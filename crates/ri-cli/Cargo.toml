@@ -1,0 +1,17 @@
+[package]
+name = "ri"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ri"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+crossterm = "0.29"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+ri-core = { path = "../ri-core" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+unicode-width = "0.2"
