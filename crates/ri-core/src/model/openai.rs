@@ -733,18 +733,23 @@ fn completions_message(message: &ModelMessage, model: &ResolvedModel) -> Value {
             tool_calls,
             ..
         } => {
-            let content = if content.is_empty() && !tool_calls.is_empty() {
-                Value::Null
-            } else {
-                Value::String(content.clone())
-            };
-            json!({
-                "role": "assistant",
-                "content": content,
-                "tool_calls": (!tool_calls.is_empty()).then(|| {
-                    tool_calls.iter().map(completions_tool_call).collect::<Vec<_>>()
-                }),
-            })
+            let mut value = Map::new();
+            value.insert("role".to_owned(), Value::String("assistant".to_owned()));
+            value.insert(
+                "content".to_owned(),
+                if content.is_empty() && !tool_calls.is_empty() {
+                    Value::Null
+                } else {
+                    Value::String(content.clone())
+                },
+            );
+            if !tool_calls.is_empty() {
+                value.insert(
+                    "tool_calls".to_owned(),
+                    Value::Array(tool_calls.iter().map(completions_tool_call).collect()),
+                );
+            }
+            Value::Object(value)
         }
         ModelMessage::ToolResult {
             tool_call_id,
@@ -1154,6 +1159,27 @@ mod tests {
                 "content": "file contents"
             })
         );
+
+        let plain_request = ModelRequest {
+            messages: vec![ModelMessage::Assistant {
+                content: "continuing".to_owned(),
+                thinking: None,
+                tool_calls: Vec::new(),
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: None,
+            sampling_params: BTreeMap::new(),
+        };
+        let (_, plain_body) = request_for(&model, &plain_request).expect("request should build");
+        assert_eq!(
+            plain_body["messages"][0],
+            json!({
+                "role": "assistant",
+                "content": "continuing"
+            })
+        );
+        assert!(plain_body["messages"][0].get("tool_calls").is_none());
     }
 
     #[test]
