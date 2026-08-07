@@ -12,27 +12,42 @@ pub struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
 }
 
+struct TerminalModeGuard {
+    active: bool,
+}
+
+impl TerminalModeGuard {
+    fn new() -> Self {
+        Self { active: true }
+    }
+
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for TerminalModeGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        }
+    }
+}
+
 impl TerminalGuard {
     pub fn new() -> Result<Self> {
         enable_raw_mode()?;
+        let mut mode_guard = TerminalModeGuard::new();
         let mut stdout = io::stdout();
-        if let Err(error) = execute!(stdout, EnterAlternateScreen) {
-            let _ = disable_raw_mode();
-            return Err(error.into());
-        }
+        execute!(stdout, EnterAlternateScreen)?;
 
         let backend = CrosstermBackend::new(stdout);
-        match Terminal::new(backend) {
-            Ok(mut terminal) => {
-                terminal.clear()?;
-                Ok(Self { terminal })
-            }
-            Err(error) => {
-                let _ = disable_raw_mode();
-                let _ = execute!(io::stdout(), LeaveAlternateScreen);
-                Err(error.into())
-            }
-        }
+        let mut terminal = Terminal::new(backend)?;
+        terminal.clear()?;
+        mode_guard.disarm();
+
+        Ok(Self { terminal })
     }
 
     pub fn terminal_mut(&mut self) -> &mut Terminal<CrosstermBackend<Stdout>> {
