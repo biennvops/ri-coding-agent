@@ -141,8 +141,10 @@ pub enum ModelEvent {
     ToolCallDelta {
         index: usize,
         id: Option<String>,
+        item_id: Option<String>,
         name: Option<String>,
         arguments: String,
+        arguments_complete: bool,
     },
     UsageUpdated(Usage),
 }
@@ -159,7 +161,10 @@ pub struct Usage {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ModelToolCall {
     pub index: usize,
+    /// The callable tool identifier (`call_...` for Responses API calls).
     pub id: Option<String>,
+    /// The output item identifier (`fc_...` for Responses API calls).
+    pub item_id: Option<String>,
     pub name: Option<String>,
     pub arguments: String,
 }

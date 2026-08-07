@@ -221,8 +221,10 @@ impl ResponseCollector {
             ModelEvent::ToolCallDelta {
                 index,
                 id,
+                item_id,
                 name,
                 arguments,
+                arguments_complete,
             } => {
                 let tool_call = self
                     .tool_calls
@@ -234,10 +236,17 @@ impl ResponseCollector {
                 if id.is_some() {
                     tool_call.id = id.clone();
                 }
+                if item_id.is_some() {
+                    tool_call.item_id = item_id.clone();
+                }
                 if name.is_some() {
                     tool_call.name = name.clone();
                 }
-                tool_call.arguments.push_str(arguments);
+                if *arguments_complete {
+                    tool_call.arguments = arguments.clone();
+                } else {
+                    tool_call.arguments.push_str(arguments);
+                }
             }
             ModelEvent::UsageUpdated(usage) => self.usage = Some(usage.clone()),
             ModelEvent::AssistantTextDelta { .. } | ModelEvent::AssistantThinkingDelta { .. } => {}
@@ -245,11 +254,11 @@ impl ResponseCollector {
     }
 
     fn finish(self) -> ModelResponse {
-        let stop_reason = self.stop_reason.unwrap_or(if self.tool_calls.is_empty() {
-            StopReason::Stop
+        let stop_reason = if self.tool_calls.is_empty() {
+            self.stop_reason.unwrap_or(StopReason::Stop)
         } else {
             StopReason::ToolCalls
-        });
+        };
         ModelResponse {
             stop_reason,
             tool_calls: self.tool_calls.into_values().collect(),
@@ -317,7 +326,10 @@ fn parse_responses_payload(value: &Value) -> Result<ParsedPayload, ProviderError
                 index,
                 id: value
                     .get("call_id")
-                    .or_else(|| value.get("item_id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                item_id: value
+                    .get("item_id")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
                 name: value.get("name").and_then(Value::as_str).map(str::to_owned),
@@ -326,6 +338,7 @@ fn parse_responses_payload(value: &Value) -> Result<ParsedPayload, ProviderError
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned(),
+                arguments_complete: false,
             });
         }
         "response.output_item.added" => {
@@ -338,17 +351,49 @@ fn parse_responses_payload(value: &Value) -> Result<ParsedPayload, ProviderError
                         .unwrap_or(0) as usize,
                     id: item
                         .get("call_id")
-                        .or_else(|| item.get("id"))
                         .and_then(Value::as_str)
                         .map(str::to_owned),
+                    item_id: item.get("id").and_then(Value::as_str).map(str::to_owned),
                     name: item.get("name").and_then(Value::as_str).map(str::to_owned),
                     arguments: item
                         .get("arguments")
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_owned(),
+                    arguments_complete: false,
                 });
             }
+        }
+        "response.function_call_arguments.done" => {
+            let item = value.get("item").unwrap_or(&Value::Null);
+            parsed.events.push(ModelEvent::ToolCallDelta {
+                index: value
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize,
+                id: value
+                    .get("call_id")
+                    .or_else(|| item.get("call_id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                item_id: value
+                    .get("item_id")
+                    .or_else(|| item.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                name: value
+                    .get("name")
+                    .or_else(|| item.get("name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                arguments: value
+                    .get("arguments")
+                    .or_else(|| item.get("arguments"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                arguments_complete: true,
+            });
         }
         "response.completed" | "response.done" => {
             let response = value.get("response").unwrap_or(value);
@@ -402,6 +447,7 @@ fn parse_completions_payload(value: &Value) -> Result<ParsedPayload, ProviderErr
                         .get("id")
                         .and_then(Value::as_str)
                         .map(str::to_owned),
+                    item_id: None,
                     name: function
                         .get("name")
                         .and_then(Value::as_str)
@@ -411,6 +457,7 @@ fn parse_completions_payload(value: &Value) -> Result<ParsedPayload, ProviderErr
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_owned(),
+                    arguments_complete: false,
                 });
             }
         }
@@ -780,17 +827,51 @@ mod tests {
 
         let tool = parse_payload(
             ApiKind::OpenAiResponses,
-            r#"{"type":"response.function_call_arguments.delta","output_index":1,"item_id":"call-2","delta":"{}"}"#,
+            r#"{"type":"response.function_call_arguments.delta","output_index":1,"item_id":"fc-2","delta":"{}"}"#,
         )
         .expect("tool event should parse");
         assert_eq!(
             tool.events,
             [ModelEvent::ToolCallDelta {
                 index: 1,
-                id: Some("call-2".to_owned()),
+                id: None,
+                item_id: Some("fc-2".to_owned()),
                 name: None,
                 arguments: "{}".to_owned(),
+                arguments_complete: false,
             }]
+        );
+    }
+
+    #[test]
+    fn responses_function_calls_preserve_ids_and_override_completed_status() {
+        let payloads = [
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_123","call_id":"call_123","name":"read","arguments":""}}"#,
+            r#"{"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_123","delta":"{\"path\":\""}"#,
+            r#"{"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_123","delta":"src/main.rs\"}"}"#,
+            r#"{"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_123","arguments":"{\"path\":\"src/main.rs\"}"}"#,
+            r#"{"type":"response.completed","response":{"status":"completed"}}"#,
+        ];
+        let mut collector = ResponseCollector::default();
+        for payload in payloads {
+            let parsed = parse_payload(ApiKind::OpenAiResponses, payload)
+                .expect("Responses event should parse");
+            if let Some(reason) = parsed.stop_reason {
+                collector.stop_reason = Some(reason);
+            }
+            for event in parsed.events {
+                collector.record(&event);
+            }
+        }
+
+        let response = collector.finish();
+        assert_eq!(response.stop_reason, StopReason::ToolCalls);
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id.as_deref(), Some("call_123"));
+        assert_eq!(response.tool_calls[0].item_id.as_deref(), Some("fc_123"));
+        assert_eq!(
+            response.tool_calls[0].arguments,
+            "{\"path\":\"src/main.rs\"}"
         );
     }
 

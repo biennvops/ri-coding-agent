@@ -39,8 +39,10 @@ pub enum AgentEvent {
     ToolCallDelta {
         index: usize,
         id: Option<String>,
+        item_id: Option<String>,
         name: Option<String>,
         arguments: String,
+        arguments_complete: bool,
     },
     UsageUpdated(Usage),
     ModelChanged(ModelRef),
@@ -235,13 +237,17 @@ fn agent_event_from_model(event: ModelEvent) -> AgentEvent {
         ModelEvent::ToolCallDelta {
             index,
             id,
+            item_id,
             name,
             arguments,
+            arguments_complete,
         } => AgentEvent::ToolCallDelta {
             index,
             id,
+            item_id,
             name,
             arguments,
+            arguments_complete,
         },
         ModelEvent::UsageUpdated(usage) => AgentEvent::UsageUpdated(usage),
     }
