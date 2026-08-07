@@ -116,6 +116,9 @@ pub enum ConfigError {
         source: serde_json::Error,
     },
 
+    #[error("RI_MODELS_FILE points to missing models config {path}; check the path or unset RI_MODELS_FILE")]
+    ExplicitModelsFileMissing { path: PathBuf },
+
     #[error("invalid model configuration: {0}")]
     Invalid(String),
 
@@ -348,13 +351,15 @@ pub fn default_models_path() -> Option<PathBuf> {
 }
 
 pub fn load_default_models() -> Result<Option<ModelCatalog>, ConfigError> {
-    let path = env::var_os("RI_MODELS_FILE")
-        .map(PathBuf::from)
-        .or_else(default_models_path);
+    let explicit_path = env::var_os("RI_MODELS_FILE").map(PathBuf::from);
+    let path = explicit_path.clone().or_else(default_models_path);
     let Some(path) = path else {
         return Ok(None);
     };
     if !path.exists() {
+        if explicit_path.is_some() {
+            return Err(ConfigError::ExplicitModelsFileMissing { path });
+        }
         return Ok(None);
     }
     ModelCatalog::load(path).map(Some)
@@ -620,6 +625,153 @@ mod tests {
             "Bearer secret / secret"
         );
         unsafe { env::remove_var("RI_CONFIG_TEST_TOKEN") };
+    }
+
+    #[test]
+    fn sampling_params_are_canonical_and_legacy_sampling_is_supported() {
+        let source = r#"
+        {
+          "providers": {
+            "custom": {
+              "baseUrl": "https://example.test/v1",
+              "api": "openai-responses",
+              "models": [{
+                "id": "coding",
+                "samplingParams": {"temperature": 0.7, "top_p": 0.9}
+              }]
+            }
+          }
+        }
+        "#;
+        let catalog = ModelCatalog::from_json("models.json", source).expect("config should parse");
+        let model = catalog.resolve(None, None).expect("model should resolve");
+        assert!(catalog.warnings().is_empty());
+        assert_eq!(model.sampling_params["temperature"], 0.7);
+        assert_eq!(model.sampling_params["top_p"], 0.9);
+
+        let legacy = ModelCatalog::from_json(
+            "models.json",
+            r#"{
+              "providers": {
+                "p": {
+                  "baseUrl": "https://example.test",
+                  "api": "openai-responses",
+                  "models": [{"id": "m", "sampling": {"temperature": 0.4}}]
+                }
+              }
+            }"#,
+        )
+        .expect("legacy sampling config should parse");
+        assert!(legacy.warnings().is_empty());
+        assert_eq!(legacy.models()[0].sampling_params["temperature"], 0.4);
+    }
+
+    #[test]
+    fn compatibility_defaults_and_overrides_are_resolved() {
+        let source = r#"
+        {
+          "providers": {
+            "defaults": {
+              "baseUrl": "https://example.test",
+              "api": "openai-responses",
+              "models": [{"id": "m"}]
+            },
+            "disabled": {
+              "baseUrl": "https://example.test",
+              "api": "openai-completions",
+              "compat": {
+                "supportsDeveloperRole": false,
+                "supportsReasoningEffort": false
+              },
+              "models": [
+                {"id": "inherited"},
+                {"id": "overridden", "compat": {
+                  "supportsDeveloperRole": true,
+                  "supportsReasoningEffort": true
+                }}
+              ]
+            }
+          }
+        }
+        "#;
+        let catalog = ModelCatalog::from_json("models.json", source).expect("config should parse");
+        let defaults = catalog
+            .resolve(Some("defaults"), None)
+            .expect("model should resolve");
+        assert!(defaults.compatibility.supports_developer_role);
+        assert!(defaults.compatibility.supports_reasoning_effort);
+
+        let inherited = catalog
+            .resolve(Some("disabled"), Some("inherited"))
+            .expect("model should resolve");
+        assert!(!inherited.compatibility.supports_developer_role);
+        assert!(!inherited.compatibility.supports_reasoning_effort);
+
+        let overridden = catalog
+            .resolve(Some("disabled"), Some("overridden"))
+            .expect("model should resolve");
+        assert!(overridden.compatibility.supports_developer_role);
+        assert!(overridden.compatibility.supports_reasoning_effort);
+    }
+
+    #[test]
+    fn invalid_model_configuration_is_rejected_early() {
+        for (description, source, expected) in [
+            (
+                "empty provider ID",
+                r#"{"providers":{"":{"baseUrl":"https://example.test","api":"openai-responses","models":[{"id":"m"}]}}}"#,
+                "provider ID must not be empty",
+            ),
+            (
+                "empty base URL",
+                r#"{"providers":{"p":{"baseUrl":"","api":"openai-responses","models":[{"id":"m"}]}}}"#,
+                "baseUrl must not be empty",
+            ),
+            (
+                "malformed base URL",
+                r#"{"providers":{"p":{"baseUrl":"not a URL","api":"openai-responses","models":[{"id":"m"}]}}}"#,
+                "baseUrl must be a valid URL",
+            ),
+            (
+                "empty model ID",
+                r#"{"providers":{"p":{"baseUrl":"https://example.test","api":"openai-responses","models":[{"id":""}]}}}"#,
+                "model ID must not be empty",
+            ),
+            (
+                "zero context window",
+                r#"{"providers":{"p":{"baseUrl":"https://example.test","api":"openai-responses","models":[{"id":"m","contextWindow":0}]}}}"#,
+                "contextWindow must be greater than zero",
+            ),
+            (
+                "zero max tokens",
+                r#"{"providers":{"p":{"baseUrl":"https://example.test","api":"openai-responses","models":[{"id":"m","maxTokens":0}]}}}"#,
+                "maxTokens must be greater than zero",
+            ),
+        ] {
+            let error = ModelCatalog::from_json("models.json", source).expect_err(description);
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn explicit_missing_models_file_does_not_fall_back() {
+        let path = std::env::temp_dir().join(format!(
+            "ri-missing-models-{}-{}.json",
+            std::process::id(),
+            "config-test"
+        ));
+        let previous = env::var_os("RI_MODELS_FILE");
+        unsafe { env::set_var("RI_MODELS_FILE", &path) };
+        let error = load_default_models().expect_err("explicit missing path should fail");
+        match previous {
+            Some(value) => unsafe { env::set_var("RI_MODELS_FILE", value) },
+            None => unsafe { env::remove_var("RI_MODELS_FILE") },
+        }
+        assert!(matches!(
+            error,
+            ConfigError::ExplicitModelsFileMissing { .. }
+        ));
+        assert!(error.to_string().contains(&path.display().to_string()));
     }
 
     #[test]

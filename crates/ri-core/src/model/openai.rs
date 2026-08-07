@@ -1078,6 +1078,23 @@ mod tests {
     }
 
     #[test]
+    fn sampling_params_are_included_in_generated_request() {
+        let mut model = test_model(
+            ApiKind::OpenAiResponses,
+            "https://example.test/v1".to_owned(),
+        );
+        model
+            .sampling_params
+            .insert("temperature".to_owned(), json!(0.7));
+        model.sampling_params.insert("top_p".to_owned(), json!(0.9));
+        let (_, body) =
+            request_for(&model, &ModelRequest::single_user("hello")).expect("request should build");
+
+        assert_eq!(body["temperature"], 0.7);
+        assert_eq!(body["top_p"], 0.9);
+    }
+
+    #[test]
     fn replays_assistant_tool_call_and_result_for_completions() {
         let model = test_model(
             ApiKind::OpenAiCompletions,
