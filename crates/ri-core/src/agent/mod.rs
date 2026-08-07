@@ -4,7 +4,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::model::{ModelEvent, ModelProvider, ModelRequest, ProviderError, StopReason};
+use crate::config::ModelRef;
+use crate::model::{ModelEvent, ModelProvider, ModelRequest, ProviderError, StopReason, Usage};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentCommand {
@@ -29,9 +30,23 @@ impl AgentError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentEvent {
     TurnStarted,
-    AssistantTextDelta { text: String },
-    AssistantThinkingDelta { text: String },
-    TurnFinished { reason: StopReason },
+    AssistantTextDelta {
+        text: String,
+    },
+    AssistantThinkingDelta {
+        text: String,
+    },
+    ToolCallDelta {
+        index: usize,
+        id: Option<String>,
+        name: Option<String>,
+        arguments: String,
+    },
+    UsageUpdated(Usage),
+    ModelChanged(ModelRef),
+    TurnFinished {
+        reason: StopReason,
+    },
     Error(AgentError),
 }
 
@@ -131,7 +146,7 @@ async fn run_turn<P>(
     }
 
     let (model_event_tx, mut model_event_rx) = mpsc::channel(64);
-    let request = ModelRequest { user_message: text };
+    let request = ModelRequest::single_user(text);
     let provider_cancel = cancel.clone();
     let mut provider_task = tokio::spawn(async move {
         provider
@@ -188,9 +203,9 @@ async fn run_turn<P>(
                 })
                 .await;
         }
-        Ok(Err(ProviderError::Failed { message })) => {
+        Ok(Err(error)) => {
             let _ = events
-                .send(AgentEvent::Error(AgentError::new(message)))
+                .send(AgentEvent::Error(AgentError::new(error.to_string())))
                 .await;
             let _ = events
                 .send(AgentEvent::TurnFinished {
@@ -217,6 +232,18 @@ fn agent_event_from_model(event: ModelEvent) -> AgentEvent {
     match event {
         ModelEvent::AssistantTextDelta { text } => AgentEvent::AssistantTextDelta { text },
         ModelEvent::AssistantThinkingDelta { text } => AgentEvent::AssistantThinkingDelta { text },
+        ModelEvent::ToolCallDelta {
+            index,
+            id,
+            name,
+            arguments,
+        } => AgentEvent::ToolCallDelta {
+            index,
+            id,
+            name,
+            arguments,
+        },
+        ModelEvent::UsageUpdated(usage) => AgentEvent::UsageUpdated(usage),
     }
 }
 

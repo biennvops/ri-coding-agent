@@ -3,7 +3,10 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use crossterm::event::{self, Event, KeyEventKind};
-use ri_core::{AgentCommand, AgentEvent, AgentRuntime, AppState, MockProvider, StopReason};
+use ri_core::{
+    config::load_default_models, AgentCommand, AgentEvent, AgentRuntime, AppState,
+    ConfiguredProvider, ModelCatalog, ModelRef, ResolvedModel, StopReason,
+};
 use tokio::sync::mpsc;
 
 use crate::input::{self, Action, VisualLayout};
@@ -16,6 +19,8 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Options {
     pub print_prompt: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
     pub show_help: bool,
 }
 
@@ -35,6 +40,18 @@ impl Options {
                         .ok_or_else(|| anyhow!("{argument} requires a prompt"))?;
                     options.print_prompt = Some(prompt);
                 }
+                "--provider" => {
+                    options.provider = Some(
+                        args.next()
+                            .ok_or_else(|| anyhow!("--provider requires a provider id"))?,
+                    );
+                }
+                "--model" => {
+                    options.model = Some(
+                        args.next()
+                            .ok_or_else(|| anyhow!("--model requires a model id"))?,
+                    );
+                }
                 "-h" | "--help" => options.show_help = true,
                 unknown => bail!("unknown argument: {unknown}"),
             }
@@ -46,23 +63,68 @@ impl Options {
     pub fn print_help() {
         println!(
             "ri — a small Rust coding agent\n\n\
-             Usage:\n  ri                 start the interactive TUI\n  ri -p <prompt>     run one prompt without the TUI\n  ri --help          show this help"
+             Usage:\n  ri                              start the interactive TUI\n  ri -p <prompt>                  run one prompt without the TUI\n  ri --provider <id> --model <id> select a configured model\n  ri --help                       show this help"
         );
     }
 }
 
 pub async fn run(options: Options) -> Result<()> {
+    let setup = ModelSetup::load(&options)?;
     if let Some(prompt) = options.print_prompt {
-        run_print(prompt).await
+        run_print(prompt, setup).await
     } else {
-        run_tui().await
+        run_tui(setup).await
     }
 }
 
-async fn run_print(prompt: String) -> Result<()> {
+struct ModelSetup {
+    provider: ConfiguredProvider,
+    catalog: Option<ModelCatalog>,
+    selected: Option<ResolvedModel>,
+}
+
+impl ModelSetup {
+    fn load(options: &Options) -> Result<Self> {
+        let catalog = load_default_models().context("could not load models.json")?;
+        if let Some(catalog) = catalog {
+            for warning in catalog.warnings() {
+                eprintln!("ri: warning: {}: {}", warning.path, warning.message);
+            }
+            let selected = catalog
+                .resolve(options.provider.as_deref(), options.model.as_deref())
+                .context("could not select configured model")?;
+            let provider = ConfiguredProvider::openai(selected.clone())
+                .map_err(|error| anyhow!(error.to_string()))?;
+            return Ok(Self {
+                provider,
+                catalog: Some(catalog),
+                selected: Some(selected),
+            });
+        }
+
+        if options.provider.is_some() || options.model.is_some() {
+            bail!("no models.json found; create ~/.ri/agent/models.json or set RI_MODELS_FILE");
+        }
+
+        Ok(Self {
+            provider: ConfiguredProvider::mock(),
+            catalog: None,
+            selected: None,
+        })
+    }
+
+    fn model_ref(&self) -> ModelRef {
+        self.selected
+            .as_ref()
+            .map(|model| model.model_ref.clone())
+            .unwrap_or_else(|| self.provider.model_ref())
+    }
+}
+
+async fn run_print(prompt: String, setup: ModelSetup) -> Result<()> {
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (event_tx, mut event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-    let runtime = AgentRuntime::new(MockProvider::new());
+    let runtime = AgentRuntime::new(setup.provider.clone());
     let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
 
     command_tx
@@ -71,6 +133,7 @@ async fn run_print(prompt: String) -> Result<()> {
         .context("could not start the mock agent")?;
 
     let mut state = AppState::new();
+    state.reduce(AgentEvent::ModelChanged(setup.model_ref()));
     let mut turn_reason = None;
     let mut output = io::stdout();
     let mut error_message = None;
@@ -85,7 +148,11 @@ async fn run_print(prompt: String) -> Result<()> {
                 eprintln!("ri: {}", error.message);
             }
             AgentEvent::TurnFinished { reason } => turn_reason = Some(reason.clone()),
-            AgentEvent::TurnStarted | AgentEvent::AssistantThinkingDelta { .. } => {}
+            AgentEvent::TurnStarted
+            | AgentEvent::AssistantThinkingDelta { .. }
+            | AgentEvent::ToolCallDelta { .. }
+            | AgentEvent::UsageUpdated(_)
+            | AgentEvent::ModelChanged(_) => {}
         }
         let finished = matches!(event, AgentEvent::TurnFinished { .. });
         state.reduce(event);
@@ -119,15 +186,22 @@ async fn run_print(prompt: String) -> Result<()> {
     Ok(())
 }
 
-async fn run_tui() -> Result<()> {
+async fn run_tui(mut setup: ModelSetup) -> Result<()> {
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (event_tx, mut event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-    let runtime = AgentRuntime::new(MockProvider::new());
+    let runtime = AgentRuntime::new(setup.provider.clone());
     let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
 
     let mut terminal = TerminalGuard::new().context("could not initialize terminal")?;
     let mut state = AppState::new();
-    let tui_result = run_tui_loop(&mut terminal, &mut state, &command_tx, &mut event_rx);
+    state.reduce(AgentEvent::ModelChanged(setup.model_ref()));
+    let tui_result = run_tui_loop(
+        &mut terminal,
+        &mut state,
+        &command_tx,
+        &mut event_rx,
+        &mut setup,
+    );
     drop(terminal);
 
     let shutdown_result = command_tx.send(AgentCommand::Shutdown).await;
@@ -146,6 +220,7 @@ fn run_tui_loop(
     state: &mut AppState,
     command_tx: &mpsc::Sender<AgentCommand>,
     event_rx: &mut mpsc::Receiver<AgentEvent>,
+    setup: &mut ModelSetup,
 ) -> Result<()> {
     let mut dirty = true;
     let mut scroll_from_bottom = 0usize;
@@ -176,7 +251,11 @@ fn run_tui_loop(
                         }
                         match action {
                             Action::Submit => {
-                                if let Some(text) = state.submit_input() {
+                                if let Some(argument) = model_command(state.input()) {
+                                    state.take_input();
+                                    handle_model_command(state, setup, argument.as_deref());
+                                    scroll_from_bottom = 0;
+                                } else if let Some(text) = state.submit_input() {
                                     command_tx
                                         .try_send(AgentCommand::Submit { text })
                                         .context("could not send prompt to the agent")?;
@@ -257,6 +336,65 @@ fn run_tui_loop(
     Ok(())
 }
 
+fn model_command(input: &str) -> Option<Option<String>> {
+    let input = input.trim();
+    if input == "/model" {
+        Some(None)
+    } else {
+        input
+            .strip_prefix("/model ")
+            .map(str::trim)
+            .filter(|argument| !argument.is_empty())
+            .map(|argument| Some(argument.to_owned()))
+    }
+}
+
+fn handle_model_command(state: &mut AppState, setup: &mut ModelSetup, argument: Option<&str>) {
+    let Some(catalog) = setup.catalog.as_ref() else {
+        state.add_system_message(
+            "No configured models are available. Create ~/.ri/agent/models.json first.",
+        );
+        return;
+    };
+
+    let selected = if let Some(argument) = argument {
+        catalog.resolve(None, Some(argument))
+    } else if catalog.models().is_empty() {
+        Err(ri_core::ConfigError::Invalid(
+            "models.json contains no selectable model".to_owned(),
+        ))
+    } else {
+        let current = setup.selected.as_ref().map(|model| &model.model_ref);
+        let current_index = current
+            .and_then(|current| {
+                catalog
+                    .models()
+                    .iter()
+                    .position(|model| model.model_ref == *current)
+            })
+            .unwrap_or(usize::MAX);
+        let next_index = if current_index == usize::MAX {
+            0
+        } else {
+            (current_index + 1) % catalog.models().len()
+        };
+        Ok(catalog.models()[next_index].clone())
+    };
+
+    match selected {
+        Ok(selected) => match setup.provider.set_model(selected.clone()) {
+            Ok(()) => {
+                let name = selected.model_ref.display_name();
+                setup.selected = Some(selected.clone());
+                state.reduce(AgentEvent::ModelChanged(selected.model_ref));
+                state.add_system_message(format!("active model: {name}"));
+            }
+            Err(error) => state.add_system_message(error.to_string()),
+        },
+        Err(error) => state.add_system_message(error.to_string()),
+    }
+}
+
 fn print_and_flush(output: &mut impl Write, text: &str) -> Result<()> {
     write!(output, "{text}")?;
     output.flush()?;
@@ -268,13 +406,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_print_prompt() {
+    fn parses_print_prompt_and_model_flags() {
         assert_eq!(
-            Options::parse(["-p".to_owned(), "hello".to_owned()]).unwrap(),
+            Options::parse([
+                "-p".to_owned(),
+                "hello".to_owned(),
+                "--provider".to_owned(),
+                "custom".to_owned(),
+                "--model".to_owned(),
+                "coding".to_owned(),
+            ])
+            .unwrap(),
             Options {
                 print_prompt: Some("hello".to_owned()),
+                provider: Some("custom".to_owned()),
+                model: Some("coding".to_owned()),
                 show_help: false,
             }
         );
+    }
+
+    #[test]
+    fn recognizes_direct_and_cycling_model_commands() {
+        assert_eq!(model_command("/model"), Some(None));
+        assert_eq!(
+            model_command("  /model custom/coding  "),
+            Some(Some("custom/coding".to_owned()))
+        );
+        assert_eq!(model_command("/modelish"), None);
     }
 }

@@ -3,7 +3,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
-use ri_core::{AppState, MessageRole};
+use ri_core::{AppState, MessageRole, ModelRef};
 
 use crate::input::VisualLayout;
 use crate::terminal::TerminalGuard;
@@ -100,6 +100,7 @@ fn transcript_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
 
     for message in state.messages() {
         let (label, style) = match message.role {
+            MessageRole::System => ("system", Style::default().fg(Color::Cyan)),
             MessageRole::User => ("you", Style::default().fg(Color::Yellow)),
             MessageRole::Assistant => ("assistant", Style::default().fg(Color::Green)),
         };
@@ -175,12 +176,16 @@ fn layout_styled_lines(text: &str, style: Style, width: usize) -> Vec<Line<'stat
 }
 
 fn footer_text(state: &AppState, width: u16) -> Line<'static> {
+    let model = state
+        .active_model()
+        .map(ModelRef::display_name)
+        .unwrap_or_else(|| "mock/mock".to_owned());
     let text = if let Some(error) = state.last_error() {
-        format!("error: {error}")
+        format!("{model} · error: {error}")
     } else if state.is_turn_active() {
-        "mock · streaming · Esc cancel · Ctrl+C cancel".to_owned()
+        format!("{model} · streaming · Esc cancel · Ctrl+C cancel")
     } else {
-        "mock · ready · Enter submit · Ctrl+C exit".to_owned()
+        format!("{model} · ready · Enter submit · Ctrl+C exit")
     };
     let truncated: String = text
         .chars()

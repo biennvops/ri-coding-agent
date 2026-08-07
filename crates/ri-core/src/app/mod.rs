@@ -1,10 +1,12 @@
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::agent::{AgentError, AgentEvent};
+use crate::config::ModelRef;
 use crate::model::StopReason;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MessageRole {
+    System,
     User,
     Assistant,
 }
@@ -31,6 +33,7 @@ pub struct AppState {
     turn_active: bool,
     last_error: Option<String>,
     last_stop_reason: Option<StopReason>,
+    active_model: Option<ModelRef>,
 }
 
 impl AppState {
@@ -72,6 +75,10 @@ impl AppState {
 
     pub fn last_stop_reason(&self) -> Option<&StopReason> {
         self.last_stop_reason.as_ref()
+    }
+
+    pub fn active_model(&self) -> Option<&ModelRef> {
+        self.active_model.as_ref()
     }
 
     pub fn insert_text(&mut self, text: &str) {
@@ -127,13 +134,25 @@ impl AppState {
         }
     }
 
-    pub fn submit_input(&mut self) -> Option<String> {
+    pub fn take_input(&mut self) -> Option<String> {
         if self.turn_active || self.input.trim().is_empty() {
             return None;
         }
-
         let text = std::mem::take(&mut self.input);
         self.cursor = 0;
+        Some(text)
+    }
+
+    pub fn add_system_message(&mut self, content: impl Into<String>) {
+        self.messages.push(TranscriptMessage {
+            role: MessageRole::System,
+            content: content.into(),
+            thinking: None,
+        });
+    }
+
+    pub fn submit_input(&mut self) -> Option<String> {
+        let text = self.take_input()?;
         self.messages.push(TranscriptMessage {
             role: MessageRole::User,
             content: text.clone(),
@@ -178,6 +197,10 @@ impl AppState {
                 }
                 self.turn_active = false;
                 self.last_stop_reason = Some(reason);
+            }
+            AgentEvent::ToolCallDelta { .. } | AgentEvent::UsageUpdated(_) => {}
+            AgentEvent::ModelChanged(model) => {
+                self.active_model = Some(model);
             }
             AgentEvent::Error(AgentError { message }) => {
                 self.last_error = Some(message);
