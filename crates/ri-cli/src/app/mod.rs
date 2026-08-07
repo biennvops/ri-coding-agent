@@ -1,8 +1,8 @@
 use std::io::{self, Write};
-use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{Event, EventStream, KeyEventKind};
+use futures_util::StreamExt;
 use ri_core::{
     config::load_default_models, AgentCommand, AgentEvent, AgentRuntime, AppState,
     ConfiguredProvider, ModelCatalog, ModelRef, ResolvedModel, StopReason,
@@ -201,7 +201,8 @@ async fn run_tui(mut setup: ModelSetup) -> Result<()> {
         &command_tx,
         &mut event_rx,
         &mut setup,
-    );
+    )
+    .await;
     drop(terminal);
 
     let shutdown_result = command_tx.send(AgentCommand::Shutdown).await;
@@ -215,7 +216,7 @@ async fn run_tui(mut setup: ModelSetup) -> Result<()> {
     Ok(())
 }
 
-fn run_tui_loop(
+async fn run_tui_loop(
     terminal: &mut TerminalGuard,
     state: &mut AppState,
     command_tx: &mpsc::Sender<AgentCommand>,
@@ -232,6 +233,7 @@ fn run_tui_loop(
         .saturating_sub(2)
         .max(1) as usize;
     let mut preferred_column = None;
+    let mut terminal_events = EventStream::new();
     let mut exit = false;
 
     while !exit {
@@ -241,94 +243,92 @@ fn run_tui_loop(
             dirty = false;
         }
 
-        if event::poll(Duration::from_millis(50)).context("could not read terminal input")? {
-            match event::read().context("could not read terminal event")? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if let Some(action) = input::action_for(key) {
+        tokio::select! {
+            terminal_event = terminal_events.next() => {
+                let terminal_event = terminal_event
+                    .ok_or_else(|| anyhow!("terminal event stream disconnected"))?
+                    .context("could not read terminal event")?;
+                match terminal_event {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        if let Some(action) = input::action_for(key) {
+                            dirty = true;
+                            if !matches!(action, Action::Up | Action::Down) {
+                                preferred_column = None;
+                            }
+                            match action {
+                                Action::Submit => {
+                                    if let Some(argument) = model_command(state.input()) {
+                                        state.take_input();
+                                        handle_model_command(state, setup, argument.as_deref());
+                                        scroll_from_bottom = 0;
+                                    } else if let Some(text) = state.submit_input() {
+                                        command_tx
+                                            .try_send(AgentCommand::Submit { text })
+                                            .context("could not send prompt to the agent")?;
+                                        scroll_from_bottom = 0;
+                                    }
+                                }
+                                Action::Newline => state.insert_newline(),
+                                Action::Escape => {
+                                    if state.is_turn_active() {
+                                        command_tx
+                                            .try_send(AgentCommand::Cancel)
+                                            .context("could not cancel the active turn")?;
+                                    }
+                                }
+                                Action::CtrlC => {
+                                    if state.is_turn_active() {
+                                        command_tx
+                                            .try_send(AgentCommand::Cancel)
+                                            .context("could not cancel the active turn")?;
+                                    } else {
+                                        exit = true;
+                                    }
+                                }
+                                Action::Insert(character) => state.insert_text(&character.to_string()),
+                                Action::Backspace => state.backspace(),
+                                Action::Delete => state.delete(),
+                                Action::Left => state.move_left(),
+                                Action::Right => state.move_right(),
+                                Action::Up | Action::Down => {
+                                    let direction = if matches!(action, Action::Up) { -1 } else { 1 };
+                                    let layout = VisualLayout::new(state.input(), editor_width);
+                                    if let Some((cursor, desired_column)) = layout.move_vertical(
+                                        state.cursor(),
+                                        direction,
+                                        preferred_column,
+                                    ) {
+                                        state.set_cursor(cursor);
+                                        preferred_column = Some(desired_column);
+                                    }
+                                }
+                                Action::Home => state.move_home(),
+                                Action::End => state.move_end(),
+                                Action::PageUp => {
+                                    scroll_from_bottom = scroll_from_bottom.saturating_add(10)
+                                }
+                                Action::PageDown => {
+                                    scroll_from_bottom = scroll_from_bottom.saturating_sub(10)
+                                }
+                            }
+                        }
+                    }
+                    Event::Resize(width, _) => {
+                        editor_width = width.saturating_sub(2).max(1) as usize;
+                        preferred_column = None;
                         dirty = true;
-                        if !matches!(action, Action::Up | Action::Down) {
-                            preferred_column = None;
-                        }
-                        match action {
-                            Action::Submit => {
-                                if let Some(argument) = model_command(state.input()) {
-                                    state.take_input();
-                                    handle_model_command(state, setup, argument.as_deref());
-                                    scroll_from_bottom = 0;
-                                } else if let Some(text) = state.submit_input() {
-                                    command_tx
-                                        .try_send(AgentCommand::Submit { text })
-                                        .context("could not send prompt to the agent")?;
-                                    scroll_from_bottom = 0;
-                                }
-                            }
-                            Action::Newline => state.insert_newline(),
-                            Action::Escape => {
-                                if state.is_turn_active() {
-                                    command_tx
-                                        .try_send(AgentCommand::Cancel)
-                                        .context("could not cancel the active turn")?;
-                                }
-                            }
-                            Action::CtrlC => {
-                                if state.is_turn_active() {
-                                    command_tx
-                                        .try_send(AgentCommand::Cancel)
-                                        .context("could not cancel the active turn")?;
-                                } else {
-                                    exit = true;
-                                }
-                            }
-                            Action::Insert(character) => state.insert_text(&character.to_string()),
-                            Action::Backspace => state.backspace(),
-                            Action::Delete => state.delete(),
-                            Action::Left => state.move_left(),
-                            Action::Right => state.move_right(),
-                            Action::Up | Action::Down => {
-                                let direction = if matches!(action, Action::Up) { -1 } else { 1 };
-                                let layout = VisualLayout::new(state.input(), editor_width);
-                                if let Some((cursor, desired_column)) = layout.move_vertical(
-                                    state.cursor(),
-                                    direction,
-                                    preferred_column,
-                                ) {
-                                    state.set_cursor(cursor);
-                                    preferred_column = Some(desired_column);
-                                }
-                            }
-                            Action::Home => state.move_home(),
-                            Action::End => state.move_end(),
-                            Action::PageUp => {
-                                scroll_from_bottom = scroll_from_bottom.saturating_add(10)
-                            }
-                            Action::PageDown => {
-                                scroll_from_bottom = scroll_from_bottom.saturating_sub(10)
-                            }
-                        }
                     }
+                    _ => {}
                 }
-                Event::Resize(width, _) => {
-                    editor_width = width.saturating_sub(2).max(1) as usize;
-                    preferred_column = None;
-                    dirty = true;
-                }
-                _ => {}
             }
-        }
-
-        loop {
-            match event_rx.try_recv() {
-                Ok(event) => {
-                    if matches!(event, AgentEvent::TurnFinished { .. }) {
-                        scroll_from_bottom = 0;
-                    }
-                    state.reduce(event);
-                    dirty = true;
+            agent_event = event_rx.recv() => {
+                let event = agent_event
+                    .ok_or_else(|| anyhow!("agent event stream disconnected"))?;
+                if matches!(event, AgentEvent::TurnFinished { .. }) {
+                    scroll_from_bottom = 0;
                 }
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    return Err(anyhow!("agent event stream disconnected"));
-                }
+                state.reduce(event);
+                dirty = true;
             }
         }
     }
