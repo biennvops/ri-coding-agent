@@ -38,7 +38,7 @@ pub enum AgentEvent {
     },
     ToolCallDelta {
         index: usize,
-        id: Option<String>,
+        call_id: Option<String>,
         item_id: Option<String>,
         name: Option<String>,
         arguments: String,
@@ -236,14 +236,14 @@ fn agent_event_from_model(event: ModelEvent) -> AgentEvent {
         ModelEvent::AssistantThinkingDelta { text } => AgentEvent::AssistantThinkingDelta { text },
         ModelEvent::ToolCallDelta {
             index,
-            id,
+            call_id,
             item_id,
             name,
             arguments,
             arguments_complete,
         } => AgentEvent::ToolCallDelta {
             index,
-            id,
+            call_id,
             item_id,
             name,
             arguments,

@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{ApiKind, ResolvedModel};
 
 use super::{
-    MessageRole, ModelEvent, ModelMessage, ModelProvider, ModelRequest, ModelResponse,
-    ModelToolCall, ProviderError, StopReason, ToolDefinition, Usage,
+    ModelEvent, ModelMessage, ModelProvider, ModelRequest, ModelResponse, ModelToolCall,
+    ProviderError, StopReason, ToolDefinition, Usage,
 };
 
 #[derive(Clone)]
@@ -213,6 +213,8 @@ async fn read_error_body(
 
 #[derive(Default)]
 struct ResponseCollector {
+    content: String,
+    thinking: String,
     stop_reason: Option<StopReason>,
     terminal_seen: bool,
     tool_calls: BTreeMap<usize, ModelToolCall>,
@@ -224,7 +226,7 @@ impl ResponseCollector {
         match event {
             ModelEvent::ToolCallDelta {
                 index,
-                id,
+                call_id,
                 item_id,
                 name,
                 arguments,
@@ -237,8 +239,8 @@ impl ResponseCollector {
                         index: *index,
                         ..ModelToolCall::default()
                     });
-                if id.is_some() {
-                    tool_call.id = id.clone();
+                if call_id.is_some() {
+                    tool_call.call_id = call_id.clone();
                 }
                 if item_id.is_some() {
                     tool_call.item_id = item_id.clone();
@@ -253,7 +255,8 @@ impl ResponseCollector {
                 }
             }
             ModelEvent::UsageUpdated(usage) => self.usage = Some(usage.clone()),
-            ModelEvent::AssistantTextDelta { .. } | ModelEvent::AssistantThinkingDelta { .. } => {}
+            ModelEvent::AssistantTextDelta { text } => self.content.push_str(text),
+            ModelEvent::AssistantThinkingDelta { text } => self.thinking.push_str(text),
         }
     }
 
@@ -271,6 +274,8 @@ impl ResponseCollector {
             None => StopReason::Stop,
         };
         Ok(ModelResponse {
+            content: self.content,
+            thinking: (!self.thinking.is_empty()).then_some(self.thinking),
             stop_reason,
             tool_calls: self.tool_calls.into_values().collect(),
             usage: self.usage,
@@ -345,7 +350,7 @@ fn parse_responses_payload(value: &Value) -> Result<ParsedPayload, ProviderError
                 .unwrap_or(0) as usize;
             parsed.events.push(ModelEvent::ToolCallDelta {
                 index,
-                id: value
+                call_id: value
                     .get("call_id")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
@@ -370,7 +375,7 @@ fn parse_responses_payload(value: &Value) -> Result<ParsedPayload, ProviderError
                         .get("output_index")
                         .and_then(Value::as_u64)
                         .unwrap_or(0) as usize,
-                    id: item
+                    call_id: item
                         .get("call_id")
                         .and_then(Value::as_str)
                         .map(str::to_owned),
@@ -392,7 +397,7 @@ fn parse_responses_payload(value: &Value) -> Result<ParsedPayload, ProviderError
                     .get("output_index")
                     .and_then(Value::as_u64)
                     .unwrap_or(0) as usize,
-                id: value
+                call_id: value
                     .get("call_id")
                     .or_else(|| item.get("call_id"))
                     .and_then(Value::as_str)
@@ -492,7 +497,7 @@ fn parse_completions_payload(value: &Value) -> Result<ParsedPayload, ProviderErr
                 let function = tool_call.get("function").unwrap_or(&Value::Null);
                 parsed.events.push(ModelEvent::ToolCallDelta {
                     index: tool_call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize,
-                    id: tool_call
+                    call_id: tool_call
                         .get("id")
                         .and_then(Value::as_str)
                         .map(str::to_owned),
@@ -608,12 +613,7 @@ fn responses_body(model: &ResolvedModel, request: &ModelRequest) -> Value {
             request
                 .messages
                 .iter()
-                .map(|message| {
-                    json!({
-                        "role": role_name(message, model),
-                        "content": message.content,
-                    })
-                })
+                .flat_map(|message| responses_message_items(message, model))
                 .collect(),
         ),
     );
@@ -635,6 +635,47 @@ fn responses_body(model: &ResolvedModel, request: &ModelRequest) -> Value {
     Value::Object(body)
 }
 
+fn responses_message_items(message: &ModelMessage, model: &ResolvedModel) -> Vec<Value> {
+    match message {
+        ModelMessage::System { content } => vec![json!({
+            "role": "system",
+            "content": content,
+        })],
+        ModelMessage::Developer { content } => vec![json!({
+            "role": role_name("developer", model),
+            "content": content,
+        })],
+        ModelMessage::User { content } => vec![json!({
+            "role": "user",
+            "content": content,
+        })],
+        ModelMessage::Assistant {
+            content,
+            tool_calls,
+            ..
+        } => {
+            let mut items = Vec::new();
+            if !content.is_empty() || tool_calls.is_empty() {
+                items.push(json!({
+                    "role": "assistant",
+                    "content": content,
+                }));
+            }
+            items.extend(tool_calls.iter().map(responses_tool_call));
+            items
+        }
+        ModelMessage::ToolResult {
+            tool_call_id,
+            content,
+            ..
+        } => vec![json!({
+            "type": "function_call_output",
+            "call_id": tool_call_id,
+            "output": content,
+        })],
+    }
+}
+
 fn completions_body(model: &ResolvedModel, request: &ModelRequest) -> Value {
     let mut body = sampling_body(model, request);
     body.insert(
@@ -647,24 +688,7 @@ fn completions_body(model: &ResolvedModel, request: &ModelRequest) -> Value {
             request
                 .messages
                 .iter()
-                .map(|message| {
-                    let mut value = Map::new();
-                    value.insert(
-                        "role".to_owned(),
-                        Value::String(role_name(message, model).to_owned()),
-                    );
-                    value.insert("content".to_owned(), Value::String(message.content.clone()));
-                    if let Some(name) = &message.name {
-                        value.insert("name".to_owned(), Value::String(name.clone()));
-                    }
-                    if let Some(tool_call_id) = &message.tool_call_id {
-                        value.insert(
-                            "tool_call_id".to_owned(),
-                            Value::String(tool_call_id.clone()),
-                        );
-                    }
-                    Value::Object(value)
-                })
+                .map(|message| completions_message(message, model))
                 .collect(),
         ),
     );
@@ -690,21 +714,62 @@ fn completions_body(model: &ResolvedModel, request: &ModelRequest) -> Value {
     Value::Object(body)
 }
 
+fn completions_message(message: &ModelMessage, model: &ResolvedModel) -> Value {
+    match message {
+        ModelMessage::System { content } => json!({
+            "role": "system",
+            "content": content,
+        }),
+        ModelMessage::Developer { content } => json!({
+            "role": role_name("developer", model),
+            "content": content,
+        }),
+        ModelMessage::User { content } => json!({
+            "role": "user",
+            "content": content,
+        }),
+        ModelMessage::Assistant {
+            content,
+            tool_calls,
+            ..
+        } => {
+            let content = if content.is_empty() && !tool_calls.is_empty() {
+                Value::Null
+            } else {
+                Value::String(content.clone())
+            };
+            json!({
+                "role": "assistant",
+                "content": content,
+                "tool_calls": (!tool_calls.is_empty()).then(|| {
+                    tool_calls.iter().map(completions_tool_call).collect::<Vec<_>>()
+                }),
+            })
+        }
+        ModelMessage::ToolResult {
+            tool_call_id,
+            content,
+            ..
+        } => json!({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": content,
+        }),
+    }
+}
+
 fn sampling_body(model: &ResolvedModel, request: &ModelRequest) -> Map<String, Value> {
     let mut body = Map::new();
-    body.extend(model.sampling.clone());
-    body.extend(request.sampling.clone());
+    body.extend(model.sampling_params.clone());
+    body.extend(request.sampling_params.clone());
     body
 }
 
-fn role_name(message: &ModelMessage, model: &ResolvedModel) -> &'static str {
-    match message.role {
-        MessageRole::System => "system",
-        MessageRole::Developer if model.compatibility.supports_developer_role => "developer",
-        MessageRole::Developer => "system",
-        MessageRole::User => "user",
-        MessageRole::Assistant => "assistant",
-        MessageRole::Tool => "tool",
+fn role_name(role: &'static str, model: &ResolvedModel) -> &'static str {
+    match role {
+        "developer" if model.compatibility.supports_developer_role => "developer",
+        "developer" => "system",
+        _ => role,
     }
 }
 
@@ -714,6 +779,27 @@ fn responses_tool(tool: &ToolDefinition) -> Value {
         "name": tool.name,
         "description": tool.description,
         "parameters": tool.parameters,
+    })
+}
+
+fn responses_tool_call(tool_call: &ModelToolCall) -> Value {
+    json!({
+        "type": "function_call",
+        "id": tool_call.item_id,
+        "call_id": tool_call.call_id,
+        "name": tool_call.name,
+        "arguments": tool_call.arguments,
+    })
+}
+
+fn completions_tool_call(tool_call: &ModelToolCall) -> Value {
+    json!({
+        "id": tool_call.call_id,
+        "type": "function",
+        "function": {
+            "name": tool_call.name,
+            "arguments": tool_call.arguments,
+        }
     })
 }
 
@@ -835,6 +921,8 @@ mod tests {
             .finish()
             .expect("completed response should finish");
 
+        assert_eq!(response.content, "hello");
+        assert_eq!(response.thinking, None);
         assert_eq!(response.stop_reason, StopReason::ToolCalls);
         assert_eq!(response.tool_calls[0].name.as_deref(), Some("read"));
         assert_eq!(
@@ -943,7 +1031,7 @@ mod tests {
             tool.events,
             [ModelEvent::ToolCallDelta {
                 index: 1,
-                id: None,
+                call_id: None,
                 item_id: Some("fc-2".to_owned()),
                 name: None,
                 arguments: "{}".to_owned(),
@@ -981,12 +1069,135 @@ mod tests {
             .expect("completed response should finish");
         assert_eq!(response.stop_reason, StopReason::ToolCalls);
         assert_eq!(response.tool_calls.len(), 1);
-        assert_eq!(response.tool_calls[0].id.as_deref(), Some("call_123"));
+        assert_eq!(response.tool_calls[0].call_id.as_deref(), Some("call_123"));
         assert_eq!(response.tool_calls[0].item_id.as_deref(), Some("fc_123"));
         assert_eq!(
             response.tool_calls[0].arguments,
             "{\"path\":\"src/main.rs\"}"
         );
+    }
+
+    #[test]
+    fn replays_assistant_tool_call_and_result_for_completions() {
+        let model = test_model(
+            ApiKind::OpenAiCompletions,
+            "https://example.test/v1".to_owned(),
+        );
+        let request = ModelRequest {
+            messages: vec![
+                ModelMessage::user("inspect src/main.rs"),
+                ModelMessage::Assistant {
+                    content: String::new(),
+                    thinking: None,
+                    tool_calls: vec![ModelToolCall {
+                        index: 0,
+                        call_id: Some("call_123".to_owned()),
+                        item_id: None,
+                        name: Some("read".to_owned()),
+                        arguments: r#"{"path":"src/main.rs"}"#.to_owned(),
+                    }],
+                },
+                ModelMessage::ToolResult {
+                    tool_call_id: "call_123".to_owned(),
+                    tool_name: "read".to_owned(),
+                    content: "file contents".to_owned(),
+                },
+            ],
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: None,
+            sampling_params: BTreeMap::new(),
+        };
+        let (_, body) = request_for(&model, &request).expect("request should build");
+
+        assert_eq!(
+            body["messages"][0],
+            json!({
+                "role": "user",
+                "content": "inspect src/main.rs"
+            })
+        );
+        assert_eq!(body["messages"][1]["content"], Value::Null);
+        assert_eq!(
+            body["messages"][1]["tool_calls"][0],
+            json!({
+                "id": "call_123",
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "arguments": r#"{"path":"src/main.rs"}"#
+                }
+            })
+        );
+        assert_eq!(
+            body["messages"][2],
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_123",
+                "content": "file contents"
+            })
+        );
+    }
+
+    #[test]
+    fn replays_responses_function_call_and_output_with_distinct_ids() {
+        let model = test_model(
+            ApiKind::OpenAiResponses,
+            "https://example.test/v1".to_owned(),
+        );
+        let request = ModelRequest {
+            messages: vec![
+                ModelMessage::user("inspect src/main.rs"),
+                ModelMessage::Assistant {
+                    content: String::new(),
+                    thinking: None,
+                    tool_calls: vec![ModelToolCall {
+                        index: 0,
+                        call_id: Some("call_123".to_owned()),
+                        item_id: Some("fc_123".to_owned()),
+                        name: Some("read".to_owned()),
+                        arguments: r#"{"path":"src/main.rs"}"#.to_owned(),
+                    }],
+                },
+                ModelMessage::ToolResult {
+                    tool_call_id: "call_123".to_owned(),
+                    tool_name: "read".to_owned(),
+                    content: "file contents".to_owned(),
+                },
+            ],
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: None,
+            sampling_params: BTreeMap::new(),
+        };
+        let (_, body) = request_for(&model, &request).expect("request should build");
+
+        assert_eq!(
+            body["input"][0],
+            json!({
+                "role": "user",
+                "content": "inspect src/main.rs"
+            })
+        );
+        assert_eq!(
+            body["input"][1],
+            json!({
+                "type": "function_call",
+                "id": "fc_123",
+                "call_id": "call_123",
+                "name": "read",
+                "arguments": r#"{"path":"src/main.rs"}"#
+            })
+        );
+        assert_eq!(
+            body["input"][2],
+            json!({
+                "type": "function_call_output",
+                "call_id": "call_123",
+                "output": "file contents"
+            })
+        );
+        assert_ne!(body["input"][1]["id"], body["input"][1]["call_id"]);
     }
 
     #[test]
@@ -999,27 +1210,27 @@ mod tests {
             api_key: None,
             headers: BTreeMap::new(),
             auth_header: true,
-            compatibility: Compatibility::default(),
+            compatibility: Compatibility {
+                supports_developer_role: false,
+                ..Compatibility::default()
+            },
             reasoning: false,
             input: vec!["text".to_owned()],
             context_window: None,
             max_tokens: Some(123),
             cost: CostMetadata::default(),
-            sampling: BTreeMap::new(),
+            sampling_params: BTreeMap::new(),
         };
         let (endpoint, body) = request_for(
             &model,
             &ModelRequest {
-                messages: vec![ModelMessage {
-                    role: MessageRole::Developer,
+                messages: vec![ModelMessage::Developer {
                     content: "instructions".to_owned(),
-                    name: None,
-                    tool_call_id: None,
                 }],
                 tools: Vec::new(),
                 max_tokens: None,
                 reasoning_effort: None,
-                sampling: BTreeMap::new(),
+                sampling_params: BTreeMap::new(),
             },
         )
         .expect("request should build");
@@ -1043,7 +1254,7 @@ mod tests {
             context_window: None,
             max_tokens: None,
             cost: CostMetadata::default(),
-            sampling: BTreeMap::new(),
+            sampling_params: BTreeMap::new(),
         }
     }
 

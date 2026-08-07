@@ -58,10 +58,19 @@ impl ModelRef {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Compatibility {
     pub supports_developer_role: bool,
     pub supports_reasoning_effort: bool,
+}
+
+impl Default for Compatibility {
+    fn default() -> Self {
+        Self {
+            supports_developer_role: true,
+            supports_reasoning_effort: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -87,7 +96,7 @@ pub struct ResolvedModel {
     pub context_window: Option<u64>,
     pub max_tokens: Option<u64>,
     pub cost: CostMetadata,
-    pub sampling: BTreeMap<String, Value>,
+    pub sampling_params: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -202,6 +211,11 @@ impl ModelCatalog {
 
         let mut models = Vec::new();
         for (provider_id, provider) in raw.providers {
+            if provider_id.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "provider ID must not be empty".to_owned(),
+                ));
+            }
             for key in provider.extra.keys() {
                 warnings.push(ConfigWarning {
                     path: format!("providers.{provider_id}.{key}"),
@@ -213,6 +227,21 @@ impl ModelCatalog {
                 &provider.base_url,
                 &format!("providers.{provider_id}.baseUrl"),
             )?;
+            if base_url.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "provider {provider_id:?} baseUrl must not be empty"
+                )));
+            }
+            let base_url_url = reqwest::Url::parse(&base_url).map_err(|error| {
+                ConfigError::Invalid(format!(
+                    "provider {provider_id:?} baseUrl must be a valid URL: {error}"
+                ))
+            })?;
+            if !matches!(base_url_url.scheme(), "http" | "https") || base_url_url.host().is_none() {
+                return Err(ConfigError::Invalid(format!(
+                    "provider {provider_id:?} baseUrl must be an HTTP or HTTPS URL"
+                )));
+            }
             let api = provider
                 .api
                 .as_deref()
@@ -249,6 +278,21 @@ impl ModelCatalog {
                 }
                 let model_id =
                     interpolate_env(&model.id, &format!("providers.{provider_id}.models.id"))?;
+                if model_id.trim().is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "provider {provider_id:?} model ID must not be empty"
+                    )));
+                }
+                if model.context_window == Some(0) {
+                    return Err(ConfigError::Invalid(format!(
+                        "model {provider_id}/{model_id:?} contextWindow must be greater than zero"
+                    )));
+                }
+                if model.max_tokens == Some(0) {
+                    return Err(ConfigError::Invalid(format!(
+                        "model {provider_id}/{model_id:?} maxTokens must be greater than zero"
+                    )));
+                }
                 let name = model.name.clone().unwrap_or_else(|| model_id.clone());
                 let api = model
                     .api
@@ -282,7 +326,7 @@ impl ModelCatalog {
                     context_window: model.context_window,
                     max_tokens: model.max_tokens,
                     cost,
-                    sampling: model.sampling,
+                    sampling_params: model.sampling_params,
                 });
             }
         }
@@ -452,8 +496,8 @@ struct RawModel {
     cost: Option<RawCost>,
     #[serde(default)]
     compat: RawCompatibility,
-    #[serde(default)]
-    sampling: BTreeMap<String, Value>,
+    #[serde(rename = "samplingParams", alias = "sampling", default)]
+    sampling_params: BTreeMap<String, Value>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
 }
@@ -469,8 +513,8 @@ struct RawCompatibility {
 impl RawCompatibility {
     fn resolve(&self) -> Compatibility {
         Compatibility {
-            supports_developer_role: self.supports_developer_role.unwrap_or(false),
-            supports_reasoning_effort: self.supports_reasoning_effort.unwrap_or(false),
+            supports_developer_role: self.supports_developer_role.unwrap_or(true),
+            supports_reasoning_effort: self.supports_reasoning_effort.unwrap_or(true),
         }
     }
 }

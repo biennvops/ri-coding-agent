@@ -64,31 +64,32 @@ impl ModelProvider for ConfiguredProvider {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MessageRole {
-    System,
-    Developer,
-    User,
-    Assistant,
-    Tool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelMessage {
-    pub role: MessageRole,
-    pub content: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
+pub enum ModelMessage {
+    System {
+        content: String,
+    },
+    Developer {
+        content: String,
+    },
+    User {
+        content: String,
+    },
+    Assistant {
+        content: String,
+        thinking: Option<String>,
+        tool_calls: Vec<ModelToolCall>,
+    },
+    ToolResult {
+        tool_call_id: String,
+        tool_name: String,
+        content: String,
+    },
 }
 
 impl ModelMessage {
     pub fn user(content: impl Into<String>) -> Self {
-        Self {
-            role: MessageRole::User,
+        Self::User {
             content: content.into(),
-            name: None,
-            tool_call_id: None,
         }
     }
 }
@@ -106,7 +107,7 @@ pub struct ModelRequest {
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: Option<u64>,
     pub reasoning_effort: Option<String>,
-    pub sampling: BTreeMap<String, Value>,
+    pub sampling_params: BTreeMap<String, Value>,
 }
 
 impl ModelRequest {
@@ -116,7 +117,7 @@ impl ModelRequest {
             tools: Vec::new(),
             max_tokens: None,
             reasoning_effort: None,
-            sampling: BTreeMap::new(),
+            sampling_params: BTreeMap::new(),
         }
     }
 
@@ -124,8 +125,10 @@ impl ModelRequest {
         self.messages
             .iter()
             .rev()
-            .find(|message| message.role == MessageRole::User)
-            .map(|message| message.content.as_str())
+            .find_map(|message| match message {
+                ModelMessage::User { content } => Some(content.as_str()),
+                _ => None,
+            })
             .unwrap_or_default()
     }
 }
@@ -140,7 +143,7 @@ pub enum ModelEvent {
     },
     ToolCallDelta {
         index: usize,
-        id: Option<String>,
+        call_id: Option<String>,
         item_id: Option<String>,
         name: Option<String>,
         arguments: String,
@@ -158,11 +161,11 @@ pub struct Usage {
     pub cache_write_tokens: Option<u64>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelToolCall {
     pub index: usize,
     /// The callable tool identifier (`call_...` for Responses API calls).
-    pub id: Option<String>,
+    pub call_id: Option<String>,
     /// The output item identifier (`fc_...` for Responses API calls).
     pub item_id: Option<String>,
     pub name: Option<String>,
@@ -171,6 +174,8 @@ pub struct ModelToolCall {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelResponse {
+    pub content: String,
+    pub thinking: Option<String>,
     pub stop_reason: StopReason,
     pub tool_calls: Vec<ModelToolCall>,
     pub usage: Option<Usage>,
@@ -287,6 +292,8 @@ impl ModelProvider for MockProvider {
         }
 
         Ok(ModelResponse {
+            content: response,
+            thinking: None,
             stop_reason: StopReason::Stop,
             tool_calls: Vec::new(),
             usage: None,
