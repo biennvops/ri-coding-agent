@@ -300,6 +300,7 @@ pub enum StopReason {
     ToolCalls,
     Length,
     ContentFilter,
+    Incomplete,
     Cancelled,
     Error,
 }

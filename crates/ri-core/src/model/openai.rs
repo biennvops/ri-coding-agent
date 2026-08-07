@@ -131,7 +131,7 @@ impl ModelProvider for OpenAiProvider {
             process_payloads(parser.finish()?, api, &events, &cancel, &mut collector).await?;
         }
 
-        Ok(collector.finish())
+        collector.finish()
     }
 }
 
@@ -148,6 +148,9 @@ async fn process_payloads(
         }
 
         let parsed = parse_payload(api, &payload)?;
+        if parsed.terminal {
+            collector.terminal_seen = true;
+        }
         if let Some(reason) = parsed.stop_reason {
             collector.stop_reason = Some(reason);
         }
@@ -211,6 +214,7 @@ async fn read_error_body(
 #[derive(Default)]
 struct ResponseCollector {
     stop_reason: Option<StopReason>,
+    terminal_seen: bool,
     tool_calls: BTreeMap<usize, ModelToolCall>,
     usage: Option<Usage>,
 }
@@ -253,24 +257,32 @@ impl ResponseCollector {
         }
     }
 
-    fn finish(self) -> ModelResponse {
-        let stop_reason = if self.tool_calls.is_empty() {
-            self.stop_reason.unwrap_or(StopReason::Stop)
-        } else {
-            StopReason::ToolCalls
+    fn finish(self) -> Result<ModelResponse, ProviderError> {
+        if !self.terminal_seen {
+            return Err(ProviderError::Failed {
+                message: "response stream ended before a terminal event".to_owned(),
+            });
+        }
+
+        let stop_reason = match self.stop_reason {
+            Some(StopReason::Stop) if !self.tool_calls.is_empty() => StopReason::ToolCalls,
+            Some(reason) => reason,
+            None if !self.tool_calls.is_empty() => StopReason::ToolCalls,
+            None => StopReason::Stop,
         };
-        ModelResponse {
+        Ok(ModelResponse {
             stop_reason,
             tool_calls: self.tool_calls.into_values().collect(),
             usage: self.usage,
-        }
+        })
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct ParsedPayload {
     events: Vec<ModelEvent>,
     stop_reason: Option<StopReason>,
+    terminal: bool,
 }
 
 fn parse_payload(api: ApiKind, payload: &str) -> Result<ParsedPayload, ProviderError> {
@@ -284,6 +296,15 @@ fn parse_payload(api: ApiKind, payload: &str) -> Result<ParsedPayload, ProviderE
     {
         return Err(ProviderError::Failed {
             message: message.to_owned(),
+        });
+    }
+    if value.get("type").and_then(Value::as_str) == Some("error") {
+        return Err(ProviderError::Failed {
+            message: value
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Responses stream reported an error")
+                .to_owned(),
         });
     }
 
@@ -395,8 +416,36 @@ fn parse_responses_payload(value: &Value) -> Result<ParsedPayload, ProviderError
                 arguments_complete: true,
             });
         }
+        "response.incomplete" => {
+            let response = value.get("response").unwrap_or(value);
+            parsed.terminal = true;
+            if let Some(usage) = response.get("usage").and_then(parse_usage) {
+                parsed.events.push(ModelEvent::UsageUpdated(usage));
+            }
+            parsed.stop_reason = Some(
+                response
+                    .get("incomplete_details")
+                    .and_then(|details| details.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(normalize_incomplete_reason)
+                    .unwrap_or(StopReason::Incomplete),
+            );
+        }
+        "response.failed" => {
+            let response = value.get("response").unwrap_or(value);
+            return Err(ProviderError::Failed {
+                message: response
+                    .get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(Value::as_str)
+                    .or_else(|| value.get("message").and_then(Value::as_str))
+                    .unwrap_or("Responses stream reported a failure")
+                    .to_owned(),
+            });
+        }
         "response.completed" | "response.done" => {
             let response = value.get("response").unwrap_or(value);
+            parsed.terminal = true;
             if let Some(usage) = response.get("usage").and_then(parse_usage) {
                 parsed.events.push(ModelEvent::UsageUpdated(usage));
             }
@@ -467,6 +516,7 @@ fn parse_completions_payload(value: &Value) -> Result<ParsedPayload, ProviderErr
         .and_then(|choice| choice.get("finish_reason"))
         .and_then(Value::as_str)
     {
+        parsed.terminal = true;
         parsed.stop_reason = normalize_stop_reason(finish_reason);
     }
     if let Some(usage) = value.get("usage").and_then(parse_usage) {
@@ -516,6 +566,14 @@ fn normalize_stop_reason(value: &str) -> Option<StopReason> {
         "length" | "max_output_tokens" | "max_tokens" => Some(StopReason::Length),
         "content_filter" => Some(StopReason::ContentFilter),
         _ => None,
+    }
+}
+
+fn normalize_incomplete_reason(value: &str) -> StopReason {
+    match value {
+        "max_output_tokens" | "max_tokens" | "length" => StopReason::Length,
+        "content_filter" => StopReason::ContentFilter,
+        _ => StopReason::Incomplete,
     }
 }
 
@@ -772,7 +830,10 @@ mod tests {
             collector.record(&event);
         }
         collector.stop_reason = second.stop_reason;
-        let response = collector.finish();
+        collector.terminal_seen = true;
+        let response = collector
+            .finish()
+            .expect("completed response should finish");
 
         assert_eq!(response.stop_reason, StopReason::ToolCalls);
         assert_eq!(response.tool_calls[0].name.as_deref(), Some("read"));
@@ -797,6 +858,54 @@ mod tests {
         assert!(is_context_overflow(413, "payload too large"));
         assert!(is_context_overflow(400, "maximum context length is 1000"));
         assert!(!is_context_overflow(400, "invalid parameter"));
+    }
+
+    #[test]
+    fn responses_incomplete_preserves_reason_and_does_not_infer_tool_calls() {
+        let added = parse_payload(
+            ApiKind::OpenAiResponses,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_123","call_id":"call_123","name":"read","arguments":""}}"#,
+        )
+        .expect("output item should parse");
+        let incomplete = parse_payload(
+            ApiKind::OpenAiResponses,
+            r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}"#,
+        )
+        .expect("incomplete response should parse");
+
+        let mut collector = ResponseCollector::default();
+        for event in added.events {
+            collector.record(&event);
+        }
+        collector.terminal_seen = incomplete.terminal;
+        collector.stop_reason = incomplete.stop_reason;
+        let response = collector
+            .finish()
+            .expect("incomplete response should finish");
+
+        assert_eq!(response.stop_reason, StopReason::Length);
+        assert_eq!(response.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn responses_failed_and_top_level_error_events_surface_provider_errors() {
+        let failed = parse_payload(
+            ApiKind::OpenAiResponses,
+            r#"{"type":"response.failed","response":{"error":{"message":"model overloaded"}}}"#,
+        )
+        .expect_err("failed response should be an error");
+        assert!(
+            matches!(failed, ProviderError::Failed { message } if message == "model overloaded")
+        );
+
+        let top_level = parse_payload(
+            ApiKind::OpenAiResponses,
+            r#"{"type":"error","message":"stream interrupted"}"#,
+        )
+        .expect_err("top-level error event should be an error");
+        assert!(
+            matches!(top_level, ProviderError::Failed { message } if message == "stream interrupted")
+        );
     }
 
     #[test]
@@ -856,6 +965,9 @@ mod tests {
         for payload in payloads {
             let parsed = parse_payload(ApiKind::OpenAiResponses, payload)
                 .expect("Responses event should parse");
+            if parsed.terminal {
+                collector.terminal_seen = true;
+            }
             if let Some(reason) = parsed.stop_reason {
                 collector.stop_reason = Some(reason);
             }
@@ -864,7 +976,9 @@ mod tests {
             }
         }
 
-        let response = collector.finish();
+        let response = collector
+            .finish()
+            .expect("completed response should finish");
         assert_eq!(response.stop_reason, StopReason::ToolCalls);
         assert_eq!(response.tool_calls.len(), 1);
         assert_eq!(response.tool_calls[0].id.as_deref(), Some("call_123"));
