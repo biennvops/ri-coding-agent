@@ -7,5 +7,6 @@ license.workspace = true
 [dependencies]
 async-trait = "0.1"
 thiserror = "2"
+unicode-segmentation = "1"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }

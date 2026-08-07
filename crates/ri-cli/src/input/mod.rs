@@ -1,4 +1,8 @@
+mod layout;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+pub(crate) use layout::VisualLayout;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {

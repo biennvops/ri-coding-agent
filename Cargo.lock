@@ -615,6 +615,7 @@ dependencies = [
  "ratatui",
  "ri-core",
  "tokio",
+ "unicode-segmentation",
  "unicode-width",
 ]
 
@@ -626,6 +627,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "unicode-segmentation",
 ]
 
 [[package]]

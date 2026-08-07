@@ -1,3 +1,5 @@
+use unicode_segmentation::UnicodeSegmentation;
+
 use crate::agent::{AgentError, AgentEvent};
 use crate::model::StopReason;
 
@@ -54,6 +56,12 @@ impl AppState {
         self.cursor
     }
 
+    pub fn set_cursor(&mut self, cursor: usize) {
+        if !self.turn_active && cursor <= self.input.len() && self.input.is_char_boundary(cursor) {
+            self.cursor = cursor;
+        }
+    }
+
     pub fn is_turn_active(&self) -> bool {
         self.turn_active
     }
@@ -82,7 +90,7 @@ impl AppState {
         if self.turn_active || self.cursor == 0 {
             return;
         }
-        let previous = previous_char_boundary(&self.input, self.cursor);
+        let previous = previous_grapheme_boundary(&self.input, self.cursor);
         self.input.drain(previous..self.cursor);
         self.cursor = previous;
     }
@@ -91,19 +99,19 @@ impl AppState {
         if self.turn_active || self.cursor == self.input.len() {
             return;
         }
-        let next = next_char_boundary(&self.input, self.cursor);
+        let next = next_grapheme_boundary(&self.input, self.cursor);
         self.input.drain(self.cursor..next);
     }
 
     pub fn move_left(&mut self) {
         if !self.turn_active {
-            self.cursor = previous_char_boundary(&self.input, self.cursor);
+            self.cursor = previous_grapheme_boundary(&self.input, self.cursor);
         }
     }
 
     pub fn move_right(&mut self) {
         if !self.turn_active {
-            self.cursor = next_char_boundary(&self.input, self.cursor);
+            self.cursor = next_grapheme_boundary(&self.input, self.cursor);
         }
     }
 
@@ -116,18 +124,6 @@ impl AppState {
     pub fn move_end(&mut self) {
         if !self.turn_active {
             self.cursor = line_end(&self.input, self.cursor);
-        }
-    }
-
-    pub fn move_up(&mut self) {
-        if !self.turn_active {
-            self.cursor = vertical_cursor(&self.input, self.cursor, -1);
-        }
-    }
-
-    pub fn move_down(&mut self) {
-        if !self.turn_active {
-            self.cursor = vertical_cursor(&self.input, self.cursor, 1);
         }
     }
 
@@ -190,17 +186,17 @@ impl AppState {
     }
 }
 
-fn previous_char_boundary(text: &str, cursor: usize) -> usize {
+fn previous_grapheme_boundary(text: &str, cursor: usize) -> usize {
     text[..cursor]
-        .char_indices()
+        .grapheme_indices(true)
         .next_back()
         .map(|(index, _)| index)
         .unwrap_or(0)
 }
 
-fn next_char_boundary(text: &str, cursor: usize) -> usize {
+fn next_grapheme_boundary(text: &str, cursor: usize) -> usize {
     text[cursor..]
-        .char_indices()
+        .grapheme_indices(true)
         .nth(1)
         .map(|(index, _)| cursor + index)
         .unwrap_or(text.len())
@@ -218,36 +214,6 @@ fn line_end(text: &str, cursor: usize) -> usize {
         .find('\n')
         .map(|index| cursor + index)
         .unwrap_or(text.len())
-}
-
-fn vertical_cursor(text: &str, cursor: usize, direction: isize) -> usize {
-    let current_start = line_start(text, cursor);
-    let column = text[current_start..cursor].chars().count();
-
-    if direction < 0 {
-        if current_start == 0 {
-            return cursor;
-        }
-        let previous_end = current_start - 1;
-        let previous_start = line_start(text, previous_end);
-        return char_offset(text, previous_start, previous_end, column);
-    }
-
-    let current_end = line_end(text, cursor);
-    if current_end == text.len() {
-        return cursor;
-    }
-    let next_start = current_end + 1;
-    let next_end = line_end(text, next_start);
-    char_offset(text, next_start, next_end, column)
-}
-
-fn char_offset(text: &str, start: usize, end: usize, column: usize) -> usize {
-    text[start..end]
-        .char_indices()
-        .nth(column)
-        .map(|(index, _)| start + index)
-        .unwrap_or(end)
 }
 
 #[cfg(test)]
@@ -298,19 +264,20 @@ mod tests {
     }
 
     #[test]
-    fn editor_supports_multiline_unicode_and_vertical_movement() {
+    fn editor_supports_multiline_unicode_and_grapheme_editing() {
         let mut state = AppState::new();
         state.insert_text("one\ntwo");
         state.move_home();
         state.move_right();
         state.move_right();
-        state.move_up();
-        assert_eq!(&state.input()[..state.cursor()], "on");
-        state.move_down();
         assert_eq!(&state.input()[..state.cursor()], "one\ntw");
 
         state.move_end();
         state.insert_text(" 🦀");
+        state.backspace();
+        assert_eq!(state.input(), "one\ntwo ");
+
+        state.insert_text("👨‍👩‍👧‍👦");
         state.backspace();
         assert_eq!(state.input(), "one\ntwo ");
     }

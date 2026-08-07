@@ -6,7 +6,7 @@ use crossterm::event::{self, Event, KeyEventKind};
 use ri_core::{AgentCommand, AgentEvent, AgentRuntime, AppState, MockProvider, StopReason};
 use tokio::sync::mpsc;
 
-use crate::input::{self, Action};
+use crate::input::{self, Action, VisualLayout};
 use crate::render;
 use crate::terminal::TerminalGuard;
 
@@ -149,6 +149,14 @@ fn run_tui_loop(
 ) -> Result<()> {
     let mut dirty = true;
     let mut scroll_from_bottom = 0usize;
+    let mut editor_width = terminal
+        .terminal_mut()
+        .size()
+        .context("could not determine terminal size")?
+        .width
+        .saturating_sub(2)
+        .max(1) as usize;
+    let mut preferred_column = None;
     let mut exit = false;
 
     while !exit {
@@ -159,55 +167,73 @@ fn run_tui_loop(
         }
 
         if event::poll(Duration::from_millis(50)).context("could not read terminal input")? {
-            if let Event::Key(key) = event::read().context("could not read terminal event")? {
-                if key.kind == KeyEventKind::Press {
-                    let Some(action) = input::action_for(key) else {
-                        continue;
-                    };
-                    dirty = true;
-                    match action {
-                        Action::Submit => {
-                            if let Some(text) = state.submit_input() {
-                                command_tx
-                                    .try_send(AgentCommand::Submit { text })
-                                    .context("could not send prompt to the agent")?;
-                                scroll_from_bottom = 0;
+            match event::read().context("could not read terminal event")? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if let Some(action) = input::action_for(key) {
+                        dirty = true;
+                        if !matches!(action, Action::Up | Action::Down) {
+                            preferred_column = None;
+                        }
+                        match action {
+                            Action::Submit => {
+                                if let Some(text) = state.submit_input() {
+                                    command_tx
+                                        .try_send(AgentCommand::Submit { text })
+                                        .context("could not send prompt to the agent")?;
+                                    scroll_from_bottom = 0;
+                                }
                             }
-                        }
-                        Action::Newline => state.insert_newline(),
-                        Action::Escape => {
-                            if state.is_turn_active() {
-                                command_tx
-                                    .try_send(AgentCommand::Cancel)
-                                    .context("could not cancel the active turn")?;
+                            Action::Newline => state.insert_newline(),
+                            Action::Escape => {
+                                if state.is_turn_active() {
+                                    command_tx
+                                        .try_send(AgentCommand::Cancel)
+                                        .context("could not cancel the active turn")?;
+                                }
                             }
-                        }
-                        Action::CtrlC => {
-                            if state.is_turn_active() {
-                                command_tx
-                                    .try_send(AgentCommand::Cancel)
-                                    .context("could not cancel the active turn")?;
-                            } else {
-                                exit = true;
+                            Action::CtrlC => {
+                                if state.is_turn_active() {
+                                    command_tx
+                                        .try_send(AgentCommand::Cancel)
+                                        .context("could not cancel the active turn")?;
+                                } else {
+                                    exit = true;
+                                }
                             }
-                        }
-                        Action::Insert(character) => state.insert_text(&character.to_string()),
-                        Action::Backspace => state.backspace(),
-                        Action::Delete => state.delete(),
-                        Action::Left => state.move_left(),
-                        Action::Right => state.move_right(),
-                        Action::Up => state.move_up(),
-                        Action::Down => state.move_down(),
-                        Action::Home => state.move_home(),
-                        Action::End => state.move_end(),
-                        Action::PageUp => {
-                            scroll_from_bottom = scroll_from_bottom.saturating_add(10)
-                        }
-                        Action::PageDown => {
-                            scroll_from_bottom = scroll_from_bottom.saturating_sub(10)
+                            Action::Insert(character) => state.insert_text(&character.to_string()),
+                            Action::Backspace => state.backspace(),
+                            Action::Delete => state.delete(),
+                            Action::Left => state.move_left(),
+                            Action::Right => state.move_right(),
+                            Action::Up | Action::Down => {
+                                let direction = if matches!(action, Action::Up) { -1 } else { 1 };
+                                let layout = VisualLayout::new(state.input(), editor_width);
+                                if let Some((cursor, desired_column)) = layout.move_vertical(
+                                    state.cursor(),
+                                    direction,
+                                    preferred_column,
+                                ) {
+                                    state.set_cursor(cursor);
+                                    preferred_column = Some(desired_column);
+                                }
+                            }
+                            Action::Home => state.move_home(),
+                            Action::End => state.move_end(),
+                            Action::PageUp => {
+                                scroll_from_bottom = scroll_from_bottom.saturating_add(10)
+                            }
+                            Action::PageDown => {
+                                scroll_from_bottom = scroll_from_bottom.saturating_sub(10)
+                            }
                         }
                     }
                 }
+                Event::Resize(width, _) => {
+                    editor_width = width.saturating_sub(2).max(1) as usize;
+                    preferred_column = None;
+                    dirty = true;
+                }
+                _ => {}
             }
         }
 

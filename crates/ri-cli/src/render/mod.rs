@@ -4,11 +4,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 use ri_core::{AppState, MessageRole};
-use unicode_width::UnicodeWidthChar;
 
+use crate::input::VisualLayout;
 use crate::terminal::TerminalGuard;
-
-const TAB_WIDTH: usize = 4;
 
 pub fn draw(
     terminal: &mut TerminalGuard,
@@ -24,9 +22,9 @@ pub fn draw(
 fn render_frame(frame: &mut Frame<'_>, state: &AppState, scroll_from_bottom: usize) {
     let area = frame.area();
     let editor_width = area.width.saturating_sub(2).max(1) as usize;
-    let (editor_cursor_row, _) =
-        visual_cursor_position(state.input(), state.cursor(), editor_width);
-    let editor_rows = visual_row_count(state.input(), editor_width).max(editor_cursor_row + 1);
+    let editor_layout = VisualLayout::new(state.input(), editor_width);
+    let editor_cursor_row = editor_layout.cursor_position(state.cursor()).row;
+    let editor_rows = editor_layout.row_count().max(editor_cursor_row + 1);
     let editor_height = (editor_rows.saturating_add(2).min(u16::MAX as usize) as u16)
         .min(area.height.saturating_sub(2))
         .max(3);
@@ -50,10 +48,21 @@ fn render_frame(frame: &mut Frame<'_>, state: &AppState, scroll_from_bottom: usi
     frame.render_widget(transcript, chunks[0]);
 
     let editor_width = chunks[1].width.saturating_sub(2).max(1) as usize;
-    let (editor_lines, cursor_row, cursor_column) =
-        editor_lines_and_cursor(state.input(), state.cursor(), editor_width);
+    let editor_layout = VisualLayout::new(state.input(), editor_width);
+    let cursor = editor_layout.cursor_position(state.cursor());
+    let mut editor_lines: Vec<Line<'static>> = editor_layout
+        .rows()
+        .iter()
+        .cloned()
+        .map(Line::from)
+        .collect();
+    while editor_lines.len() <= cursor.row {
+        editor_lines.push(Line::default());
+    }
     let editor_visible_lines = chunks[1].height.saturating_sub(2) as usize;
-    let editor_scroll = cursor_row.saturating_sub(editor_visible_lines.saturating_sub(1));
+    let editor_scroll = cursor
+        .row
+        .saturating_sub(editor_visible_lines.saturating_sub(1));
     let editor_title = if state.is_turn_active() {
         " input · Esc cancels "
     } else {
@@ -71,11 +80,11 @@ fn render_frame(frame: &mut Frame<'_>, state: &AppState, scroll_from_bottom: usi
         let x = chunks[1]
             .x
             .saturating_add(1)
-            .saturating_add(cursor_column as u16);
+            .saturating_add(cursor.column as u16);
         let y = chunks[1]
             .y
             .saturating_add(1)
-            .saturating_add(cursor_row.saturating_sub(editor_scroll) as u16);
+            .saturating_add(cursor.row.saturating_sub(editor_scroll) as u16);
         let max_x = chunks[1]
             .x
             .saturating_add(chunks[1].width.saturating_sub(2));
@@ -94,15 +103,15 @@ fn transcript_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
             MessageRole::User => ("you", Style::default().fg(Color::Yellow)),
             MessageRole::Assistant => ("assistant", Style::default().fg(Color::Green)),
         };
-        lines.extend(wrapped_styled_lines(&format!("▶ {label}"), style, width));
-        append_wrapped_content(&mut lines, &message.content, Style::default(), width);
+        lines.extend(layout_styled_lines(&format!("▶ {label}"), style, width));
+        append_layout_content(&mut lines, &message.content, Style::default(), width);
         if let Some(thinking) = &message.thinking {
-            lines.extend(wrapped_styled_lines(
+            lines.extend(layout_styled_lines(
                 "  thinking:",
                 Style::default().fg(Color::Cyan),
                 width,
             ));
-            append_wrapped_content(
+            append_layout_content(
                 &mut lines,
                 thinking,
                 Style::default().fg(Color::DarkGray),
@@ -113,19 +122,19 @@ fn transcript_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
     }
 
     if let Some((content, thinking)) = state.streaming_assistant() {
-        lines.extend(wrapped_styled_lines(
+        lines.extend(layout_styled_lines(
             "▶ assistant · streaming",
             Style::default().fg(Color::Green),
             width,
         ));
-        append_wrapped_content(&mut lines, content, Style::default(), width);
+        append_layout_content(&mut lines, content, Style::default(), width);
         if !thinking.is_empty() {
-            lines.extend(wrapped_styled_lines(
+            lines.extend(layout_styled_lines(
                 "  thinking:",
                 Style::default().fg(Color::Cyan),
                 width,
             ));
-            append_wrapped_content(
+            append_layout_content(
                 &mut lines,
                 thinking,
                 Style::default().fg(Color::DarkGray),
@@ -135,7 +144,7 @@ fn transcript_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
     }
 
     if lines.is_empty() {
-        lines.extend(wrapped_styled_lines(
+        lines.extend(layout_styled_lines(
             "Start by describing a task.",
             Style::default().fg(Color::DarkGray),
             width,
@@ -145,119 +154,24 @@ fn transcript_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-fn append_wrapped_content(
+fn append_layout_content(
     lines: &mut Vec<Line<'static>>,
     content: &str,
     style: Style,
     width: usize,
 ) {
     for line in content.split('\n') {
-        lines.extend(wrapped_styled_lines(&format!("  {line}"), style, width));
+        lines.extend(layout_styled_lines(&format!("  {line}"), style, width));
     }
 }
 
-fn wrapped_styled_lines(text: &str, style: Style, width: usize) -> Vec<Line<'static>> {
-    wrapped_segments(text, width)
-        .into_iter()
-        .map(|segment| Line::from(Span::styled(segment, style)))
+fn layout_styled_lines(text: &str, style: Style, width: usize) -> Vec<Line<'static>> {
+    VisualLayout::new(text, width)
+        .rows()
+        .iter()
+        .cloned()
+        .map(|row| Line::from(Span::styled(row, style)))
         .collect()
-}
-
-fn editor_lines_and_cursor(
-    text: &str,
-    cursor: usize,
-    width: usize,
-) -> (Vec<Line<'static>>, usize, usize) {
-    let (cursor_row, cursor_column) = visual_cursor_position(text, cursor, width);
-    let mut lines: Vec<Line<'static>> = wrapped_segments_for_text(text, width)
-        .into_iter()
-        .map(Line::from)
-        .collect();
-
-    while lines.len() <= cursor_row {
-        lines.push(Line::default());
-    }
-
-    (lines, cursor_row, cursor_column)
-}
-
-fn visual_row_count(text: &str, width: usize) -> usize {
-    wrapped_segments_for_text(text, width).len()
-}
-
-fn wrapped_segments_for_text(text: &str, width: usize) -> Vec<String> {
-    text.split('\n')
-        .flat_map(|line| wrapped_segments(line, width))
-        .collect()
-}
-
-fn wrapped_segments(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    if text.is_empty() {
-        return vec![String::new()];
-    }
-
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    let mut current_width = 0;
-
-    for character in text.chars() {
-        let character_width = display_width(character);
-        if !current.is_empty() && current_width + character_width > width {
-            lines.push(std::mem::take(&mut current));
-            current_width = 0;
-        }
-        current.push(character);
-        current_width += character_width;
-    }
-
-    lines.push(current);
-    lines
-}
-
-fn visual_cursor_position(text: &str, cursor: usize, width: usize) -> (usize, usize) {
-    let width = width.max(1);
-    let cursor = cursor.min(text.len());
-    let prefix = text.get(..cursor).unwrap_or(text);
-    let mut row = 0;
-    let mut column = 0;
-
-    for character in prefix.chars() {
-        if character == '\n' {
-            row += 1;
-            column = 0;
-            continue;
-        }
-
-        let character_width = display_width(character);
-        if column > 0 && column + character_width > width {
-            row += 1;
-            column = 0;
-        }
-        column += character_width;
-    }
-
-    if column >= width {
-        if !matches!(
-            text.get(cursor..).and_then(|rest| rest.chars().next()),
-            Some('\n')
-        ) {
-            row += 1;
-            column = 0;
-        } else {
-            column = width.saturating_sub(1);
-        }
-    }
-
-    (row, column.min(width.saturating_sub(1)))
-}
-
-fn display_width(character: char) -> usize {
-    if character == '\t' {
-        TAB_WIDTH
-    } else {
-        UnicodeWidthChar::width(character).unwrap_or(0)
-    }
 }
 
 fn footer_text(state: &AppState, width: u16) -> Line<'static> {
@@ -273,32 +187,4 @@ fn footer_text(state: &AppState, width: u16) -> Line<'static> {
         .take(width.saturating_sub(1) as usize)
         .collect();
     Line::from(Span::styled(truncated, Style::default().fg(Color::Gray)))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn wrapping_returns_visual_rows_for_long_lines() {
-        assert_eq!(
-            wrapped_segments_for_text("abcdefghij", 4),
-            ["abcd", "efgh", "ij"]
-        );
-        assert_eq!(wrapped_segments_for_text("one\ntwo", 10), ["one", "two"]);
-    }
-
-    #[test]
-    fn cursor_moves_to_visual_rows_when_a_line_wraps() {
-        assert_eq!(visual_cursor_position("abcdefghij", 4, 4), (1, 0));
-        assert_eq!(visual_cursor_position("abcdefghij", 10, 4), (2, 2));
-        assert_eq!(visual_cursor_position("abcd\nef", 4, 4), (0, 3));
-    }
-
-    #[test]
-    fn editor_adds_a_cursor_row_after_a_full_wrapped_line() {
-        let (lines, row, column) = editor_lines_and_cursor("abcd", 4, 4);
-        assert_eq!(lines.len(), 2);
-        assert_eq!((row, column), (1, 0));
-    }
 }
