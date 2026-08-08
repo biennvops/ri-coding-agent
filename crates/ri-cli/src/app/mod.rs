@@ -7,7 +7,7 @@ use ri_core::{
     config::{load_default_models, load_default_settings},
     context::{build_system_prompt, discover_project, load_context, ContextBundle},
     AgentCommand, AgentEvent, AgentRuntime, AgentRuntimeConfig, AppState, ConfiguredProvider,
-    ModelCatalog, ModelMessage, ModelRef, ResolvedModel, StopReason, ToolContext,
+    ModelCatalog, ModelMessage, ModelRef, ResolvedModel, ResolvedSettings, StopReason, ToolContext,
 };
 use tokio::sync::mpsc;
 
@@ -108,31 +108,14 @@ impl AppSetup {
             eprintln!("ri: warning: {}: {}", warning.path, warning.message);
         }
 
-        let requested_provider = options
-            .provider
-            .as_deref()
-            .or(settings.settings.default_provider.as_deref());
-        let requested_model = options
-            .model
-            .as_deref()
-            .or(settings.settings.default_model.as_deref());
-        let provider_selection = if options.provider.is_none()
-            && options
-                .model
-                .as_deref()
-                .is_some_and(|model| model.contains('/'))
-        {
-            None
-        } else {
-            requested_provider
-        };
+        let (requested_provider, requested_model) = model_selection(options, &settings.settings);
         let catalog = load_default_models().context("could not load models.json")?;
         let (provider, catalog, selected) = if let Some(catalog) = catalog {
             for warning in catalog.warnings() {
                 eprintln!("ri: warning: {}: {}", warning.path, warning.message);
             }
             let selected = catalog
-                .resolve(provider_selection, requested_model)
+                .resolve(requested_provider, requested_model)
                 .context("could not select configured model")?;
             let provider = ConfiguredProvider::openai(selected.clone())
                 .map_err(|error| anyhow!(error.to_string()))?;
@@ -142,7 +125,8 @@ impl AppSetup {
                 || settings.settings.default_model.is_some()
             {
                 bail!(
-                    "settings select provider/model, but no models.json is available; create ~/.ri/agent/models.json or set RI_MODELS_FILE"
+                    "settings select {}, but no models.json is available; create ~/.ri/agent/models.json or set RI_MODELS_FILE",
+                    settings_selection_description(&settings.settings)
                 );
             }
             bail!("no models.json found; create ~/.ri/agent/models.json or set RI_MODELS_FILE");
@@ -416,6 +400,40 @@ async fn run_tui_loop(
     Ok(())
 }
 
+fn model_selection<'a>(
+    options: &'a Options,
+    settings: &'a ResolvedSettings,
+) -> (Option<&'a str>, Option<&'a str>) {
+    let provider = options
+        .provider
+        .as_deref()
+        .or(settings.default_provider.as_deref());
+    let model = options
+        .model
+        .as_deref()
+        .or(settings.default_model.as_deref());
+    let provider = if options.provider.is_none() && model.is_some_and(|model| model.contains('/')) {
+        None
+    } else {
+        provider
+    };
+    (provider, model)
+}
+
+fn settings_selection_description(settings: &ResolvedSettings) -> String {
+    match (
+        settings.default_provider.as_deref(),
+        settings.default_model.as_deref(),
+    ) {
+        (Some(provider), Some(model)) => {
+            format!("provider {provider:?} and model {model:?}")
+        }
+        (Some(provider), None) => format!("provider {provider:?}"),
+        (None, Some(model)) => format!("model {model:?}"),
+        (None, None) => "a configured model".to_owned(),
+    }
+}
+
 fn model_command(input: &str) -> Option<Option<String>> {
     let input = input.trim();
     if input == "/model" {
@@ -518,6 +536,89 @@ mod tests {
 
         assert_eq!(options.print_prompt.as_deref(), Some("hello"));
         assert!(options.no_context);
+    }
+
+    #[test]
+    fn settings_defaults_feed_model_catalog_and_cli_overrides_win() {
+        let settings = ResolvedSettings {
+            default_provider: Some("provider-a".to_owned()),
+            default_model: Some("model-a".to_owned()),
+            ..ResolvedSettings::default()
+        };
+        let options = Options::default();
+        let (provider, model) = model_selection(&options, &settings);
+        let catalog = ModelCatalog::from_json(
+            "models.json",
+            r#"{
+                "providers": {
+                    "provider-a": {
+                        "baseUrl": "https://example.test",
+                        "api": "openai-responses",
+                        "models": [{"id": "model-a"}]
+                    },
+                    "provider-b": {
+                        "baseUrl": "https://example.test",
+                        "api": "openai-responses",
+                        "models": [{"id": "model-b"}]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            catalog
+                .resolve(provider, model)
+                .unwrap()
+                .model_ref
+                .display_name(),
+            "provider-a/model-a"
+        );
+
+        let options = Options {
+            provider: Some("provider-b".to_owned()),
+            model: Some("model-b".to_owned()),
+            ..Options::default()
+        };
+        let (provider, model) = model_selection(&options, &settings);
+        assert_eq!(
+            catalog
+                .resolve(provider, model)
+                .unwrap()
+                .model_ref
+                .display_name(),
+            "provider-b/model-b"
+        );
+    }
+
+    #[test]
+    fn qualified_cli_model_can_override_a_settings_provider() {
+        let settings = ResolvedSettings {
+            default_provider: Some("provider-a".to_owned()),
+            ..ResolvedSettings::default()
+        };
+        let options = Options {
+            model: Some("provider-b/model-b".to_owned()),
+            ..Options::default()
+        };
+
+        assert_eq!(
+            model_selection(&options, &settings),
+            (None, Some("provider-b/model-b"))
+        );
+    }
+
+    #[test]
+    fn settings_selection_diagnostic_includes_requested_values() {
+        let settings = ResolvedSettings {
+            default_provider: Some("foo".to_owned()),
+            default_model: Some("coding".to_owned()),
+            ..ResolvedSettings::default()
+        };
+
+        assert_eq!(
+            settings_selection_description(&settings),
+            "provider \"foo\" and model \"coding\""
+        );
     }
 
     #[test]
