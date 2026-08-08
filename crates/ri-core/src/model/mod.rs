@@ -74,6 +74,13 @@ pub struct ModelThinking {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModelAssistantItem {
+    Text { content: String },
+    Reasoning(ModelThinking),
+    ToolCall(ModelToolCall),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelMessage {
     System {
         content: String,
@@ -85,9 +92,7 @@ pub enum ModelMessage {
         content: String,
     },
     Assistant {
-        content: String,
-        thinking: Option<ModelThinking>,
-        tool_calls: Vec<ModelToolCall>,
+        items: Vec<ModelAssistantItem>,
     },
     ToolResult {
         tool_call_id: String,
@@ -146,15 +151,23 @@ impl ModelRequest {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ModelEvent {
     AssistantTextDelta {
+        index: Option<usize>,
         text: String,
     },
+    AssistantTextItem {
+        index: usize,
+        content: Option<String>,
+    },
     AssistantThinkingDelta {
+        item_id: Option<String>,
         text: String,
     },
     AssistantThinkingContentDelta {
+        item_id: Option<String>,
         text: String,
     },
     AssistantThinkingItem {
+        index: usize,
         item_id: Option<String>,
         summary: Option<String>,
         content: Option<String>,
@@ -193,10 +206,8 @@ pub struct ModelToolCall {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelResponse {
-    pub content: String,
-    pub thinking: Option<ModelThinking>,
+    pub items: Vec<ModelAssistantItem>,
     pub stop_reason: StopReason,
-    pub tool_calls: Vec<ModelToolCall>,
     pub usage: Option<Usage>,
 }
 
@@ -298,7 +309,7 @@ impl ModelProvider for MockProvider {
             let text: String = chunk.iter().collect();
             tokio::select! {
                 _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
-                result = events.send(ModelEvent::AssistantTextDelta { text }) => {
+                result = events.send(ModelEvent::AssistantTextDelta { index: None, text }) => {
                     result.map_err(|_| ProviderError::Failed {
                         message: "agent event stream closed".to_owned(),
                     })?;
@@ -311,10 +322,8 @@ impl ModelProvider for MockProvider {
         }
 
         Ok(ModelResponse {
-            content: response,
-            thinking: None,
+            items: vec![ModelAssistantItem::Text { content: response }],
             stop_reason: StopReason::Stop,
-            tool_calls: Vec::new(),
             usage: None,
         })
     }
@@ -353,7 +362,7 @@ mod tests {
 
         let mut chunks = Vec::new();
         while let Some(event) = rx.recv().await {
-            let ModelEvent::AssistantTextDelta { text } = event else {
+            let ModelEvent::AssistantTextDelta { text, .. } = event else {
                 continue;
             };
             chunks.push(text);
@@ -361,7 +370,12 @@ mod tests {
 
         assert_eq!(chunks, ["ab", "cd", "ef"]);
         assert_eq!(response.stop_reason, StopReason::Stop);
-        assert!(response.tool_calls.is_empty());
+        assert_eq!(
+            response.items,
+            [ModelAssistantItem::Text {
+                content: "abcdef".to_owned()
+            }]
+        );
     }
 
     #[tokio::test]

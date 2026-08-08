@@ -140,7 +140,7 @@ async fn run_print(prompt: String, setup: ModelSetup) -> Result<()> {
 
     while let Some(event) = event_rx.recv().await {
         match &event {
-            AgentEvent::AssistantTextDelta { text } => {
+            AgentEvent::AssistantTextDelta { text, .. } => {
                 print_and_flush(&mut output, text)?;
             }
             AgentEvent::Error(error) => {
@@ -149,6 +149,7 @@ async fn run_print(prompt: String, setup: ModelSetup) -> Result<()> {
             }
             AgentEvent::TurnFinished { reason } => turn_reason = Some(reason.clone()),
             AgentEvent::TurnStarted
+            | AgentEvent::AssistantTextItem { .. }
             | AgentEvent::AssistantThinkingDelta { .. }
             | AgentEvent::AssistantThinkingContentDelta { .. }
             | AgentEvent::AssistantThinkingItem { .. }
