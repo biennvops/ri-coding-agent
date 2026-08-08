@@ -244,12 +244,16 @@ fn footer_text(state: &AppState, width: u16) -> Line<'static> {
         .active_model()
         .map(ModelRef::display_name)
         .unwrap_or_else(|| "mock/mock".to_owned());
+    let session = state
+        .session_info()
+        .map(|info| format!("session: {}", info.display_name()))
+        .unwrap_or_else(|| "session: ephemeral".to_owned());
     let text = if let Some(error) = state.last_error() {
-        format!("{model} · error: {error}")
+        format!("{model} · {session} · error: {error}")
     } else if state.is_turn_active() {
-        format!("{model} · streaming · Esc cancel · Ctrl+C cancel")
+        format!("{model} · {session} · streaming · Esc cancel · Ctrl+C cancel")
     } else {
-        format!("{model} · ready · Enter submit · Ctrl+C exit")
+        format!("{model} · {session} · ready · Enter submit · Ctrl+C exit")
     };
     let truncated: String = text
         .chars()

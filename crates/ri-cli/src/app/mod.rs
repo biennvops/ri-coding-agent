@@ -7,7 +7,8 @@ use ri_core::{
     config::{load_default_models, load_default_settings},
     context::{build_system_prompt, discover_project, load_context, ContextBundle},
     AgentCommand, AgentEvent, AgentRuntime, AgentRuntimeConfig, AppState, ConfiguredProvider,
-    ModelCatalog, ModelMessage, ModelRef, ResolvedModel, ResolvedSettings, StopReason, ToolContext,
+    ModelCatalog, ModelMessage, ModelRef, OpenedSession, ResolvedModel, ResolvedSettings,
+    SessionHandle, SessionInfo, SessionMode, SessionRepository, StopReason, ToolContext,
 };
 use tokio::sync::mpsc;
 
@@ -25,6 +26,10 @@ pub struct Options {
     pub model: Option<String>,
     pub no_context: bool,
     pub show_help: bool,
+    pub continue_session: bool,
+    pub resume_session: bool,
+    pub session: Option<String>,
+    pub no_session: bool,
 }
 
 impl Options {
@@ -64,9 +69,31 @@ impl Options {
                     );
                 }
                 "--no-context" => options.no_context = true,
+                "-c" | "--continue" => options.continue_session = true,
+                "-r" | "--resume" => options.resume_session = true,
+                "--session" => {
+                    options.session = Some(
+                        args.next()
+                            .ok_or_else(|| anyhow!("--session requires an id or path"))?,
+                    );
+                }
+                "--no-session" => options.no_session = true,
                 "-h" | "--help" => options.show_help = true,
                 unknown => bail!("unknown argument: {unknown}"),
             }
+        }
+
+        let selection_count = options.continue_session as u8
+            + options.resume_session as u8
+            + options.session.is_some() as u8;
+        if options.no_session && selection_count > 0 {
+            bail!("--no-session cannot be combined with --continue, --resume, or --session");
+        }
+        if selection_count > 1 {
+            bail!("--continue, --resume, and --session are mutually exclusive");
+        }
+        if options.resume_session && options.print_prompt.is_some() {
+            bail!("--resume requires interactive mode; use --continue or --session with --print");
         }
 
         Ok(options)
@@ -75,13 +102,22 @@ impl Options {
     pub fn print_help() {
         println!(
             "ri — a small Rust coding agent\n\n\
-             Usage:\n  ri                              start the interactive TUI\n  ri -p <prompt>                  run one prompt without the TUI\n  ri --provider <id> --model <id> select a configured model\n  ri --no-context                 disable AGENTS context loading\n  ri --help                       show this help"
+             Usage:\n  ri                              start the interactive TUI\n  ri -p <prompt>                  run one prompt without the TUI\n  ri --provider <id> --model <id> select a configured model\n  ri -c                            continue the newest saved session\n  ri -r                            choose a saved session interactively\n  ri --session <id-or-path>        resume one saved session\n  ri --no-session                  disable session persistence\n  ri --no-context                 disable AGENTS context loading\n  ri --help                       show this help"
         );
     }
 }
 
 pub async fn run(options: Options) -> Result<()> {
-    let setup = AppSetup::load(&options)?;
+    let mut setup = AppSetup::load(&options)?;
+    if setup.resume_requested {
+        let repository = setup
+            .repository
+            .as_ref()
+            .ok_or_else(|| anyhow!("sessions are disabled for this run"))?;
+        let opened = crate::session_picker::pick(repository)?
+            .ok_or_else(|| anyhow!("session picker cancelled"))?;
+        setup.apply_opened(opened);
+    }
     if let Some(prompt) = options.print_prompt {
         run_print(prompt, setup).await
     } else {
@@ -96,6 +132,10 @@ struct AppSetup {
     tool_context: ToolContext,
     context: ContextBundle,
     system_prompt: String,
+    repository: Option<SessionRepository>,
+    session: Option<SessionHandle>,
+    initial_history: Vec<ModelMessage>,
+    resume_requested: bool,
 }
 
 impl AppSetup {
@@ -144,6 +184,47 @@ impl AppSetup {
         let tool_context =
             ToolContext::new(&project.launch_cwd).map_err(|error| anyhow!(error.to_string()))?;
 
+        let (repository, session, initial_history, resume_requested) = if options.no_session {
+            (None, None, Vec::new(), false)
+        } else {
+            let repository =
+                SessionRepository::for_workspace(&project.launch_cwd, &project.project_root)
+                    .map_err(|error| anyhow!(error.to_string()))?;
+            if options.resume_session {
+                (Some(repository), None, Vec::new(), true)
+            } else if options.continue_session {
+                let summary = repository
+                    .latest()
+                    .map_err(|error| anyhow!(error.to_string()))?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "no saved sessions found for {}",
+                            project.launch_cwd.display()
+                        )
+                    })?;
+                let opened = repository
+                    .open_path(&summary.path)
+                    .map_err(|error| anyhow!(error.to_string()))?;
+                for warning in &opened.warnings {
+                    eprintln!("{warning}");
+                }
+                (Some(repository), Some(opened.handle), opened.history, false)
+            } else if let Some(selector) = options.session.as_deref() {
+                let opened = repository
+                    .open_selector(selector)
+                    .map_err(|error| anyhow!(error.to_string()))?;
+                for warning in &opened.warnings {
+                    eprintln!("{warning}");
+                }
+                (Some(repository), Some(opened.handle), opened.history, false)
+            } else {
+                let session = repository
+                    .create()
+                    .map_err(|error| anyhow!(error.to_string()))?;
+                (Some(repository), Some(session), Vec::new(), false)
+            }
+        };
+
         Ok(Self {
             provider,
             catalog,
@@ -151,6 +232,10 @@ impl AppSetup {
             tool_context,
             context,
             system_prompt,
+            repository,
+            session,
+            initial_history,
+            resume_requested,
         })
     }
 
@@ -167,12 +252,40 @@ impl AppSetup {
             base_messages: vec![ModelMessage::System {
                 content: self.system_prompt.clone(),
             }],
+            initial_history: self.initial_history.clone(),
+            session: self
+                .session
+                .as_ref()
+                .map(|session| SessionMode::Enabled(session.clone()))
+                .unwrap_or(SessionMode::Disabled),
         }
+    }
+
+    fn apply_opened(&mut self, opened: OpenedSession) {
+        self.session = Some(opened.handle);
+        self.initial_history = opened.history;
+        self.resume_requested = false;
+        for warning in opened.warnings {
+            eprintln!("{warning}");
+        }
+    }
+
+    fn session_info(&self) -> Result<Option<SessionInfo>> {
+        self.session
+            .as_ref()
+            .map(SessionHandle::info)
+            .transpose()
+            .map_err(|error| anyhow!(error.to_string()))
     }
 }
 
 async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
     eprintln!("{}", setup.context.diagnostic());
+    if let Some(info) = setup.session_info()? {
+        eprintln!("session: {} ({})", info.display_name(), info.id);
+    } else {
+        eprintln!("session: ephemeral");
+    }
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (event_tx, mut event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let runtime = AgentRuntime::with_config(setup.provider.clone(), setup.runtime_config());
@@ -184,6 +297,8 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
         .context("could not start the mock agent")?;
 
     let mut state = AppState::new();
+    state.replace_history(&setup.initial_history);
+    state.set_session_info(setup.session_info()?);
     state.reduce(AgentEvent::ModelChanged(setup.model_ref()));
     let mut turn_reason = None;
     let mut output = io::stdout();
@@ -215,7 +330,9 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
             | AgentEvent::ToolExecutionOutput { .. }
             | AgentEvent::ToolExecutionFinished { .. }
             | AgentEvent::UsageUpdated(_)
-            | AgentEvent::ModelChanged(_) => {}
+            | AgentEvent::ModelChanged(_)
+            | AgentEvent::SessionChanged { .. }
+            | AgentEvent::SessionLoaded { .. } => {}
         }
         let finished = matches!(event, AgentEvent::TurnFinished { .. });
         state.reduce(event);
@@ -257,7 +374,9 @@ async fn run_tui(mut setup: AppSetup) -> Result<()> {
 
     let mut terminal = TerminalGuard::new().context("could not initialize terminal")?;
     let mut state = AppState::new();
+    state.replace_history(&setup.initial_history);
     state.add_system_message(setup.context.diagnostic());
+    state.set_session_info(setup.session_info()?);
     state.reduce(AgentEvent::ModelChanged(setup.model_ref()));
     let tui_result = run_tui_loop(
         &mut terminal,
@@ -321,10 +440,21 @@ async fn run_tui_loop(
                             }
                             match action {
                                 Action::Submit => {
-                                    if let Some(argument) = model_command(state.input()) {
-                                        state.take_input();
-                                        handle_model_command(state, setup, argument.as_deref());
-                                        scroll_from_bottom = 0;
+                                    if let Some(command) = slash_command(state.input()) {
+                                        if state.is_turn_active() {
+                                            state.add_system_message("a turn is already active");
+                                        } else {
+                                            state.take_input();
+                                            handle_slash_command(
+                                                command,
+                                                terminal,
+                                                state,
+                                                command_tx,
+                                                setup,
+                                            )
+                                            .await?;
+                                            scroll_from_bottom = 0;
+                                        }
                                     } else if let Some(text) = state.submit_input() {
                                         command_tx
                                             .try_send(AgentCommand::Submit { text })
@@ -391,7 +521,11 @@ async fn run_tui_loop(
                 if matches!(event, AgentEvent::TurnFinished { .. }) {
                     scroll_from_bottom = 0;
                 }
+                let session_loaded = matches!(event, AgentEvent::SessionLoaded { .. });
                 state.reduce(event);
+                if session_loaded {
+                    state.add_system_message(setup.context.diagnostic());
+                }
                 dirty = true;
             }
         }
@@ -437,16 +571,142 @@ fn settings_selection_description(settings: &ResolvedSettings) -> String {
     }
 }
 
-fn model_command(input: &str) -> Option<Option<String>> {
+enum SlashCommand {
+    Model(Option<String>),
+    New,
+    Resume,
+    Name(Option<String>),
+    Session,
+}
+
+fn slash_command(input: &str) -> Option<SlashCommand> {
     let input = input.trim();
     if input == "/model" {
-        Some(None)
+        return Some(SlashCommand::Model(None));
+    }
+    if let Some(argument) = input.strip_prefix("/model ") {
+        return argument
+            .trim()
+            .is_empty()
+            .then_some(SlashCommand::Model(None))
+            .or_else(|| Some(SlashCommand::Model(Some(argument.trim().to_owned()))));
+    }
+    if input == "/new" {
+        Some(SlashCommand::New)
+    } else if input == "/resume" {
+        Some(SlashCommand::Resume)
+    } else if input == "/session" {
+        Some(SlashCommand::Session)
+    } else if input == "/name" {
+        Some(SlashCommand::Name(None))
     } else {
         input
-            .strip_prefix("/model ")
-            .map(str::trim)
-            .filter(|argument| !argument.is_empty())
-            .map(|argument| Some(argument.to_owned()))
+            .strip_prefix("/name ")
+            .map(|argument| SlashCommand::Name(Some(argument.trim().to_owned())))
+    }
+}
+
+async fn handle_slash_command(
+    command: SlashCommand,
+    terminal: &mut TerminalGuard,
+    state: &mut AppState,
+    command_tx: &mpsc::Sender<AgentCommand>,
+    setup: &mut AppSetup,
+) -> Result<()> {
+    match command {
+        SlashCommand::Model(argument) => handle_model_command(state, setup, argument.as_deref()),
+        SlashCommand::Session => state.add_system_message(session_diagnostic(setup)?),
+        SlashCommand::Name(None) => state.add_system_message(session_diagnostic(setup)?),
+        SlashCommand::Name(Some(name)) => {
+            if setup.session.is_none() {
+                state.add_system_message("sessions are disabled for this run");
+            } else {
+                command_tx
+                    .send(AgentCommand::RenameSession { name })
+                    .await
+                    .context("could not rename the session")?;
+            }
+        }
+        SlashCommand::New => {
+            let Some(repository) = setup.repository.as_ref() else {
+                state.add_system_message("sessions are disabled for this run");
+                return Ok(());
+            };
+            let session = repository
+                .create()
+                .map_err(|error| anyhow!(error.to_string()))?;
+            let handle = session.clone();
+            setup.session = Some(session);
+            setup.initial_history.clear();
+            command_tx
+                .send(AgentCommand::NewSession { session: handle })
+                .await
+                .context("could not create a new session")?;
+            state.replace_history(&[]);
+            state.set_session_info(setup.session_info()?);
+            state.add_system_message(setup.context.diagnostic());
+        }
+        SlashCommand::Resume => {
+            let Some(repository) = setup.repository.as_ref() else {
+                state.add_system_message("sessions are disabled for this run");
+                return Ok(());
+            };
+            let path = match crate::session_picker::pick_path_in_terminal(terminal, repository) {
+                Ok(Some(path)) => path,
+                Ok(None) => return Ok(()),
+                Err(error) => {
+                    state.add_system_message(format!("ri: {error}"));
+                    return Ok(());
+                }
+            };
+            if setup.session_info()?.is_some_and(|info| info.path == path) {
+                state.add_system_message("that session is already active");
+                return Ok(());
+            }
+            let opened = repository
+                .open_path(path)
+                .map_err(|error| anyhow!(error.to_string()))?;
+            let handle = opened.handle.clone();
+            let history = opened.history.clone();
+            setup.apply_opened(opened);
+            command_tx
+                .send(AgentCommand::LoadSession {
+                    session: handle,
+                    history,
+                })
+                .await
+                .context("could not resume the session")?;
+            state.replace_history(&setup.initial_history);
+            state.set_session_info(setup.session_info()?);
+            state.add_system_message(setup.context.diagnostic());
+        }
+    }
+    Ok(())
+}
+
+fn session_diagnostic(setup: &AppSetup) -> Result<String> {
+    let Some(info) = setup.session_info()? else {
+        return Ok("session: ephemeral".to_owned());
+    };
+    let file = if info.materialized {
+        info.path.display().to_string()
+    } else {
+        "not created yet".to_owned()
+    };
+    Ok(format!(
+        "session: {}\nid: {}\nfile: {}\nmessages: {}",
+        info.name.as_deref().unwrap_or(info.id.as_str()),
+        info.id,
+        file,
+        info.message_count
+    ))
+}
+
+#[cfg(test)]
+fn model_command(input: &str) -> Option<Option<String>> {
+    match slash_command(input) {
+        Some(SlashCommand::Model(argument)) => Some(argument),
+        _ => None,
     }
 }
 
@@ -524,7 +784,46 @@ mod tests {
                 model: Some("coding".to_owned()),
                 no_context: false,
                 show_help: false,
+                continue_session: false,
+                resume_session: false,
+                session: None,
+                no_session: false,
             }
+        );
+    }
+
+    #[test]
+    fn rejects_conflicting_session_flags_and_picker_print_mode() {
+        let conflicts = [
+            vec!["-c", "-r"],
+            vec!["-c", "--session", "abc"],
+            vec!["-r", "--session", "abc"],
+            vec!["--no-session", "-c"],
+            vec!["--no-session", "-r"],
+            vec!["--no-session", "--session", "abc"],
+            vec!["-r", "-p", "hello"],
+        ];
+        for arguments in conflicts {
+            let arguments = arguments.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(Options::parse(arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn parses_continue_explicit_session_and_ephemeral_flags() {
+        assert!(Options::parse(["-c".to_owned()]).unwrap().continue_session);
+        assert!(Options::parse(["-r".to_owned()]).unwrap().resume_session);
+        assert_eq!(
+            Options::parse(["--session".to_owned(), "0198ab".to_owned()])
+                .unwrap()
+                .session
+                .as_deref(),
+            Some("0198ab")
+        );
+        assert!(
+            Options::parse(["--no-session".to_owned()])
+                .unwrap()
+                .no_session
         );
     }
 
