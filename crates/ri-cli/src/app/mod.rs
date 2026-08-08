@@ -152,12 +152,17 @@ async fn run_print(prompt: String, setup: ModelSetup) -> Result<()> {
             }
             AgentEvent::TurnFinished { reason } => turn_reason = Some(reason.clone()),
             AgentEvent::TurnStarted
+            | AgentEvent::AssistantMessageStarted
+            | AgentEvent::AssistantMessageFinished { .. }
             | AgentEvent::AssistantTextItem { .. }
             | AgentEvent::AssistantRefusalItem { .. }
             | AgentEvent::AssistantThinkingDelta { .. }
             | AgentEvent::AssistantThinkingContentDelta { .. }
             | AgentEvent::AssistantThinkingItem { .. }
             | AgentEvent::ToolCallDelta { .. }
+            | AgentEvent::ToolExecutionStarted { .. }
+            | AgentEvent::ToolExecutionOutput { .. }
+            | AgentEvent::ToolExecutionFinished { .. }
             | AgentEvent::UsageUpdated(_)
             | AgentEvent::ModelChanged(_) => {}
         }

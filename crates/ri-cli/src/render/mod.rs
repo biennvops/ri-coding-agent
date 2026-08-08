@@ -3,7 +3,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
-use ri_core::{AppState, MessageRole, ModelRef};
+use ri_core::{AppState, MessageRole, ModelRef, ToolStatus, TranscriptEntry};
 
 use crate::input::VisualLayout;
 use crate::terminal::TerminalGuard;
@@ -98,26 +98,31 @@ fn render_frame(frame: &mut Frame<'_>, state: &AppState, scroll_from_bottom: usi
 fn transcript_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
-    for message in state.messages() {
-        let (label, style) = match message.role {
-            MessageRole::System => ("system", Style::default().fg(Color::Cyan)),
-            MessageRole::User => ("you", Style::default().fg(Color::Yellow)),
-            MessageRole::Assistant => ("assistant", Style::default().fg(Color::Green)),
-        };
-        lines.extend(layout_styled_lines(&format!("▶ {label}"), style, width));
-        append_layout_content(&mut lines, &message.content, Style::default(), width);
-        if let Some(thinking) = &message.thinking {
-            lines.extend(layout_styled_lines(
-                "  thinking:",
-                Style::default().fg(Color::Cyan),
-                width,
-            ));
-            append_layout_content(
-                &mut lines,
-                thinking,
-                Style::default().fg(Color::DarkGray),
-                width,
-            );
+    for entry in state.transcript_entries() {
+        match entry {
+            TranscriptEntry::Message(message) => {
+                let (label, style) = match message.role {
+                    MessageRole::System => ("system", Style::default().fg(Color::Cyan)),
+                    MessageRole::User => ("you", Style::default().fg(Color::Yellow)),
+                    MessageRole::Assistant => ("assistant", Style::default().fg(Color::Green)),
+                };
+                lines.extend(layout_styled_lines(&format!("▶ {label}"), style, width));
+                append_layout_content(&mut lines, &message.content, Style::default(), width);
+                if let Some(thinking) = &message.thinking {
+                    lines.extend(layout_styled_lines(
+                        "  thinking:",
+                        Style::default().fg(Color::Cyan),
+                        width,
+                    ));
+                    append_layout_content(
+                        &mut lines,
+                        thinking,
+                        Style::default().fg(Color::DarkGray),
+                        width,
+                    );
+                }
+            }
+            TranscriptEntry::Tool(tool) => append_tool_entry(&mut lines, tool, width),
         }
         lines.push(Line::default());
     }
@@ -153,6 +158,65 @@ fn transcript_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+fn append_tool_entry(
+    lines: &mut Vec<Line<'static>>,
+    tool: &ri_core::ToolTranscriptEntry,
+    width: usize,
+) {
+    let (marker, style) = match &tool.status {
+        ToolStatus::Running => ("▶", Style::default().fg(Color::Yellow)),
+        ToolStatus::Finished(metadata) if metadata.success => {
+            ("✓", Style::default().fg(Color::Green))
+        }
+        ToolStatus::Finished(_) => ("✗", Style::default().fg(Color::Red)),
+    };
+    let title = if tool.arguments.is_empty() {
+        format!("{marker} {}", tool.name)
+    } else {
+        format!("{marker} {} {}", tool.name, tool.arguments)
+    };
+    lines.extend(layout_styled_lines(&title, style, width));
+    if tool.output.is_empty() && matches!(tool.status, ToolStatus::Running) {
+        lines.extend(layout_styled_lines(
+            "  running...",
+            Style::default().fg(Color::DarkGray),
+            width,
+        ));
+    } else {
+        append_layout_content(lines, &tool.output, Style::default(), width);
+    }
+    if let ToolStatus::Finished(metadata) = &tool.status {
+        let status = if metadata.cancelled {
+            "cancelled".to_owned()
+        } else if metadata.timed_out {
+            "timed out".to_owned()
+        } else if let Some(exit_code) = metadata.exit_code {
+            format!("exited {exit_code}")
+        } else if metadata.success {
+            "completed".to_owned()
+        } else {
+            "failed".to_owned()
+        };
+        lines.extend(layout_styled_lines(
+            &format!("  {status} · {:.1}s", metadata.duration.as_secs_f64()),
+            Style::default().fg(Color::DarkGray),
+            width,
+        ));
+        if metadata.truncated || tool.output_truncated {
+            let spill = metadata
+                .full_output_path
+                .as_ref()
+                .map(|path| format!(" · full output: {}", path.display()))
+                .unwrap_or_default();
+            lines.extend(layout_styled_lines(
+                &format!("  output truncated{spill}"),
+                Style::default().fg(Color::DarkGray),
+                width,
+            ));
+        }
+    }
 }
 
 fn append_layout_content(
