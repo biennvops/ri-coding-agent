@@ -38,7 +38,7 @@ struct BashArguments {
 enum BashStreamEvent {
     Chunk {
         stream: ToolOutputStream,
-        bytes: Vec<u8>,
+        text: String,
     },
     Closed,
     Error {
@@ -141,8 +141,7 @@ impl Tool for BashTool {
             tokio::select! {
                 stream_event = stream_rx.recv(), if active_readers > 0 => {
                     match stream_event {
-                        Some(BashStreamEvent::Chunk { stream, bytes }) => {
-                            let text = String::from_utf8_lossy(&bytes).into_owned();
+                        Some(BashStreamEvent::Chunk { stream, text }) => {
                             if let Err(error) = output.push(stream.clone(), &text) {
                                 process_error.get_or_insert(error);
                             }
@@ -289,14 +288,19 @@ async fn read_stream<R>(
     R: AsyncRead + Unpin,
 {
     let mut buffer = vec![0; BASH_CHUNK_BYTES];
+    let mut decoder = Utf8Decoder::default();
     loop {
         match reader.read(&mut buffer).await {
             Ok(0) => break,
             Ok(length) => {
+                let text = decoder.decode(&buffer[..length]);
+                if text.is_empty() {
+                    continue;
+                }
                 if events
                     .send(BashStreamEvent::Chunk {
                         stream: stream.clone(),
-                        bytes: buffer[..length].to_vec(),
+                        text,
                     })
                     .await
                     .is_err()
@@ -315,7 +319,68 @@ async fn read_stream<R>(
             }
         }
     }
+    let text = decoder.finish();
+    if !text.is_empty()
+        && events
+            .send(BashStreamEvent::Chunk { stream, text })
+            .await
+            .is_err()
+    {
+        return;
+    }
     let _ = events.send(BashStreamEvent::Closed).await;
+}
+
+#[derive(Default)]
+struct Utf8Decoder {
+    pending: Vec<u8>,
+}
+
+impl Utf8Decoder {
+    fn decode(&mut self, bytes: &[u8]) -> String {
+        let mut input = std::mem::take(&mut self.pending);
+        input.extend_from_slice(bytes);
+        self.decode_input(&input)
+    }
+
+    fn finish(&mut self) -> String {
+        if self.pending.is_empty() {
+            return String::new();
+        }
+        let pending = std::mem::take(&mut self.pending);
+        String::from_utf8_lossy(&pending).into_owned()
+    }
+
+    fn decode_input(&mut self, input: &[u8]) -> String {
+        let mut output = String::new();
+        let mut cursor = 0;
+        while cursor < input.len() {
+            match std::str::from_utf8(&input[cursor..]) {
+                Ok(text) => {
+                    output.push_str(text);
+                    cursor = input.len();
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    if valid > 0 {
+                        output.push_str(
+                            std::str::from_utf8(&input[cursor..cursor + valid])
+                                .expect("valid UTF-8 prefix should decode"),
+                        );
+                        cursor += valid;
+                    }
+                    if let Some(error_length) = error.error_len() {
+                        output.push('\u{FFFD}');
+                        cursor += error_length;
+                    } else {
+                        self.pending.extend_from_slice(&input[cursor..]);
+                        break;
+                    }
+                }
+            }
+        }
+        output
+    }
 }
 
 async fn terminate_child(child: &mut Child) -> Result<(), ToolError> {
@@ -478,6 +543,14 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn utf8_decoder_preserves_code_points_split_between_reads() {
+        let mut decoder = Utf8Decoder::default();
+        assert_eq!(decoder.decode(&[0xf0, 0x9f]), "");
+        assert_eq!(decoder.decode(&[0xa6, 0x80]), "🦀");
+        assert_eq!(decoder.finish(), "");
+    }
 
     #[tokio::test]
     async fn captures_stdout_stderr_and_nonzero_exit() {
