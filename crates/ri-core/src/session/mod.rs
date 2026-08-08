@@ -627,7 +627,17 @@ impl SessionWriter {
         })
     }
 
-    fn open(path: PathBuf) -> Result<(SessionHandle, SessionSnapshot), SessionError> {
+    fn open(
+        path: PathBuf,
+        current_workspace: &Path,
+    ) -> Result<(SessionHandle, SessionSnapshot), SessionError> {
+        let preflight = read_session(&path)?;
+        if preflight.info.workspace_root != current_workspace {
+            return Err(SessionError::WorkspaceMismatch {
+                session_workspace: preflight.info.workspace_root,
+                current_workspace: current_workspace.to_path_buf(),
+            });
+        }
         let mut options = OpenOptions::new();
         options.read(true).write(true).append(true);
         #[cfg(unix)]
@@ -640,6 +650,12 @@ impl SessionWriter {
             .map_err(|source| io_error(&path, source))?;
         lock_exclusive(&file)?;
         let snapshot = read_session(&path)?;
+        if snapshot.info.workspace_root != current_workspace {
+            return Err(SessionError::WorkspaceMismatch {
+                session_workspace: snapshot.info.workspace_root,
+                current_workspace: current_workspace.to_path_buf(),
+            });
+        }
         let mut file = file;
         if let Some(offset) = snapshot.truncate_at {
             file.set_len(offset)
@@ -900,13 +916,7 @@ impl SessionRepository {
     pub fn open_path(&self, path: impl AsRef<Path>) -> Result<OpenedSession, SessionError> {
         let path =
             fs::canonicalize(path.as_ref()).map_err(|source| io_error(path.as_ref(), source))?;
-        let (handle, snapshot) = SessionWriter::open(path)?;
-        if snapshot.info.workspace_root != self.workspace_root {
-            return Err(SessionError::WorkspaceMismatch {
-                session_workspace: snapshot.info.workspace_root,
-                current_workspace: self.workspace_root.clone(),
-            });
-        }
+        let (handle, snapshot) = SessionWriter::open(path, &self.workspace_root)?;
         let mut history = snapshot.history.clone();
         let unresolved = unresolved_tool_calls(&history);
         for call in unresolved {
@@ -1032,6 +1042,13 @@ fn read_session_inner(path: &Path, include_history: bool) -> Result<SessionSnaps
         }
         let record = match serde_json::from_slice::<SessionRecord>(content) {
             Ok(record) => record,
+            Err(error) if has_newline => {
+                return Err(SessionError::Corrupted {
+                    path: path.to_path_buf(),
+                    line: line_number,
+                    message: error.to_string(),
+                });
+            }
             Err(error) => {
                 pending_invalid = Some((line_number, line_start, error.to_string()));
                 truncate_at = Some(line_start);
@@ -1324,29 +1341,16 @@ fn ensure_private_directory(path: &Path) -> Result<(), SessionError> {
     Ok(())
 }
 
-#[cfg(unix)]
 fn lock_exclusive(file: &File) -> Result<(), SessionError> {
-    use std::os::fd::AsRawFd;
-    unsafe extern "C" {
-        fn flock(fd: std::ffi::c_int, operation: std::ffi::c_int) -> std::ffi::c_int;
-    }
-    const LOCK_EX: std::ffi::c_int = 2;
-    const LOCK_NB: std::ffi::c_int = 4;
-    let result = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
-    if result == 0 {
-        return Ok(());
-    }
-    let error = io::Error::last_os_error();
-    if matches!(error.raw_os_error(), Some(11) | Some(35)) {
-        Err(SessionError::AlreadyOpen)
-    } else {
-        Err(io_error("session lock", error))
-    }
-}
+    use fs2::FileExt;
 
-#[cfg(not(unix))]
-fn lock_exclusive(_file: &File) -> Result<(), SessionError> {
-    Ok(())
+    file.try_lock_exclusive().map_err(|error| {
+        if error.kind() == fs2::lock_contended_error().kind() {
+            SessionError::AlreadyOpen
+        } else {
+            io_error("session lock", error)
+        }
+    })
 }
 
 fn preview(content: &str) -> String {
@@ -1609,7 +1613,7 @@ mod tests {
     }
 
     #[test]
-    fn trailing_invalid_record_is_ignored_but_middle_corruption_fails() {
+    fn unterminated_trailing_record_is_recovered() {
         let root = test_dir("recovery");
         fs::create_dir_all(&root).unwrap();
         let repository = SessionRepository::new(root.join("sessions"), &root, &root).unwrap();
@@ -1620,14 +1624,35 @@ mod tests {
         let mut content = fs::read_to_string(&path).unwrap();
         content.push_str("{\"type\":\"mess");
         fs::write(&path, content).unwrap();
+
         let snapshot = read_session(&path).unwrap();
         assert_eq!(snapshot.history, vec![ModelMessage::user("hello")]);
         assert_eq!(snapshot.warnings.len(), 1);
-        let mut repaired = fs::read_to_string(&path).unwrap();
-        repaired.push_str("\n{}\n");
-        fs::write(&path, repaired).unwrap();
-        let error = read_session(&path).unwrap_err();
-        assert!(error.to_string().contains("line 3"));
+        repository.open_path(&path).unwrap();
+        assert!(fs::read_to_string(&path).unwrap().ends_with('\n'));
+        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn newline_terminated_corrupted_trailing_record_fails() {
+        let root = test_dir("newline-corruption");
+        fs::create_dir_all(&root).unwrap();
+        let repository = SessionRepository::new(root.join("sessions"), &root, &root).unwrap();
+        let handle = repository.create().unwrap();
+        handle.append_message(&ModelMessage::user("hello")).unwrap();
+        let path = handle.info().unwrap().path;
+        drop(handle);
+        let mut content = fs::read_to_string(&path).unwrap();
+        content.push_str("{}\n");
+        fs::write(&path, &content).unwrap();
+
+        let error = repository.open_path(&path);
+        assert!(matches!(
+            error,
+            Err(SessionError::Corrupted { line: 3, .. })
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), content);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1708,6 +1733,38 @@ mod tests {
         ));
         drop(first);
         assert!(repository.open_path(&path).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn foreign_workspace_open_does_not_repair_the_session() {
+        let root = test_dir("workspace-mismatch");
+        let current_workspace = root.join("current");
+        let foreign_workspace = root.join("foreign");
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&current_workspace).unwrap();
+        fs::create_dir_all(&foreign_workspace).unwrap();
+        let foreign_repository =
+            SessionRepository::new(&sessions, &foreign_workspace, &foreign_workspace).unwrap();
+        let handle = foreign_repository.create().unwrap();
+        handle
+            .append_message(&ModelMessage::user("from another workspace"))
+            .unwrap();
+        let path = handle.info().unwrap().path;
+        drop(handle);
+
+        let mut content = fs::read_to_string(&path).unwrap();
+        content.push_str("{\"type\":\"mess");
+        fs::write(&path, &content).unwrap();
+        let before = fs::read(&path).unwrap();
+        let current_repository =
+            SessionRepository::new(&sessions, &current_workspace, &current_workspace).unwrap();
+
+        assert!(matches!(
+            current_repository.open_path(&path),
+            Err(SessionError::WorkspaceMismatch { .. })
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
         fs::remove_dir_all(root).unwrap();
     }
 
