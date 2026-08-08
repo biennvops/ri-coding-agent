@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -124,41 +124,71 @@ fn apply_raw_settings(
         });
     }
 
-    validate_optional_string(
-        raw.default_provider.as_deref(),
+    let default_provider = optional_string(
+        raw.default_provider,
         &format_path(source_path, "defaultProvider"),
         "defaultProvider",
     )?;
-    validate_optional_string(
-        raw.default_model.as_deref(),
+    let default_model = optional_string(
+        raw.default_model,
         &format_path(source_path, "defaultModel"),
         "defaultModel",
     )?;
+    let context_enabled = optional_bool(
+        raw.context.enabled,
+        &format_path(source_path, "context.enabled"),
+        "context.enabled",
+    )?;
 
-    if raw.default_provider.is_some() {
-        load.settings.default_provider = raw.default_provider;
+    if default_provider.is_some() {
+        load.settings.default_provider = default_provider;
     }
-    if raw.default_model.is_some() {
-        load.settings.default_model = raw.default_model;
+    if default_model.is_some() {
+        load.settings.default_model = default_model;
     }
-    if let Some(enabled) = raw.context.enabled {
+    if let Some(enabled) = context_enabled {
         load.settings.context.enabled = enabled;
     }
     Ok(())
 }
 
-fn validate_optional_string(
-    value: Option<&str>,
+fn optional_string(
+    value: RawField<String>,
     path: &str,
     field: &str,
-) -> Result<(), SettingsError> {
-    if value.is_some_and(|value| value.trim().is_empty()) {
+) -> Result<Option<String>, SettingsError> {
+    let value = match value {
+        RawField::Missing => return Ok(None),
+        RawField::Null => {
+            return Err(SettingsError::Invalid {
+                path: path.to_owned(),
+                message: format!("{field} must be a non-empty string"),
+            });
+        }
+        RawField::Value(value) => value,
+    };
+    if value.trim().is_empty() {
         return Err(SettingsError::Invalid {
             path: path.to_owned(),
             message: format!("{field} must be a non-empty string"),
         });
     }
-    Ok(())
+    Ok(Some(value))
+}
+
+fn optional_bool(
+    value: RawField<bool>,
+    path: &str,
+    field: &str,
+) -> Result<Option<bool>, SettingsError> {
+    match value {
+        RawField::Missing => Ok(None),
+        RawField::Null => Err(SettingsError::Invalid {
+            path: path.to_owned(),
+            message: format!("{field} must be a boolean"),
+        }),
+        RawField::Value(value) => Ok(Some(value)),
+    }
 }
 
 fn format_path(source_path: &Path, field: &str) -> String {
@@ -174,19 +204,42 @@ fn home_directory() -> Option<PathBuf> {
 #[derive(Debug, Deserialize, Default)]
 struct RawSettings {
     #[serde(rename = "defaultProvider", default)]
-    default_provider: Option<String>,
+    default_provider: RawField<String>,
     #[serde(rename = "defaultModel", default)]
-    default_model: Option<String>,
+    default_model: RawField<String>,
     #[serde(default)]
     context: RawContextSettings,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
 }
 
+#[derive(Debug, Default)]
+enum RawField<T> {
+    #[default]
+    Missing,
+    Null,
+    Value(T),
+}
+
+impl<'de, T> Deserialize<'de> for RawField<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match Option::<T>::deserialize(deserializer)? {
+            Some(value) => Self::Value(value),
+            None => Self::Null,
+        })
+    }
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct RawContextSettings {
     #[serde(default)]
-    enabled: Option<bool>,
+    enabled: RawField<bool>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
 }
@@ -314,6 +367,23 @@ mod tests {
 
         assert!(matches!(error, SettingsError::Json { .. }));
         assert!(error.to_string().contains(&path.display().to_string()));
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn null_known_values_are_not_treated_as_unset() {
+        let root = unique_test_dir("settings-null");
+        fs::create_dir_all(&root).unwrap();
+        for (field, source) in [
+            ("defaultProvider", r#"{"defaultProvider":null}"#),
+            ("defaultModel", r#"{"defaultModel":null}"#),
+            ("context.enabled", r#"{"context":{"enabled":null}}"#),
+        ] {
+            let path = root.join(format!("{field}.json"));
+            fs::write(&path, source).unwrap();
+            let error = load_settings_from_paths(Some(&path), None).unwrap_err();
+            assert!(error.to_string().contains(field));
+        }
         remove_test_dir(root);
     }
 
