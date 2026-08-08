@@ -184,6 +184,22 @@ impl AppState {
                     .thinking
                     .push_str(&text);
             }
+            AgentEvent::AssistantRefusalDelta { text, .. } => {
+                self.streaming_assistant
+                    .get_or_insert_with(StreamingAssistant::default)
+                    .content
+                    .push_str(&text);
+            }
+            AgentEvent::AssistantRefusalItem { content, .. } => {
+                if let Some(content) = content {
+                    let assistant = self
+                        .streaming_assistant
+                        .get_or_insert_with(StreamingAssistant::default);
+                    if assistant.content.is_empty() {
+                        assistant.content = content;
+                    }
+                }
+            }
             AgentEvent::TurnFinished { reason } => {
                 if let Some(assistant) = self.streaming_assistant.take() {
                     if !assistant.content.is_empty() || !assistant.thinking.is_empty() {

@@ -77,6 +77,7 @@ pub struct ModelThinking {
 pub enum ModelAssistantItem {
     Text { content: String },
     Reasoning(ModelThinking),
+    Refusal { content: String },
     ToolCall(ModelToolCall),
 }
 
@@ -155,6 +156,14 @@ pub enum ModelEvent {
         text: String,
     },
     AssistantTextItem {
+        index: usize,
+        content: Option<String>,
+    },
+    AssistantRefusalDelta {
+        index: Option<usize>,
+        text: String,
+    },
+    AssistantRefusalItem {
         index: usize,
         content: Option<String>,
     },

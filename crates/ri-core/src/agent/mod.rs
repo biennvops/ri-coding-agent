@@ -38,6 +38,14 @@ pub enum AgentEvent {
         index: usize,
         content: Option<String>,
     },
+    AssistantRefusalDelta {
+        index: Option<usize>,
+        text: String,
+    },
+    AssistantRefusalItem {
+        index: usize,
+        content: Option<String>,
+    },
     AssistantThinkingDelta {
         item_id: Option<String>,
         text: String,
@@ -254,6 +262,12 @@ fn agent_event_from_model(event: ModelEvent) -> AgentEvent {
         }
         ModelEvent::AssistantTextItem { index, content } => {
             AgentEvent::AssistantTextItem { index, content }
+        }
+        ModelEvent::AssistantRefusalDelta { index, text } => {
+            AgentEvent::AssistantRefusalDelta { index, text }
+        }
+        ModelEvent::AssistantRefusalItem { index, content } => {
+            AgentEvent::AssistantRefusalItem { index, content }
         }
         ModelEvent::AssistantThinkingDelta { item_id, text } => {
             AgentEvent::AssistantThinkingDelta { item_id, text }

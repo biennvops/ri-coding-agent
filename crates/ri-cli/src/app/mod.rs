@@ -143,6 +143,9 @@ async fn run_print(prompt: String, setup: ModelSetup) -> Result<()> {
             AgentEvent::AssistantTextDelta { text, .. } => {
                 print_and_flush(&mut output, text)?;
             }
+            AgentEvent::AssistantRefusalDelta { text, .. } => {
+                print_and_flush(&mut output, text)?;
+            }
             AgentEvent::Error(error) => {
                 error_message = Some(error.message.clone());
                 eprintln!("ri: {}", error.message);
@@ -150,6 +153,7 @@ async fn run_print(prompt: String, setup: ModelSetup) -> Result<()> {
             AgentEvent::TurnFinished { reason } => turn_reason = Some(reason.clone()),
             AgentEvent::TurnStarted
             | AgentEvent::AssistantTextItem { .. }
+            | AgentEvent::AssistantRefusalItem { .. }
             | AgentEvent::AssistantThinkingDelta { .. }
             | AgentEvent::AssistantThinkingContentDelta { .. }
             | AgentEvent::AssistantThinkingItem { .. }
