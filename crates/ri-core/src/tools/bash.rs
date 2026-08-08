@@ -399,9 +399,9 @@ impl ProcessTree {
     fn attach(child: &Child) -> Result<Self, ToolError> {
         #[cfg(windows)]
         {
-            return Ok(Self {
-                job: WindowsJob::attach(child)?,
-            });
+            let job = WindowsJob::attach(child)?;
+            resume_suspended_process(child)?;
+            return Ok(Self { job });
         }
         #[cfg(not(windows))]
         {
@@ -572,6 +572,28 @@ struct JobObjectExtendedLimitInformation {
 }
 
 #[cfg(windows)]
+#[repr(C)]
+#[derive(Default)]
+struct ThreadEntry32 {
+    dw_size: u32,
+    cnt_usage: u32,
+    th32_thread_id: u32,
+    th32_owner_process_id: u32,
+    tp_base_pri: i32,
+    tp_delta_pri: i32,
+    dw_flags: u32,
+}
+
+#[cfg(windows)]
+const CREATE_SUSPENDED: u32 = 0x0000_0004;
+#[cfg(windows)]
+const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
+#[cfg(windows)]
+const THREAD_SUSPEND_RESUME: u32 = 0x0002;
+#[cfg(windows)]
+const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = (-1isize) as *mut std::ffi::c_void;
+
+#[cfg(windows)]
 unsafe extern "system" {
     fn CreateJobObjectW(
         attributes: *mut std::ffi::c_void,
@@ -586,6 +608,68 @@ unsafe extern "system" {
     fn AssignProcessToJobObject(job: *mut std::ffi::c_void, process: *mut std::ffi::c_void) -> i32;
     fn TerminateJobObject(job: *mut std::ffi::c_void, exit_code: u32) -> i32;
     fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+    fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> *mut std::ffi::c_void;
+    fn Thread32First(snapshot: *mut std::ffi::c_void, entry: *mut ThreadEntry32) -> i32;
+    fn Thread32Next(snapshot: *mut std::ffi::c_void, entry: *mut ThreadEntry32) -> i32;
+    fn OpenThread(
+        desired_access: u32,
+        inherit_handle: i32,
+        thread_id: u32,
+    ) -> *mut std::ffi::c_void;
+    fn ResumeThread(thread: *mut std::ffi::c_void) -> u32;
+}
+
+#[cfg(windows)]
+fn resume_suspended_process(child: &Child) -> Result<(), ToolError> {
+    let process_id = child
+        .id()
+        .ok_or_else(|| ToolError::Failed("shell process exited before resume".to_owned()))?;
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
+        return Err(ToolError::Failed(format!(
+            "could not inspect suspended shell threads: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    let mut entry = ThreadEntry32 {
+        dw_size: std::mem::size_of::<ThreadEntry32>() as u32,
+        ..ThreadEntry32::default()
+    };
+    let mut thread_id = None;
+    let mut found = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+    while found {
+        if entry.th32_owner_process_id == process_id {
+            thread_id = Some(entry.th32_thread_id);
+            break;
+        }
+        found = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+    }
+    unsafe {
+        CloseHandle(snapshot);
+    }
+
+    let thread_id = thread_id.ok_or_else(|| {
+        ToolError::Failed("could not find suspended shell primary thread".to_owned())
+    })?;
+    let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id) };
+    if thread.is_null() {
+        return Err(ToolError::Failed(format!(
+            "could not open suspended shell primary thread: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let resumed = unsafe { ResumeThread(thread) };
+    unsafe {
+        CloseHandle(thread);
+    }
+    if resumed == u32::MAX {
+        return Err(ToolError::Failed(format!(
+            "could not resume shell primary thread: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -612,7 +696,12 @@ fn configure_process_group(command: &mut Command) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn configure_process_group(command: &mut Command) {
+    command.creation_flags(CREATE_SUSPENDED);
+}
+
+#[cfg(not(any(unix, windows)))]
 fn configure_process_group(_command: &mut Command) {}
 
 #[cfg(unix)]
