@@ -426,6 +426,8 @@ impl AppState {
             }
             AgentEvent::ModelChanged(model) => {
                 self.active_model = Some(model);
+                self.context_usage.input_tokens = None;
+                self.context_usage.source = crate::context::UsageSource::Estimated;
             }
             AgentEvent::SessionChanged { info } => {
                 self.session_info = Some(info);
@@ -891,6 +893,15 @@ mod tests {
         assert_eq!(
             state.latest_usage().and_then(|usage| usage.output_tokens),
             Some(100)
+        );
+        state.reduce(AgentEvent::ModelChanged(crate::config::ModelRef {
+            provider: "test".to_owned(),
+            model: "new-model".to_owned(),
+        }));
+        assert_eq!(state.context_usage().input_tokens, None);
+        assert_eq!(
+            state.context_usage().source,
+            crate::context::UsageSource::Estimated
         );
     }
 

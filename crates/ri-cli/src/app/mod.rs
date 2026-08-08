@@ -660,7 +660,9 @@ async fn handle_slash_command(
     setup: &mut AppSetup,
 ) -> Result<()> {
     match command {
-        SlashCommand::Model(argument) => handle_model_command(state, setup, argument.as_deref()),
+        SlashCommand::Model(argument) => {
+            handle_model_command(state, setup, command_tx, argument.as_deref()).await?
+        }
         SlashCommand::Compact => {
             state.set_compaction_active(true);
             command_tx
@@ -764,12 +766,17 @@ fn model_command(input: &str) -> Option<Option<String>> {
     }
 }
 
-fn handle_model_command(state: &mut AppState, setup: &mut AppSetup, argument: Option<&str>) {
+async fn handle_model_command(
+    state: &mut AppState,
+    setup: &mut AppSetup,
+    command_tx: &mpsc::Sender<AgentCommand>,
+    argument: Option<&str>,
+) -> Result<()> {
     let Some(catalog) = setup.catalog.as_ref() else {
         state.add_system_message(
             "No configured models are available. Create ~/.ri/agent/models.json first.",
         );
-        return;
+        return Ok(());
     };
 
     let selected = if let Some(argument) = argument {
@@ -803,12 +810,17 @@ fn handle_model_command(state: &mut AppState, setup: &mut AppSetup, argument: Op
                 setup.selected = Some(selected.clone());
                 state.reduce(AgentEvent::ModelChanged(selected.model_ref));
                 state.reduce(AgentEvent::ContextLimitsUpdated(setup.provider.limits()));
+                command_tx
+                    .send(AgentCommand::RefreshContext)
+                    .await
+                    .context("could not refresh context for the selected model")?;
                 state.add_system_message(format!("active model: {name}"));
             }
             Err(error) => state.add_system_message(error.to_string()),
         },
         Err(error) => state.add_system_message(error.to_string()),
     }
+    Ok(())
 }
 
 fn print_and_flush(output: &mut impl Write, text: &str) -> Result<()> {

@@ -45,6 +45,7 @@ pub enum AgentCommand {
     RenameSession {
         name: String,
     },
+    RefreshContext,
     Shutdown,
 }
 
@@ -262,7 +263,16 @@ where
                     tokio::select! {
                         result = &mut active_task.task => {
                             task_finished = true;
-                            apply_task_result(result, active_task.compaction, &mut self.conversation, &events).await;
+                            apply_task_result(
+                                result,
+                                active_task.compaction,
+                                &mut self.conversation,
+                                self.provider.as_ref(),
+                                &self.registry,
+                                &self.base_messages,
+                                &events,
+                            )
+                            .await;
                         }
                         command = commands.recv() => {
                             match command {
@@ -271,7 +281,8 @@ where
                                 | Some(AgentCommand::Compact)
                                 | Some(AgentCommand::NewSession { .. })
                                 | Some(AgentCommand::LoadSession { .. })
-                                | Some(AgentCommand::RenameSession { .. }) => {
+                                | Some(AgentCommand::RenameSession { .. })
+                                | Some(AgentCommand::RefreshContext) => {
                                     let _ = events.send(AgentEvent::Error(AgentError::new(
                                         "a turn or compaction is already active",
                                     ))).await;
@@ -279,7 +290,16 @@ where
                                 Some(AgentCommand::Shutdown) | None => {
                                     active_task.cancel.cancel();
                                     let result = (&mut active_task.task).await;
-                                    apply_task_result(result, active_task.compaction, &mut self.conversation, &events).await;
+                                    apply_task_result(
+                                        result,
+                                        active_task.compaction,
+                                        &mut self.conversation,
+                                        self.provider.as_ref(),
+                                        &self.registry,
+                                        &self.base_messages,
+                                        &events,
+                                    )
+                                    .await;
                                     return;
                                 }
                             }
@@ -406,6 +426,16 @@ where
                             }
                         },
                     },
+                    Some(AgentCommand::RefreshContext) => {
+                        emit_context_snapshot(
+                            self.provider.as_ref(),
+                            &self.registry,
+                            &self.base_messages,
+                            &self.conversation,
+                            &events,
+                        )
+                        .await;
+                    }
                     Some(AgentCommand::Cancel) => {
                         let _ = events
                             .send(AgentEvent::Error(AgentError::new("no turn is active")))
@@ -474,15 +504,21 @@ async fn emit_session_loaded(
     }
 }
 
-async fn apply_task_result(
+async fn apply_task_result<P>(
     result: Result<RuntimeTaskOutcome, tokio::task::JoinError>,
     compaction: bool,
     conversation: &mut ConversationHistory,
+    provider: &P,
+    registry: &ToolRegistry,
+    base_messages: &[ModelMessage],
     events: &mpsc::Sender<AgentEvent>,
-) {
+) where
+    P: ModelProvider,
+{
     match result {
         Ok(RuntimeTaskOutcome::Turn(outcome)) => {
             *conversation = outcome.history;
+            emit_context_snapshot(provider, registry, base_messages, conversation, events).await;
             let _ = events
                 .send(AgentEvent::TurnFinished {
                     reason: outcome.reason,
@@ -940,6 +976,20 @@ where
             return Err(CompactionError::Failed(message));
         }
     };
+    let compacted = ConversationHistory::new(Some(summary.clone()), retained.clone());
+    let after_tokens =
+        estimator.estimate_request(&normal_request(&config.base_messages, &compacted, &tools));
+    if after_tokens >= before_tokens {
+        let message = format!(
+            "compaction did not reduce context: estimated {before_tokens} tokens before and {after_tokens} after"
+        );
+        let _ = events
+            .send(AgentEvent::CompactionFailed {
+                message: message.clone(),
+            })
+            .await;
+        return Err(CompactionError::Failed(message));
+    }
 
     if let Err(error) = config
         .session
@@ -957,9 +1007,6 @@ where
         let _ = events.send(AgentEvent::SessionChanged { info }).await;
     }
 
-    let compacted = ConversationHistory::new(Some(summary), retained);
-    let after_tokens =
-        estimator.estimate_request(&normal_request(&config.base_messages, &compacted, &tools));
     let _ = events
         .send(AgentEvent::ContextUsageUpdated(ContextUsage::estimated(
             after_tokens,
@@ -1019,53 +1066,8 @@ fn select_compaction_prefix(
         }
     }
 
-    let mut retained = messages_from_segments(&segments, retained_start);
-    let current_groups = atomic_groups(&segments[current_segment].messages);
-    if current_groups.len() > 2 && current_groups[0].has_user_message {
-        let removable_end = current_groups.len() - 1;
-        let mut current_prefix = Vec::new();
-        let mut removed_until = 1;
-        for group_index in 1..removable_end {
-            if !current_groups[group_index].safe_to_compact {
-                break;
-            }
-            current_prefix.extend(current_groups[group_index].messages.iter().cloned());
-            removed_until = group_index + 1;
-            let retained_current = current_groups
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| *index == 0 || *index >= removed_until)
-                .flat_map(|(_, group)| group.messages.iter().cloned());
-            let mut candidate = retained[..retained
-                .len()
-                .saturating_sub(segments[current_segment].messages.len())]
-                .to_vec();
-            candidate.extend(retained_current);
-            if projected_tokens(base_messages, tools, &candidate) <= target {
-                let mut complete_prefix = prefix.clone();
-                complete_prefix.extend(current_prefix.iter().cloned());
-                return Some((complete_prefix, candidate));
-            }
-        }
-
-        if !current_prefix.is_empty() {
-            let retained_current = current_groups
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| *index == 0 || *index >= removed_until)
-                .flat_map(|(_, group)| group.messages.iter().cloned());
-            let mut candidate = retained[..retained
-                .len()
-                .saturating_sub(segments[current_segment].messages.len())]
-                .to_vec();
-            candidate.extend(retained_current);
-            retained = candidate;
-            prefix.extend(current_prefix);
-        }
-    }
-
     if !prefix.is_empty() {
-        Some((prefix, retained))
+        Some((prefix, messages_from_segments(&segments, retained_start)))
     } else {
         None
     }
@@ -1091,38 +1093,6 @@ fn messages_from_segments(segments: &[HistorySegment], start: usize) -> Vec<Mode
         .collect()
 }
 
-fn atomic_groups(messages: &[ModelMessage]) -> Vec<HistorySegment> {
-    let mut groups = Vec::new();
-    let mut index = 0;
-    while index < messages.len() {
-        let mut group = vec![messages[index].clone()];
-        let has_tool_calls = matches!(
-            &messages[index],
-            ModelMessage::Assistant { items }
-                if items.iter().any(|item| matches!(item, crate::model::ModelAssistantItem::ToolCall(_)))
-        );
-        index += 1;
-        if has_tool_calls {
-            while index < messages.len()
-                && matches!(messages[index], ModelMessage::ToolResult { .. })
-            {
-                group.push(messages[index].clone());
-                index += 1;
-            }
-        }
-        let segment = segment_history(&group)
-            .into_iter()
-            .next()
-            .unwrap_or(HistorySegment {
-                messages: group,
-                has_user_message: false,
-                safe_to_compact: false,
-            });
-        groups.push(segment);
-    }
-    groups
-}
-
 fn extract_summary(response: &ModelResponse) -> Result<String, String> {
     if response.stop_reason == StopReason::ToolCalls
         || response
@@ -1131,6 +1101,12 @@ fn extract_summary(response: &ModelResponse) -> Result<String, String> {
             .any(|item| matches!(item, ModelAssistantItem::ToolCall(_)))
     {
         return Err("compaction response contained a tool call".to_owned());
+    }
+    if response.stop_reason != StopReason::Stop {
+        return Err(format!(
+            "compaction response did not finish successfully: {:?}",
+            response.stop_reason
+        ));
     }
     let summary: String = response
         .items
@@ -1568,6 +1544,25 @@ mod tests {
                 reason: StopReason::Stop,
             })
         );
+        let context_snapshots: Vec<u64> = received
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ContextUsageUpdated(usage) => Some(usage.estimated_input_tokens),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(context_snapshots.len(), 2);
+        assert!(context_snapshots[1] > context_snapshots[0]);
+
+        command_tx.send(AgentCommand::RefreshContext).await.unwrap();
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(AgentEvent::ContextLimitsUpdated(_))
+        ));
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(AgentEvent::ContextUsageUpdated(_))
+        ));
 
         command_tx
             .send(AgentCommand::Shutdown)
@@ -2318,9 +2313,7 @@ mod tests {
     }
 
     #[test]
-    fn current_turn_compaction_keeps_user_and_atomic_tool_boundaries() {
-        let call_a = tool_call("a", "read", "{}");
-        let call_b = tool_call("b", "read", "{}");
+    fn compaction_never_summarizes_work_after_a_retained_user_request() {
         let history = ConversationHistory::new(
             None,
             vec![
@@ -2330,9 +2323,15 @@ mod tests {
                         content: "old answer".to_owned(),
                     }],
                 },
+                ModelMessage::user("recent"),
+                ModelMessage::Assistant {
+                    items: vec![ModelAssistantItem::Text {
+                        content: "recent answer".to_owned(),
+                    }],
+                },
                 ModelMessage::user("current request"),
                 ModelMessage::Assistant {
-                    items: vec![ModelAssistantItem::ToolCall(call_a)],
+                    items: vec![ModelAssistantItem::ToolCall(tool_call("a", "read", "{}"))],
                 },
                 ModelMessage::ToolResult {
                     tool_call_id: "a".to_owned(),
@@ -2340,34 +2339,47 @@ mod tests {
                     content: "first result".to_owned(),
                 },
                 ModelMessage::Assistant {
-                    items: vec![ModelAssistantItem::ToolCall(call_b)],
+                    items: vec![ModelAssistantItem::ToolCall(tool_call("b", "read", "{}"))],
                 },
                 ModelMessage::ToolResult {
                     tool_call_id: "b".to_owned(),
                     tool_name: "read".to_owned(),
                     content: "latest result".to_owned(),
                 },
-                ModelMessage::Assistant {
-                    items: vec![ModelAssistantItem::Text {
-                        content: "done".to_owned(),
-                    }],
-                },
             ],
         );
+        let current_turn = history.messages()[4..].to_vec();
         let (prefix, retained) = select_compaction_prefix(&history, &[], &[], 1, true)
-            .expect("completed current-turn work should be compactable");
-        assert!(!prefix.iter().any(|message| {
-            matches!(message, ModelMessage::User { content } if content == "current request")
-        }));
-        assert!(retained.iter().any(|message| {
-            matches!(message, ModelMessage::User { content } if content == "current request")
-        }));
-        assert!(prefix.iter().any(|message| {
-            matches!(message, ModelMessage::ToolResult { tool_call_id, .. } if tool_call_id == "a")
-        }));
-        assert!(prefix.iter().any(|message| {
-            matches!(message, ModelMessage::ToolResult { tool_call_id, .. } if tool_call_id == "b")
-        }));
+            .expect("a completed prior turn should be compactable");
+
+        assert!(prefix.iter().all(|message| !current_turn.contains(message)));
+        assert!(retained.ends_with(&current_turn));
+    }
+
+    #[test]
+    fn compaction_rejects_length_limited_summary() {
+        let response = ModelResponse {
+            items: vec![ModelAssistantItem::Text {
+                content: "partial summary".to_owned(),
+            }],
+            stop_reason: StopReason::Length,
+            usage: None,
+        };
+
+        assert!(extract_summary(&response).is_err());
+    }
+
+    #[test]
+    fn compaction_rejects_incomplete_summary() {
+        let response = ModelResponse {
+            items: vec![ModelAssistantItem::Text {
+                content: "partial summary".to_owned(),
+            }],
+            stop_reason: StopReason::Incomplete,
+            usage: None,
+        };
+
+        assert!(extract_summary(&response).is_err());
     }
 
     #[tokio::test]
@@ -2524,24 +2536,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_reducing_compaction_is_not_persisted() {
+        let root = unique_test_dir("agent-non-reducing-compaction");
+        std::fs::create_dir_all(&root).unwrap();
+        let repository =
+            crate::session::SessionRepository::new(root.join("sessions"), &root, &root).unwrap();
+        let handle = repository.create().unwrap();
+        let initial_history = vec![
+            ModelMessage::user("first request ".repeat(20)),
+            ModelMessage::Assistant {
+                items: vec![ModelAssistantItem::Text {
+                    content: "first answer ".repeat(20),
+                }],
+            },
+            ModelMessage::user("second request ".repeat(20)),
+            ModelMessage::Assistant {
+                items: vec![ModelAssistantItem::Text {
+                    content: "second answer ".repeat(20),
+                }],
+            },
+            ModelMessage::user("recent request ".repeat(20)),
+            ModelMessage::Assistant {
+                items: vec![ModelAssistantItem::Text {
+                    content: "recent answer ".repeat(20),
+                }],
+            },
+        ];
+        for message in &initial_history {
+            handle.append_message(message).unwrap();
+        }
+        let path = handle.info().unwrap().path.clone();
+        let provider = ScriptedProvider::new(vec![final_step(&"verbose summary ".repeat(500))]);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let runtime = AgentRuntime::with_config(
+            provider,
+            AgentRuntimeConfig {
+                tool_context: ToolContext::new(&root).unwrap(),
+                base_messages: Vec::new(),
+                initial_history,
+                session: SessionMode::Enabled(handle.clone()),
+            },
+        );
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+
+        command_tx.send(AgentCommand::Compact).await.unwrap();
+        let failure = loop {
+            if let AgentEvent::CompactionFailed { message } = event_rx.recv().await.unwrap() {
+                break message;
+            }
+        };
+        assert!(failure.contains("did not reduce context"));
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+        drop(handle);
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("\"type\":\"compaction\""));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn manual_compaction_does_not_create_a_turn() {
         let initial_history = vec![
-            ModelMessage::user("old one"),
+            ModelMessage::user("old one ".repeat(100)),
             ModelMessage::Assistant {
                 items: vec![ModelAssistantItem::Text {
-                    content: "answer one".to_owned(),
+                    content: "answer one ".repeat(100),
                 }],
             },
-            ModelMessage::user("old two"),
+            ModelMessage::user("old two ".repeat(100)),
             ModelMessage::Assistant {
                 items: vec![ModelAssistantItem::Text {
-                    content: "answer two".to_owned(),
+                    content: "answer two ".repeat(100),
                 }],
             },
-            ModelMessage::user("recent"),
+            ModelMessage::user("recent ".repeat(100)),
             ModelMessage::Assistant {
                 items: vec![ModelAssistantItem::Text {
-                    content: "answer recent".to_owned(),
+                    content: "answer recent ".repeat(100),
                 }],
             },
         ];
@@ -2583,22 +2656,22 @@ mod tests {
     #[tokio::test]
     async fn repeated_compaction_replaces_summary_after_reincluding_previous_state() {
         let initial_history = vec![
-            ModelMessage::user("first"),
+            ModelMessage::user("first ".repeat(100)),
             ModelMessage::Assistant {
                 items: vec![ModelAssistantItem::Text {
-                    content: "first answer".to_owned(),
+                    content: "first answer ".repeat(100),
                 }],
             },
-            ModelMessage::user("second"),
+            ModelMessage::user("second ".repeat(100)),
             ModelMessage::Assistant {
                 items: vec![ModelAssistantItem::Text {
-                    content: "second answer".to_owned(),
+                    content: "second answer ".repeat(100),
                 }],
             },
-            ModelMessage::user("third"),
+            ModelMessage::user("third ".repeat(100)),
             ModelMessage::Assistant {
                 items: vec![ModelAssistantItem::Text {
-                    content: "third answer".to_owned(),
+                    content: "third answer ".repeat(100),
                 }],
             },
         ];
@@ -2664,10 +2737,10 @@ mod tests {
     #[tokio::test]
     async fn context_overflow_is_retried_once_after_emergency_compaction() {
         let initial_history = vec![
-            ModelMessage::user("old one"),
+            ModelMessage::user("old one ".repeat(20)),
             ModelMessage::Assistant {
                 items: vec![ModelAssistantItem::Text {
-                    content: "answer one".to_owned(),
+                    content: "answer one ".repeat(20),
                 }],
             },
             ModelMessage::user("old two"),
