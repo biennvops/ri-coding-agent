@@ -13,8 +13,8 @@ pub use app::{
     AppState, MessageRole, ToolStatus, ToolTranscriptEntry, TranscriptEntry, TranscriptMessage,
 };
 pub use config::{
-    ApiKind, Compatibility, ConfigError, ConfigWarning, CostMetadata, ModelCatalog, ModelRef,
-    ResolvedModel,
+    ApiKind, Compatibility, ConfigError, ConfigWarning, ContextSettings, CostMetadata,
+    ModelCatalog, ModelRef, ResolvedModel, ResolvedSettings, Settings, SettingsError, SettingsLoad,
 };
 pub use model::{
     ConfiguredProvider, MockProvider, ModelAssistantItem, ModelEvent, ModelMessage, ModelProvider,
