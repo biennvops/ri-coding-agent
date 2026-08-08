@@ -140,10 +140,7 @@ pub fn load_context_with_home(
     };
 
     if let Some(home) = home {
-        loader.load_candidate(
-            &home.join(".ri/agent/AGENTS.md"),
-            ContextFileKind::GlobalAgents,
-        )?;
+        loader.load_directory(&home.join(".ri/agent"), ContextFileKind::GlobalAgents)?;
     }
 
     let relative_cwd = launch_cwd
@@ -333,6 +330,31 @@ mod tests {
             ["global", "root", "nested", "cwd"]
         );
         assert!(bundle.files.iter().all(|file| file.path.is_absolute()));
+        remove_test_dir(home);
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn global_override_replaces_global_agents() {
+        let home = unique_test_dir("agents-global-override-home");
+        let root = unique_test_dir("agents-global-override-root");
+        fs::create_dir_all(home.join(".ri/agent")).unwrap();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(home.join(".ri/agent/AGENTS.md"), "ignored global").unwrap();
+        fs::write(home.join(".ri/agent/AGENTS.override.md"), "global override").unwrap();
+        fs::write(root.join("AGENTS.md"), "project root").unwrap();
+
+        let bundle = load_context_with_home(&root, &root, Some(&home)).unwrap();
+
+        assert_eq!(
+            bundle
+                .files
+                .iter()
+                .map(|file| file.content.as_str())
+                .collect::<Vec<_>>(),
+            ["global override", "project root"]
+        );
+        assert_eq!(bundle.files[0].kind, ContextFileKind::AgentsOverride);
         remove_test_dir(home);
         remove_test_dir(root);
     }

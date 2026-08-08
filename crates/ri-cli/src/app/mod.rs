@@ -404,18 +404,21 @@ fn model_selection<'a>(
     options: &'a Options,
     settings: &'a ResolvedSettings,
 ) -> (Option<&'a str>, Option<&'a str>) {
-    let provider = options
-        .provider
-        .as_deref()
-        .or(settings.default_provider.as_deref());
     let model = options
         .model
         .as_deref()
         .or(settings.default_model.as_deref());
-    let provider = if options.provider.is_none() && model.is_some_and(|model| model.contains('/')) {
+    let provider = if let Some(provider) = options.provider.as_deref() {
+        Some(provider)
+    } else if options
+        .model
+        .as_deref()
+        .is_some_and(|model| model.contains('/'))
+    {
+        // An explicitly qualified CLI model overrides an inherited provider.
         None
     } else {
-        provider
+        settings.default_provider.as_deref()
     };
     (provider, model)
 }
@@ -588,6 +591,35 @@ mod tests {
                 .display_name(),
             "provider-b/model-b"
         );
+    }
+
+    #[test]
+    fn settings_provider_preserves_slash_containing_model_id() {
+        let settings = ResolvedSettings {
+            default_provider: Some("openrouter".to_owned()),
+            default_model: Some("anthropic/claude-sonnet-4".to_owned()),
+            ..ResolvedSettings::default()
+        };
+        let catalog = ModelCatalog::from_json(
+            "models.json",
+            r#"{
+                "providers": {
+                    "openrouter": {
+                        "baseUrl": "https://example.test",
+                        "api": "openai-responses",
+                        "models": [{"id": "anthropic/claude-sonnet-4"}]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let options = Options::default();
+        let (provider, model) = model_selection(&options, &settings);
+        let selected = catalog.resolve(provider, model).unwrap();
+
+        assert_eq!(selected.model_ref.provider, "openrouter");
+        assert_eq!(selected.model_ref.model, "anthropic/claude-sonnet-4");
     }
 
     #[test]
