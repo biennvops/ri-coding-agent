@@ -198,7 +198,10 @@ impl AppState {
                 self.turn_active = false;
                 self.last_stop_reason = Some(reason);
             }
-            AgentEvent::ToolCallDelta { .. } | AgentEvent::UsageUpdated(_) => {}
+            AgentEvent::AssistantThinkingContentDelta { .. }
+            | AgentEvent::AssistantThinkingItem { .. }
+            | AgentEvent::ToolCallDelta { .. }
+            | AgentEvent::UsageUpdated(_) => {}
             AgentEvent::ModelChanged(model) => {
                 self.active_model = Some(model);
             }

@@ -150,6 +150,8 @@ async fn run_print(prompt: String, setup: ModelSetup) -> Result<()> {
             AgentEvent::TurnFinished { reason } => turn_reason = Some(reason.clone()),
             AgentEvent::TurnStarted
             | AgentEvent::AssistantThinkingDelta { .. }
+            | AgentEvent::AssistantThinkingContentDelta { .. }
+            | AgentEvent::AssistantThinkingItem { .. }
             | AgentEvent::ToolCallDelta { .. }
             | AgentEvent::UsageUpdated(_)
             | AgentEvent::ModelChanged(_) => {}

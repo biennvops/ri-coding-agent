@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{ApiKind, ResolvedModel};
 
 use super::{
-    ModelEvent, ModelMessage, ModelProvider, ModelRequest, ModelResponse, ModelToolCall,
-    ProviderError, StopReason, ToolDefinition, Usage,
+    ModelEvent, ModelMessage, ModelProvider, ModelRequest, ModelResponse, ModelThinking,
+    ModelToolCall, ProviderError, StopReason, ToolDefinition, Usage,
 };
 
 #[derive(Clone)]
@@ -214,7 +214,7 @@ async fn read_error_body(
 #[derive(Default)]
 struct ResponseCollector {
     content: String,
-    thinking: String,
+    thinking: ModelThinking,
     stop_reason: Option<StopReason>,
     terminal_seen: bool,
     tool_calls: BTreeMap<usize, ModelToolCall>,
@@ -256,7 +256,29 @@ impl ResponseCollector {
             }
             ModelEvent::UsageUpdated(usage) => self.usage = Some(usage.clone()),
             ModelEvent::AssistantTextDelta { text } => self.content.push_str(text),
-            ModelEvent::AssistantThinkingDelta { text } => self.thinking.push_str(text),
+            ModelEvent::AssistantThinkingDelta { text } => self.thinking.summary.push_str(text),
+            ModelEvent::AssistantThinkingContentDelta { text } => {
+                self.thinking.content.push_str(text)
+            }
+            ModelEvent::AssistantThinkingItem {
+                item_id,
+                summary,
+                content,
+                encrypted_content,
+            } => {
+                if item_id.is_some() {
+                    self.thinking.item_id = item_id.clone();
+                }
+                if summary.is_some() {
+                    self.thinking.summary = summary.clone().unwrap_or_default();
+                }
+                if content.is_some() {
+                    self.thinking.content = content.clone().unwrap_or_default();
+                }
+                if encrypted_content.is_some() {
+                    self.thinking.encrypted_content = encrypted_content.clone();
+                }
+            }
         }
     }
 
@@ -275,7 +297,11 @@ impl ResponseCollector {
         };
         Ok(ModelResponse {
             content: self.content,
-            thinking: (!self.thinking.is_empty()).then_some(self.thinking),
+            thinking: (!self.thinking.summary.is_empty()
+                || !self.thinking.content.is_empty()
+                || self.thinking.item_id.is_some()
+                || self.thinking.encrypted_content.is_some())
+            .then_some(self.thinking),
             stop_reason,
             tool_calls: self.tool_calls.into_values().collect(),
             usage: self.usage,
@@ -334,13 +360,20 @@ fn parse_responses_payload(value: &Value) -> Result<ParsedPayload, ProviderError
                 });
             }
         }
-        "response.reasoning_summary_text.delta"
-        | "response.reasoning_text.delta"
-        | "response.reasoning.delta" => {
+        "response.reasoning_summary_text.delta" | "response.reasoning.delta" => {
             if let Some(text) = value.get("delta").and_then(Value::as_str) {
                 parsed.events.push(ModelEvent::AssistantThinkingDelta {
                     text: text.to_owned(),
                 });
+            }
+        }
+        "response.reasoning_text.delta" => {
+            if let Some(text) = value.get("delta").and_then(Value::as_str) {
+                parsed
+                    .events
+                    .push(ModelEvent::AssistantThinkingContentDelta {
+                        text: text.to_owned(),
+                    });
             }
         }
         "response.function_call_arguments.delta" => {
@@ -388,6 +421,14 @@ fn parse_responses_payload(value: &Value) -> Result<ParsedPayload, ProviderError
                         .to_owned(),
                     arguments_complete: false,
                 });
+            } else if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+                parsed.events.push(reasoning_item_event(item));
+            }
+        }
+        "response.output_item.done" => {
+            let item = value.get("item").unwrap_or(&Value::Null);
+            if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+                parsed.events.push(reasoning_item_event(item));
             }
         }
         "response.function_call_arguments.done" => {
@@ -531,6 +572,32 @@ fn parse_completions_payload(value: &Value) -> Result<ParsedPayload, ProviderErr
     Ok(parsed)
 }
 
+fn reasoning_item_event(item: &Value) -> ModelEvent {
+    ModelEvent::AssistantThinkingItem {
+        item_id: item.get("id").and_then(Value::as_str).map(str::to_owned),
+        summary: reasoning_text(item.get("summary")),
+        content: reasoning_text(item.get("content")),
+        encrypted_content: item
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    }
+}
+
+fn reasoning_text(value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(Value::Array(parts)) => {
+            let text: String = parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect();
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
 fn parse_usage(value: &Value) -> Option<Usage> {
     let input_tokens = value
         .get("input_tokens")
@@ -651,10 +718,13 @@ fn responses_message_items(message: &ModelMessage, model: &ResolvedModel) -> Vec
         })],
         ModelMessage::Assistant {
             content,
+            thinking,
             tool_calls,
-            ..
         } => {
             let mut items = Vec::new();
+            if let Some(thinking) = thinking {
+                items.push(responses_reasoning_item(thinking));
+            }
             if !content.is_empty() || tool_calls.is_empty() {
                 items.push(json!({
                     "role": "assistant",
@@ -785,6 +855,33 @@ fn responses_tool(tool: &ToolDefinition) -> Value {
         "description": tool.description,
         "parameters": tool.parameters,
     })
+}
+
+fn responses_reasoning_item(thinking: &ModelThinking) -> Value {
+    let mut value = Map::new();
+    value.insert("type".to_owned(), Value::String("reasoning".to_owned()));
+    if let Some(item_id) = &thinking.item_id {
+        value.insert("id".to_owned(), Value::String(item_id.clone()));
+    }
+    if !thinking.summary.is_empty() {
+        value.insert(
+            "summary".to_owned(),
+            json!([{"type": "summary_text", "text": thinking.summary}]),
+        );
+    }
+    if !thinking.content.is_empty() {
+        value.insert(
+            "content".to_owned(),
+            json!([{"type": "reasoning_text", "text": thinking.content}]),
+        );
+    }
+    if let Some(encrypted_content) = &thinking.encrypted_content {
+        value.insert(
+            "encrypted_content".to_owned(),
+            Value::String(encrypted_content.clone()),
+        );
+    }
+    Value::Object(value)
 }
 
 fn responses_tool_call(tool_call: &ModelToolCall) -> Value {
@@ -1042,6 +1139,82 @@ mod tests {
                 arguments: "{}".to_owned(),
                 arguments_complete: false,
             }]
+        );
+    }
+
+    #[test]
+    fn responses_reasoning_replays_before_function_call_and_output() {
+        let payloads = [
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_123","summary":[],"content":[],"encrypted_content":"enc_123"}}"#,
+            r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_123","delta":"inspect the file"}"#,
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_123","call_id":"call_123","name":"read","arguments":"{\"path\":\"src/main.rs\"}"}}"#,
+            r#"{"type":"response.completed","response":{"status":"completed"}}"#,
+        ];
+        let mut collector = ResponseCollector::default();
+        for payload in payloads {
+            let parsed = parse_payload(ApiKind::OpenAiResponses, payload)
+                .expect("Responses event should parse");
+            collector.terminal_seen |= parsed.terminal;
+            if parsed.stop_reason.is_some() {
+                collector.stop_reason = parsed.stop_reason;
+            }
+            for event in parsed.events {
+                collector.record(&event);
+            }
+        }
+
+        let response = collector
+            .finish()
+            .expect("completed response should finish");
+        let thinking = response.thinking.expect("reasoning should be preserved");
+        assert_eq!(thinking.item_id.as_deref(), Some("rs_123"));
+        assert_eq!(thinking.summary, "inspect the file");
+        assert_eq!(thinking.encrypted_content.as_deref(), Some("enc_123"));
+
+        let model = test_model(
+            ApiKind::OpenAiResponses,
+            "https://example.test/v1".to_owned(),
+        );
+        let request = ModelRequest {
+            messages: vec![
+                ModelMessage::user("inspect src/main.rs"),
+                ModelMessage::Assistant {
+                    content: response.content,
+                    thinking: Some(thinking),
+                    tool_calls: response.tool_calls,
+                },
+                ModelMessage::ToolResult {
+                    tool_call_id: "call_123".to_owned(),
+                    tool_name: "read".to_owned(),
+                    content: "file contents".to_owned(),
+                },
+            ],
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: None,
+            sampling_params: BTreeMap::new(),
+        };
+        let (_, body) = request_for(&model, &request).expect("request should build");
+
+        assert_eq!(
+            body["input"][1],
+            json!({
+                "type": "reasoning",
+                "id": "rs_123",
+                "summary": [{"type": "summary_text", "text": "inspect the file"}],
+                "encrypted_content": "enc_123"
+            })
+        );
+        assert_eq!(body["input"][2]["type"], "function_call");
+        assert_eq!(body["input"][2]["id"], "fc_123");
+        assert_eq!(body["input"][2]["call_id"], "call_123");
+        assert_eq!(
+            body["input"][3],
+            json!({
+                "type": "function_call_output",
+                "call_id": "call_123",
+                "output": "file contents"
+            })
         );
     }
 

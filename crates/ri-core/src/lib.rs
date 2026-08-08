@@ -11,5 +11,5 @@ pub use config::{
 };
 pub use model::{
     ConfiguredProvider, MockProvider, ModelEvent, ModelMessage, ModelProvider, ModelRequest,
-    ModelResponse, ModelToolCall, ProviderError, StopReason, Usage,
+    ModelResponse, ModelThinking, ModelToolCall, ProviderError, StopReason, Usage,
 };

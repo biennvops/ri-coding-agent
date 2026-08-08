@@ -63,6 +63,16 @@ impl ModelProvider for ConfiguredProvider {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelThinking {
+    /// The Responses reasoning item identifier, when the provider supplies one.
+    pub item_id: Option<String>,
+    pub summary: String,
+    pub content: String,
+    /// Opaque provider-returned state required to replay encrypted reasoning.
+    pub encrypted_content: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ModelMessage {
     System {
@@ -76,7 +86,7 @@ pub enum ModelMessage {
     },
     Assistant {
         content: String,
-        thinking: Option<String>,
+        thinking: Option<ModelThinking>,
         tool_calls: Vec<ModelToolCall>,
     },
     ToolResult {
@@ -141,6 +151,15 @@ pub enum ModelEvent {
     AssistantThinkingDelta {
         text: String,
     },
+    AssistantThinkingContentDelta {
+        text: String,
+    },
+    AssistantThinkingItem {
+        item_id: Option<String>,
+        summary: Option<String>,
+        content: Option<String>,
+        encrypted_content: Option<String>,
+    },
     ToolCallDelta {
         index: usize,
         call_id: Option<String>,
@@ -175,7 +194,7 @@ pub struct ModelToolCall {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelResponse {
     pub content: String,
-    pub thinking: Option<String>,
+    pub thinking: Option<ModelThinking>,
     pub stop_reason: StopReason,
     pub tool_calls: Vec<ModelToolCall>,
     pub usage: Option<Usage>,

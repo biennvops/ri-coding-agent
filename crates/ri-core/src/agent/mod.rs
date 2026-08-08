@@ -36,6 +36,15 @@ pub enum AgentEvent {
     AssistantThinkingDelta {
         text: String,
     },
+    AssistantThinkingContentDelta {
+        text: String,
+    },
+    AssistantThinkingItem {
+        item_id: Option<String>,
+        summary: Option<String>,
+        content: Option<String>,
+        encrypted_content: Option<String>,
+    },
     ToolCallDelta {
         index: usize,
         call_id: Option<String>,
@@ -234,6 +243,20 @@ fn agent_event_from_model(event: ModelEvent) -> AgentEvent {
     match event {
         ModelEvent::AssistantTextDelta { text } => AgentEvent::AssistantTextDelta { text },
         ModelEvent::AssistantThinkingDelta { text } => AgentEvent::AssistantThinkingDelta { text },
+        ModelEvent::AssistantThinkingContentDelta { text } => {
+            AgentEvent::AssistantThinkingContentDelta { text }
+        }
+        ModelEvent::AssistantThinkingItem {
+            item_id,
+            summary,
+            content,
+            encrypted_content,
+        } => AgentEvent::AssistantThinkingItem {
+            item_id,
+            summary,
+            content,
+            encrypted_content,
+        },
         ModelEvent::ToolCallDelta {
             index,
             call_id,
