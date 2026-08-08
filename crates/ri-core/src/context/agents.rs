@@ -404,6 +404,19 @@ mod tests {
     }
 
     #[test]
+    fn accepts_a_file_at_the_per_file_limit() {
+        let root = unique_test_dir("agents-file-limit-exact");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("AGENTS.md"), vec![b'x'; MAX_CONTEXT_FILE_BYTES]).unwrap();
+
+        let bundle = load_context_with_home(&root, &root, None).unwrap();
+
+        assert_eq!(bundle.files.len(), 1);
+        assert_eq!(bundle.files[0].content.len(), MAX_CONTEXT_FILE_BYTES);
+        remove_test_dir(root);
+    }
+
+    #[test]
     fn rejects_a_file_over_the_per_file_limit() {
         let root = unique_test_dir("agents-file-limit");
         fs::create_dir_all(&root).unwrap();
