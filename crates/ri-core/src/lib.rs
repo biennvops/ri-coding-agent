@@ -5,7 +5,10 @@ pub mod context;
 pub mod model;
 pub mod tools;
 
-pub use agent::{AgentCommand, AgentError, AgentEvent, AgentRuntime, MAX_TOOL_ROUNDS_PER_TURN};
+pub use agent::{
+    AgentCommand, AgentError, AgentEvent, AgentRuntime, AgentRuntimeConfig,
+    MAX_TOOL_ROUNDS_PER_TURN,
+};
 pub use app::{
     AppState, MessageRole, ToolStatus, ToolTranscriptEntry, TranscriptEntry, TranscriptMessage,
 };
