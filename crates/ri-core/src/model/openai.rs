@@ -762,6 +762,12 @@ fn parse_completions_payload(value: &Value) -> Result<ParsedPayload, ProviderErr
                 text: text.to_owned(),
             });
         }
+        if let Some(text) = delta.get("refusal").and_then(Value::as_str) {
+            parsed.events.push(ModelEvent::AssistantRefusalDelta {
+                index: None,
+                text: text.to_owned(),
+            });
+        }
         for key in ["reasoning_content", "reasoning", "thinking"] {
             if let Some(text) = delta.get(key).and_then(Value::as_str) {
                 parsed.events.push(ModelEvent::AssistantThinkingDelta {
@@ -1333,6 +1339,59 @@ mod tests {
                 total_tokens: Some(7),
                 cache_read_tokens: None,
                 cache_write_tokens: None,
+            })
+        );
+    }
+
+    #[test]
+    fn completions_refusal_deltas_are_retained_and_replayed() {
+        let parsed = parse_payload(
+            ApiKind::OpenAiCompletions,
+            r#"{"choices":[{"delta":{"refusal":"I cannot help with that."},"finish_reason":null}]}"#,
+        )
+        .expect("payload should parse");
+        let finished = parse_payload(
+            ApiKind::OpenAiCompletions,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        )
+        .expect("finish payload should parse");
+        let mut collector = ResponseCollector::default();
+        for event in parsed.events.into_iter().chain(finished.events) {
+            collector.record(&event);
+        }
+        collector.stop_reason = finished.stop_reason;
+        collector.terminal_seen = true;
+        let response = collector
+            .finish()
+            .expect("completed response should finish");
+
+        assert_eq!(
+            response.items,
+            [ModelAssistantItem::Refusal {
+                content: "I cannot help with that.".to_owned()
+            }]
+        );
+
+        let model = test_model(
+            ApiKind::OpenAiCompletions,
+            "https://example.test/v1".to_owned(),
+        );
+        let request = ModelRequest {
+            messages: vec![ModelMessage::Assistant {
+                items: response.items,
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: None,
+            sampling_params: BTreeMap::new(),
+        };
+        let (_, body) = request_for(&model, &request).expect("request should build");
+        assert_eq!(
+            body["messages"][0],
+            json!({
+                "role": "assistant",
+                "content": null,
+                "refusal": "I cannot help with that."
             })
         );
     }
