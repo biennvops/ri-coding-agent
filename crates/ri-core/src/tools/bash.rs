@@ -107,6 +107,13 @@ impl Tool for BashTool {
         let mut child = command.spawn().map_err(|error| {
             ToolError::Failed(format!("could not start shell command: {error}"))
         })?;
+        let process_tree = match ProcessTree::attach(&child) {
+            Ok(process_tree) => process_tree,
+            Err(error) => {
+                let _ = child.kill().await;
+                return Err(error);
+            }
+        };
         let stdout = child
             .stdout
             .take()
@@ -175,14 +182,14 @@ impl Tool for BashTool {
                 }
                 _ = cancel.cancelled(), if status.is_none() && !cancelled => {
                     cancelled = true;
-                    terminate_child(&mut child).await?;
+                    terminate_child(&mut child, &process_tree).await?;
                     status = child.try_wait().map_err(|error| {
                         ToolError::Failed(format!("could not collect cancelled command: {error}"))
                     })?;
                 }
                 _ = &mut timeout_sleep, if status.is_none() && !timed_out && !cancelled => {
                     timed_out = true;
-                    terminate_child(&mut child).await?;
+                    terminate_child(&mut child, &process_tree).await?;
                     status = child.try_wait().map_err(|error| {
                         ToolError::Failed(format!("could not collect timed-out command: {error}"))
                     })?;
@@ -192,7 +199,7 @@ impl Tool for BashTool {
                         Ok(next_status) => status = next_status,
                         Err(error) => {
                             process_error = Some(ToolError::Failed(format!("could not inspect command: {error}")));
-                            terminate_child(&mut child).await?;
+                            terminate_child(&mut child, &process_tree).await?;
                             status = child.try_wait().ok().flatten();
                         }
                     }
@@ -383,10 +390,40 @@ impl Utf8Decoder {
     }
 }
 
-async fn terminate_child(child: &mut Child) -> Result<(), ToolError> {
+struct ProcessTree {
+    #[cfg(windows)]
+    job: WindowsJob,
+}
+
+impl ProcessTree {
+    fn attach(child: &Child) -> Result<Self, ToolError> {
+        #[cfg(windows)]
+        {
+            return Ok(Self {
+                job: WindowsJob::attach(child)?,
+            });
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = child;
+            Ok(Self {})
+        }
+    }
+
+    #[cfg(windows)]
+    fn terminate(&self) -> Result<(), ToolError> {
+        self.job.terminate()
+    }
+}
+
+async fn terminate_child(child: &mut Child, process_tree: &ProcessTree) -> Result<(), ToolError> {
+    #[cfg(unix)]
+    let _ = process_tree;
     #[cfg(unix)]
     signal_process_group(child, SIGTERM);
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    process_tree.terminate()?;
+    #[cfg(not(any(unix, windows)))]
     child.start_kill().map_err(|error| {
         ToolError::Failed(format!("could not terminate shell command: {error}"))
     })?;
@@ -395,6 +432,17 @@ async fn terminate_child(child: &mut Child) -> Result<(), ToolError> {
 
     #[cfg(unix)]
     signal_process_group(child, SIGKILL);
+    #[cfg(windows)]
+    if child
+        .try_wait()
+        .map_err(|error| {
+            ToolError::Failed(format!("could not inspect terminated command: {error}"))
+        })?
+        .is_none()
+    {
+        process_tree.terminate()?;
+    }
+    #[cfg(not(any(unix, windows)))]
     child
         .start_kill()
         .map_err(|error| ToolError::Failed(format!("could not kill shell command: {error}")))?;
@@ -403,6 +451,141 @@ async fn terminate_child(child: &mut Child) -> Result<(), ToolError> {
         .await
         .map_err(|error| ToolError::Failed(format!("could not wait for shell command: {error}")))?;
     Ok(())
+}
+
+#[cfg(windows)]
+struct WindowsJob {
+    handle: usize,
+}
+
+#[cfg(windows)]
+impl WindowsJob {
+    fn attach(child: &Child) -> Result<Self, ToolError> {
+        let handle = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
+        if handle.is_null() {
+            return Err(ToolError::Failed(format!(
+                "could not create Windows job object: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let mut limits = JobObjectExtendedLimitInformation::default();
+        limits.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                handle,
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+                &mut limits as *mut _ as *mut std::ffi::c_void,
+                std::mem::size_of::<JobObjectExtendedLimitInformation>() as u32,
+            )
+        } != 0;
+        if !configured {
+            unsafe {
+                CloseHandle(handle);
+            }
+            return Err(ToolError::Failed(format!(
+                "could not configure Windows job object: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let process_handle = child.raw_handle().ok_or_else(|| {
+            unsafe {
+                CloseHandle(handle);
+            }
+            ToolError::Failed("shell process exited before job assignment".to_owned())
+        })?;
+        if unsafe { AssignProcessToJobObject(handle, process_handle) } == 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                CloseHandle(handle);
+            }
+            return Err(ToolError::Failed(format!(
+                "could not assign shell process to Windows job object: {error}"
+            )));
+        }
+        Ok(Self {
+            handle: handle as usize,
+        })
+    }
+
+    fn terminate(&self) -> Result<(), ToolError> {
+        if unsafe { TerminateJobObject(self.handle as *mut std::ffi::c_void, 1) } == 0 {
+            return Err(ToolError::Failed(format!(
+                "could not terminate Windows process tree: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsJob {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.handle as *mut std::ffi::c_void);
+        }
+    }
+}
+
+#[cfg(windows)]
+const JOBOBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: u32 = 9;
+#[cfg(windows)]
+const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Default)]
+struct JobObjectBasicLimitInformation {
+    per_process_user_time_limit: i64,
+    per_job_user_time_limit: i64,
+    limit_flags: u32,
+    minimum_working_set_size: usize,
+    maximum_working_set_size: usize,
+    active_process_limit: u32,
+    affinity: usize,
+    priority_class: u32,
+    scheduling_class: u32,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Default)]
+struct IoCounters {
+    read_operation_count: u64,
+    write_operation_count: u64,
+    other_operation_count: u64,
+    read_transfer_count: u64,
+    write_transfer_count: u64,
+    other_transfer_count: u64,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Default)]
+struct JobObjectExtendedLimitInformation {
+    basic_limit_information: JobObjectBasicLimitInformation,
+    io_information: IoCounters,
+    process_memory_limit: usize,
+    job_memory_limit: usize,
+    peak_process_memory_used: usize,
+    peak_job_memory_used: usize,
+}
+
+#[cfg(windows)]
+unsafe extern "system" {
+    fn CreateJobObjectW(
+        attributes: *mut std::ffi::c_void,
+        name: *const u16,
+    ) -> *mut std::ffi::c_void;
+    fn SetInformationJobObject(
+        job: *mut std::ffi::c_void,
+        information_class: u32,
+        job_object_information: *mut std::ffi::c_void,
+        job_object_information_length: u32,
+    ) -> i32;
+    fn AssignProcessToJobObject(job: *mut std::ffi::c_void, process: *mut std::ffi::c_void) -> i32;
+    fn TerminateJobObject(job: *mut std::ffi::c_void, exit_code: u32) -> i32;
+    fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
 }
 
 #[cfg(unix)]
@@ -558,9 +741,14 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let context = ToolContext::new(&root).unwrap();
         let (events, mut event_rx) = mpsc::channel(32);
+        let command = if cfg!(windows) {
+            "echo out & echo err 1>&2 & exit /B 7"
+        } else {
+            "printf out; printf err >&2; exit 7"
+        };
         let result = BashTool
             .execute(
-                json!({"command":"printf out; printf err >&2; exit 7"}),
+                json!({"command": command}),
                 &context,
                 events,
                 CancellationToken::new(),
@@ -583,9 +771,14 @@ mod tests {
         let root = unique_test_dir("bash-timeout");
         fs::create_dir_all(&root).unwrap();
         let context = ToolContext::new(&root).unwrap();
+        let command = if cfg!(windows) {
+            "ping -n 6 127.0.0.1 >NUL"
+        } else {
+            "sleep 5"
+        };
         let result = BashTool
             .execute(
-                json!({"command":"sleep 5", "timeout_ms":50}),
+                json!({"command":command, "timeout_ms":50}),
                 &context,
                 mpsc::channel(8).0,
                 CancellationToken::new(),
@@ -606,10 +799,15 @@ mod tests {
         let context = ToolContext::new(&root).unwrap();
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
+        let command = if cfg!(windows) {
+            "ping -n 6 127.0.0.1 >NUL"
+        } else {
+            "sleep 5"
+        };
         let task = tokio::spawn(async move {
             BashTool
                 .execute(
-                    json!({"command":"sleep 5"}),
+                    json!({"command":command}),
                     &context,
                     mpsc::channel(8).0,
                     task_cancel,
@@ -671,6 +869,33 @@ mod tests {
             .full_output_path
             .expect("stderr truncation should spill");
         assert!(fs::metadata(path).unwrap().len() > STREAM_OUTPUT_LIMIT as u64);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cancellation_kills_windows_descendants() {
+        let root = unique_test_dir("bash-windows-tree");
+        fs::create_dir_all(&root).unwrap();
+        let context = ToolContext::new(&root).unwrap();
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            BashTool
+                .execute(
+                    json!({"command":"start \"\" /B cmd /C \"ping -n 6 127.0.0.1 >NUL & echo leaked > descendant.txt\" & ping -n 6 127.0.0.1 >NUL"}),
+                    &context,
+                    mpsc::channel(8).0,
+                    task_cancel,
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        let result = task.await.unwrap().unwrap();
+        assert!(result.metadata.cancelled);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!root.join("descendant.txt").exists());
         fs::remove_dir_all(root).unwrap();
     }
 
