@@ -304,10 +304,11 @@ impl AppState {
                 if let Some(TranscriptEntry::Tool(tool)) = self.entries.iter_mut().rev().find(
                     |entry| matches!(entry, TranscriptEntry::Tool(tool) if tool.call_id == call_id),
                 ) {
-                    if tool.output.is_empty() {
-                        append_tool_output(tool, &result.model_content);
-                    }
-                    tool.output_truncated |= result.metadata.truncated;
+                    let live_output_truncated = tool.output_truncated;
+                    tool.output.clear();
+                    tool.output_truncated = false;
+                    append_tool_output(tool, &result.model_content);
+                    tool.output_truncated |= live_output_truncated || result.metadata.truncated;
                     tool.status = ToolStatus::Finished(result.metadata);
                 }
             }
@@ -525,6 +526,32 @@ mod tests {
     }
 
     #[test]
+    fn finished_tool_result_reconciles_the_live_transcript() {
+        let mut state = AppState::new();
+        state.reduce(AgentEvent::ToolExecutionStarted {
+            call_id: "call-1".to_owned(),
+            name: "bash".to_owned(),
+            arguments: "{}".to_owned(),
+        });
+        state.reduce(AgentEvent::ToolExecutionOutput {
+            call_id: "call-1".to_owned(),
+            stream: ToolOutputStream::Stdout,
+            chunk: "partial live output".to_owned(),
+        });
+        state.reduce(AgentEvent::ToolExecutionFinished {
+            call_id: "call-1".to_owned(),
+            name: "bash".to_owned(),
+            result: ToolExecutionResultForTest::result_with_content("authoritative result"),
+        });
+
+        let TranscriptEntry::Tool(tool) = &state.transcript_entries()[0] else {
+            panic!("expected tool entry");
+        };
+        assert_eq!(tool.output, "authoritative result");
+        assert!(matches!(tool.status, ToolStatus::Finished(_)));
+    }
+
+    #[test]
     fn tool_output_is_bounded_and_finishes_with_metadata() {
         let mut state = AppState::new();
         state.reduce(AgentEvent::ToolExecutionStarted {
@@ -555,8 +582,12 @@ mod tests {
 
     impl ToolExecutionResultForTest {
         fn result() -> crate::tools::ToolExecutionResult {
+            Self::result_with_content("done")
+        }
+
+        fn result_with_content(content: &str) -> crate::tools::ToolExecutionResult {
             crate::tools::ToolExecutionResult {
-                model_content: "done".to_owned(),
+                model_content: content.to_owned(),
                 metadata: ToolExecutionMetadata::success(),
             }
         }
