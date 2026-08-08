@@ -1,11 +1,24 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::ModelRef;
-use crate::model::{ModelEvent, ModelProvider, ModelRequest, ProviderError, StopReason, Usage};
+use crate::model::{
+    ModelAssistantItem, ModelEvent, ModelMessage, ModelProvider, ModelRequest, ModelResponse,
+    ModelToolCall, ProviderError, StopReason, Usage,
+};
+use crate::tools::{
+    ToolContext, ToolError, ToolEvent, ToolExecutionMetadata, ToolExecutionResult,
+    ToolOutputStream, ToolRegistry,
+};
+
+pub const MAX_TOOL_ROUNDS_PER_TURN: usize = 32;
+const MODEL_EVENT_CHANNEL_CAPACITY: usize = 64;
+const TOOL_EVENT_CHANNEL_CAPACITY: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentCommand {
@@ -30,6 +43,7 @@ impl AgentError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentEvent {
     TurnStarted,
+    AssistantMessageStarted,
     AssistantTextDelta {
         index: Option<usize>,
         text: String,
@@ -69,6 +83,24 @@ pub enum AgentEvent {
         arguments: String,
         arguments_complete: bool,
     },
+    AssistantMessageFinished {
+        items: Vec<ModelAssistantItem>,
+    },
+    ToolExecutionStarted {
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
+    ToolExecutionOutput {
+        call_id: String,
+        stream: ToolOutputStream,
+        chunk: String,
+    },
+    ToolExecutionFinished {
+        call_id: String,
+        name: String,
+        result: ToolExecutionResult,
+    },
     UsageUpdated(Usage),
     ModelChanged(ModelRef),
     TurnFinished {
@@ -79,11 +111,19 @@ pub enum AgentEvent {
 
 struct ActiveTurn {
     cancel: CancellationToken,
-    task: JoinHandle<()>,
+    task: JoinHandle<TurnOutcome>,
+}
+
+struct TurnOutcome {
+    history: Vec<ModelMessage>,
+    reason: StopReason,
 }
 
 pub struct AgentRuntime<P> {
     provider: Arc<P>,
+    registry: Arc<ToolRegistry>,
+    context: ToolContext,
+    history: Vec<ModelMessage>,
 }
 
 impl<P> AgentRuntime<P>
@@ -91,13 +131,33 @@ where
     P: ModelProvider,
 {
     pub fn new(provider: P) -> Self {
+        let context = ToolContext::from_current_dir().unwrap_or_else(|_| ToolContext {
+            workspace_root: PathBuf::from("."),
+        });
+        Self::with_context(provider, context)
+    }
+
+    pub fn with_context(provider: P, context: ToolContext) -> Self {
         Self {
             provider: Arc::new(provider),
+            registry: Arc::new(ToolRegistry::new()),
+            context,
+            history: Vec::new(),
         }
     }
 
+    pub fn with_workspace_root(
+        provider: P,
+        workspace_root: impl Into<PathBuf>,
+    ) -> Result<Self, ToolError> {
+        Ok(Self::with_context(
+            provider,
+            ToolContext::new(workspace_root)?,
+        ))
+    }
+
     pub async fn run(
-        self,
+        mut self,
         mut commands: mpsc::Receiver<AgentCommand>,
         events: mpsc::Sender<AgentEvent>,
     ) {
@@ -110,10 +170,21 @@ where
                     tokio::select! {
                         result = &mut active_turn.task => {
                             task_finished = true;
-                            if let Err(error) = result {
-                                let _ = events.send(AgentEvent::Error(AgentError::new(
-                                    format!("agent turn task failed: {error}"),
-                                ))).await;
+                            match result {
+                                Ok(outcome) => {
+                                    self.history = outcome.history;
+                                    let _ = events.send(AgentEvent::TurnFinished {
+                                        reason: outcome.reason,
+                                    }).await;
+                                }
+                                Err(error) => {
+                                    let _ = events.send(AgentEvent::Error(AgentError::new(
+                                        format!("agent turn task failed: {error}"),
+                                    ))).await;
+                                    let _ = events.send(AgentEvent::TurnFinished {
+                                        reason: StopReason::Error,
+                                    }).await;
+                                }
                             }
                         }
                         command = commands.recv() => {
@@ -126,7 +197,22 @@ where
                                 }
                                 Some(AgentCommand::Shutdown) | None => {
                                     active_turn.cancel.cancel();
-                                    let _ = (&mut active_turn.task).await;
+                                    match (&mut active_turn.task).await {
+                                        Ok(outcome) => {
+                                            self.history = outcome.history;
+                                            let _ = events.send(AgentEvent::TurnFinished {
+                                                reason: outcome.reason,
+                                            }).await;
+                                        }
+                                        Err(error) => {
+                                            let _ = events.send(AgentEvent::Error(AgentError::new(
+                                                format!("agent turn task failed: {error}"),
+                                            ))).await;
+                                            let _ = events.send(AgentEvent::TurnFinished {
+                                                reason: StopReason::Error,
+                                            }).await;
+                                        }
+                                    }
                                     return;
                                 }
                             }
@@ -141,10 +227,22 @@ where
                     Some(AgentCommand::Submit { text }) => {
                         let cancel = CancellationToken::new();
                         let provider = Arc::clone(&self.provider);
+                        let registry = Arc::clone(&self.registry);
+                        let context = self.context.clone();
+                        let history = self.history.clone();
                         let turn_events = events.clone();
                         let turn_cancel = cancel.clone();
                         let task = tokio::spawn(async move {
-                            run_turn(provider, text, turn_events, turn_cancel).await;
+                            run_turn(
+                                provider,
+                                registry,
+                                context,
+                                history,
+                                text,
+                                turn_events,
+                                turn_cancel,
+                            )
+                            .await
                         });
                         active = Some(ActiveTurn { cancel, task });
                     }
@@ -162,18 +260,167 @@ where
 
 async fn run_turn<P>(
     provider: Arc<P>,
+    registry: Arc<ToolRegistry>,
+    context: ToolContext,
+    mut history: Vec<ModelMessage>,
     text: String,
     events: mpsc::Sender<AgentEvent>,
     cancel: CancellationToken,
-) where
+) -> TurnOutcome
+where
     P: ModelProvider,
 {
+    history.push(ModelMessage::user(text));
     if events.send(AgentEvent::TurnStarted).await.is_err() {
-        return;
+        return turn_outcome(history, StopReason::Error);
     }
 
-    let (model_event_tx, mut model_event_rx) = mpsc::channel(64);
-    let request = ModelRequest::single_user(text);
+    let mut tool_rounds = 0;
+    loop {
+        if cancel.is_cancelled() {
+            return turn_outcome(history, StopReason::Cancelled);
+        }
+
+        if events
+            .send(AgentEvent::AssistantMessageStarted)
+            .await
+            .is_err()
+        {
+            return turn_outcome(history, StopReason::Error);
+        }
+        let request = ModelRequest {
+            messages: history.clone(),
+            tools: registry.definitions(),
+            max_tokens: None,
+            reasoning_effort: None,
+            sampling_params: Default::default(),
+        };
+        let response = match stream_model(
+            Arc::clone(&provider),
+            request,
+            events.clone(),
+            cancel.clone(),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(ProviderError::Cancelled) => {
+                return turn_outcome(history, StopReason::Cancelled);
+            }
+            Err(error) => {
+                fail_turn(&events, error.to_string()).await;
+                return turn_outcome(history, StopReason::Error);
+            }
+        };
+
+        let calls = match validated_tool_calls(&response) {
+            Ok(calls) => calls,
+            Err(error) => {
+                fail_turn(&events, error).await;
+                return turn_outcome(history, StopReason::Error);
+            }
+        };
+        if response.stop_reason == StopReason::ToolCalls && calls.is_empty() {
+            fail_turn(
+                &events,
+                "provider requested tool execution but returned no tool calls",
+            )
+            .await;
+            return turn_outcome(history, StopReason::Error);
+        }
+
+        history.push(ModelMessage::Assistant {
+            items: response.items.clone(),
+        });
+        if events
+            .send(AgentEvent::AssistantMessageFinished {
+                items: response.items.clone(),
+            })
+            .await
+            .is_err()
+        {
+            return turn_outcome(history, StopReason::Error);
+        }
+
+        if calls.is_empty() {
+            if response.stop_reason == StopReason::Error {
+                fail_turn(&events, "provider returned an error stop reason").await;
+                return turn_outcome(history, StopReason::Error);
+            }
+            return turn_outcome(history, response.stop_reason);
+        }
+
+        tool_rounds += 1;
+        if tool_rounds > MAX_TOOL_ROUNDS_PER_TURN {
+            append_synthetic_results(
+                &mut history,
+                &calls,
+                &events,
+                "tool loop limit reached; this tool call was not executed",
+            )
+            .await;
+            fail_turn(
+                &events,
+                format!(
+                    "tool loop limit reached after {MAX_TOOL_ROUNDS_PER_TURN} rounds; start a new turn to continue"
+                ),
+            )
+            .await;
+            return turn_outcome(history, StopReason::Error);
+        }
+
+        for (index, call) in calls.iter().enumerate() {
+            if cancel.is_cancelled() {
+                append_synthetic_results(
+                    &mut history,
+                    &calls[index..],
+                    &events,
+                    "Tool execution cancelled by user.",
+                )
+                .await;
+                return turn_outcome(history, StopReason::Cancelled);
+            }
+
+            let result = execute_tool_call(
+                Arc::clone(&registry),
+                context.clone(),
+                call,
+                &events,
+                cancel.clone(),
+            )
+            .await;
+            history.push(ModelMessage::ToolResult {
+                tool_call_id: call.call_id.clone().expect("validated call id"),
+                tool_name: call.name.clone().expect("validated tool name"),
+                content: result.model_content.clone(),
+            });
+
+            if cancel.is_cancelled() || result.metadata.cancelled {
+                if index + 1 < calls.len() {
+                    append_synthetic_results(
+                        &mut history,
+                        &calls[index + 1..],
+                        &events,
+                        "Tool execution cancelled by user.",
+                    )
+                    .await;
+                }
+                return turn_outcome(history, StopReason::Cancelled);
+            }
+        }
+    }
+}
+
+async fn stream_model<P>(
+    provider: Arc<P>,
+    request: ModelRequest,
+    events: mpsc::Sender<AgentEvent>,
+    cancel: CancellationToken,
+) -> Result<ModelResponse, ProviderError>
+where
+    P: ModelProvider,
+{
+    let (model_event_tx, mut model_event_rx) = mpsc::channel(MODEL_EVENT_CHANNEL_CAPACITY);
     let provider_cancel = cancel.clone();
     let mut provider_task = tokio::spawn(async move {
         provider
@@ -186,17 +433,14 @@ async fn run_turn<P>(
             _ = cancel.cancelled() => {
                 provider_task.abort();
                 let _ = provider_task.await;
-                let _ = events.send(AgentEvent::TurnFinished {
-                    reason: StopReason::Cancelled,
-                }).await;
-                return;
+                return Err(ProviderError::Cancelled);
             }
             model_event = model_event_rx.recv() => {
                 let Some(model_event) = model_event else { continue };
-                let event = agent_event_from_model(model_event);
-                if events.send(event).await.is_err() {
+                if let Err(error) = send_model_event(&events, model_event, &cancel).await {
                     provider_task.abort();
-                    return;
+                    let _ = provider_task.await;
+                    return Err(error);
                 }
             }
             result = &mut provider_task => {
@@ -206,53 +450,216 @@ async fn run_turn<P>(
     };
 
     while let Some(model_event) = model_event_rx.recv().await {
-        if events
-            .send(agent_event_from_model(model_event))
-            .await
-            .is_err()
-        {
-            return;
-        }
+        send_model_event(&events, model_event, &cancel).await?;
     }
 
     match provider_result {
-        Ok(Ok(response)) => {
-            let _ = events
-                .send(AgentEvent::TurnFinished {
-                    reason: response.stop_reason,
-                })
-                .await;
+        Ok(result) => result,
+        Err(error) => Err(ProviderError::Failed {
+            message: format!("provider task failed: {error}"),
+        }),
+    }
+}
+
+fn validated_tool_calls(response: &ModelResponse) -> Result<Vec<ModelToolCall>, String> {
+    let calls: Vec<ModelToolCall> = response
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ModelAssistantItem::ToolCall(call) => Some(call.clone()),
+            _ => None,
+        })
+        .collect();
+    for call in &calls {
+        if call.call_id.as_deref().is_none_or(str::is_empty) {
+            return Err("provider returned a tool call without a call_id".to_owned());
         }
-        Ok(Err(ProviderError::Cancelled)) => {
-            let _ = events
-                .send(AgentEvent::TurnFinished {
-                    reason: StopReason::Cancelled,
-                })
-                .await;
-        }
-        Ok(Err(error)) => {
-            let _ = events
-                .send(AgentEvent::Error(AgentError::new(error.to_string())))
-                .await;
-            let _ = events
-                .send(AgentEvent::TurnFinished {
-                    reason: StopReason::Error,
-                })
-                .await;
-        }
-        Err(error) => {
-            let _ = events
-                .send(AgentEvent::Error(AgentError::new(format!(
-                    "provider task failed: {error}"
-                ))))
-                .await;
-            let _ = events
-                .send(AgentEvent::TurnFinished {
-                    reason: StopReason::Error,
-                })
-                .await;
+        if call.name.as_deref().is_none_or(str::is_empty) {
+            return Err("provider returned a tool call without a name".to_owned());
         }
     }
+    Ok(calls)
+}
+
+async fn execute_tool_call(
+    registry: Arc<ToolRegistry>,
+    context: ToolContext,
+    call: &ModelToolCall,
+    events: &mpsc::Sender<AgentEvent>,
+    cancel: CancellationToken,
+) -> ToolExecutionResult {
+    let call_id = call.call_id.clone().expect("validated call id");
+    let name = call.name.clone().expect("validated tool name");
+    let _ = events
+        .send(AgentEvent::ToolExecutionStarted {
+            call_id: call_id.clone(),
+            name: name.clone(),
+            arguments: call.arguments.clone(),
+        })
+        .await;
+
+    let result = match serde_json::from_str::<Value>(&call.arguments) {
+        Ok(arguments) => {
+            let (tool_events, mut tool_event_rx) = mpsc::channel(TOOL_EVENT_CHANNEL_CAPACITY);
+            let tool_cancel = cancel.clone();
+            let tool_name = name.clone();
+            let tool_registry = Arc::clone(&registry);
+            let tool_context = context.clone();
+            let mut task = tokio::spawn(async move {
+                tool_registry
+                    .execute(
+                        &tool_name,
+                        arguments,
+                        &tool_context,
+                        tool_events,
+                        tool_cancel,
+                    )
+                    .await
+            });
+            let mut tool_events_open = true;
+            let result = loop {
+                tokio::select! {
+                    tool_event = tool_event_rx.recv(), if tool_events_open => {
+                        match tool_event {
+                            Some(tool_event) => {
+                                forward_tool_event(events, &call_id, tool_event, &cancel).await
+                            }
+                            None => tool_events_open = false,
+                        }
+                    }
+                    joined = &mut task => {
+                        break match joined {
+                            Ok(Ok(result)) => result,
+                            Ok(Err(error)) => tool_error_result(error, cancel.is_cancelled()),
+                            Err(error) => ToolExecutionResult::failure(format!(
+                                "Tool error: internal tool task failed: {error}"
+                            )),
+                        };
+                    }
+                    _ = cancel.cancelled() => {
+                        break match task.await {
+                            Ok(Ok(result)) => result,
+                            Ok(Err(error)) => tool_error_result(error, true),
+                            Err(error) => ToolExecutionResult::failure(format!(
+                                "Tool error: internal tool task failed: {error}"
+                            )),
+                        };
+                    }
+                }
+            };
+            while let Some(tool_event) = tool_event_rx.recv().await {
+                forward_tool_event(events, &call_id, tool_event, &cancel).await;
+            }
+            result
+        }
+        Err(error) => {
+            ToolExecutionResult::failure(format!("Tool error: invalid JSON arguments: {error}"))
+        }
+    };
+
+    let _ = events
+        .send(AgentEvent::ToolExecutionFinished {
+            call_id,
+            name,
+            result: result.clone(),
+        })
+        .await;
+    result
+}
+
+async fn forward_tool_event(
+    events: &mpsc::Sender<AgentEvent>,
+    call_id: &str,
+    event: ToolEvent,
+    cancel: &CancellationToken,
+) {
+    match event {
+        ToolEvent::Output { stream, chunk } => {
+            let _ = tokio::select! {
+                _ = cancel.cancelled() => Ok(()),
+                result = events.send(AgentEvent::ToolExecutionOutput {
+                    call_id: call_id.to_owned(),
+                    stream,
+                    chunk,
+                }) => result,
+            };
+        }
+    }
+}
+
+async fn send_model_event(
+    events: &mpsc::Sender<AgentEvent>,
+    event: ModelEvent,
+    cancel: &CancellationToken,
+) -> Result<(), ProviderError> {
+    tokio::select! {
+        _ = cancel.cancelled() => Err(ProviderError::Cancelled),
+        result = events.send(agent_event_from_model(event)) => result.map_err(|_| ProviderError::Failed {
+            message: "agent event stream closed".to_owned(),
+        }),
+    }
+}
+
+fn tool_error_result(error: ToolError, cancelled: bool) -> ToolExecutionResult {
+    if matches!(error, ToolError::Cancelled) || cancelled {
+        let mut metadata = ToolExecutionMetadata::failure();
+        metadata.cancelled = true;
+        ToolExecutionResult {
+            model_content: "Tool execution cancelled by user.".to_owned(),
+            metadata,
+        }
+    } else {
+        ToolExecutionResult::failure(format!("Tool error: {error}"))
+    }
+}
+
+async fn append_synthetic_results(
+    history: &mut Vec<ModelMessage>,
+    calls: &[ModelToolCall],
+    events: &mpsc::Sender<AgentEvent>,
+    message: &str,
+) {
+    for call in calls {
+        let call_id = call.call_id.clone().expect("validated call id");
+        let name = call.name.clone().expect("validated tool name");
+        let result = {
+            let mut metadata = ToolExecutionMetadata::failure();
+            metadata.cancelled = message.contains("cancelled");
+            ToolExecutionResult {
+                model_content: message.to_owned(),
+                metadata,
+            }
+        };
+        let _ = events
+            .send(AgentEvent::ToolExecutionStarted {
+                call_id: call_id.clone(),
+                name: name.clone(),
+                arguments: call.arguments.clone(),
+            })
+            .await;
+        history.push(ModelMessage::ToolResult {
+            tool_call_id: call_id.clone(),
+            tool_name: name.clone(),
+            content: result.model_content.clone(),
+        });
+        let _ = events
+            .send(AgentEvent::ToolExecutionFinished {
+                call_id,
+                name,
+                result,
+            })
+            .await;
+    }
+}
+
+async fn fail_turn(events: &mpsc::Sender<AgentEvent>, message: impl Into<String>) {
+    let _ = events
+        .send(AgentEvent::Error(AgentError::new(message)))
+        .await;
+}
+
+fn turn_outcome(history: Vec<ModelMessage>, reason: StopReason) -> TurnOutcome {
+    TurnOutcome { history, reason }
 }
 
 fn agent_event_from_model(event: ModelEvent) -> AgentEvent {
@@ -309,6 +716,8 @@ fn agent_event_from_model(event: ModelEvent) -> AgentEvent {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use super::*;
@@ -405,5 +814,517 @@ mod tests {
             .await
             .expect("runtime should shut down");
         runtime_task.await.expect("runtime should join");
+    }
+
+    #[tokio::test]
+    async fn tool_loop_replays_assistant_and_results_with_tools_every_time() {
+        let root = unique_test_dir("agent-loop");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("note.txt"), "alpha\nbeta\n").unwrap();
+        let first_call = ModelToolCall {
+            index: 0,
+            call_id: Some("call-read".to_owned()),
+            item_id: Some("item-read".to_owned()),
+            name: Some("read".to_owned()),
+            arguments: r#"{"path":"note.txt"}"#.to_owned(),
+        };
+        let provider = ScriptedProvider::new(vec![
+            ScriptedStep {
+                events: vec![ModelEvent::AssistantTextDelta {
+                    index: None,
+                    text: "I will inspect it.".to_owned(),
+                }],
+                response: ModelResponse {
+                    items: vec![
+                        ModelAssistantItem::Text {
+                            content: "I will inspect it.".to_owned(),
+                        },
+                        ModelAssistantItem::ToolCall(first_call.clone()),
+                    ],
+                    stop_reason: StopReason::ToolCalls,
+                    usage: None,
+                },
+            },
+            ScriptedStep {
+                events: vec![ModelEvent::AssistantTextDelta {
+                    index: None,
+                    text: "The file contains alpha and beta.".to_owned(),
+                }],
+                response: ModelResponse {
+                    items: vec![ModelAssistantItem::Text {
+                        content: "The file contains alpha and beta.".to_owned(),
+                    }],
+                    stop_reason: StopReason::Stop,
+                    usage: None,
+                },
+            },
+        ]);
+        let requests = Arc::clone(&provider.requests);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let runtime = AgentRuntime::with_workspace_root(provider, &root).unwrap();
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "inspect note.txt".to_owned(),
+            })
+            .await
+            .unwrap();
+        let events = collect_turn(&mut event_rx).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::AssistantMessageStarted))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::AssistantMessageFinished { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ToolExecutionStarted { .. }))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| {
+            matches!(event, AgentEvent::ToolExecutionFinished { result, .. } if result.model_content.contains("1 | alpha"))
+        }));
+
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].messages,
+            vec![ModelMessage::user("inspect note.txt")]
+        );
+        assert_eq!(requests[0].tools.len(), 4);
+        assert_eq!(requests[1].tools.len(), 4);
+        assert_eq!(requests[1].messages.len(), 3);
+        assert!(matches!(
+            &requests[1].messages[1],
+            ModelMessage::Assistant { items } if items == &vec![
+                ModelAssistantItem::Text { content: "I will inspect it.".to_owned() },
+                ModelAssistantItem::ToolCall(first_call),
+            ]
+        ));
+        assert!(matches!(
+            &requests[1].messages[2],
+            ModelMessage::ToolResult { tool_call_id, tool_name, content }
+                if tool_call_id == "call-read" && tool_name == "read" && content.contains("2 | beta")
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_calls_in_one_response_execute_in_order() {
+        let root = unique_test_dir("agent-order");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "a").unwrap();
+        std::fs::write(root.join("b.txt"), "b").unwrap();
+        let calls = [
+            tool_call("a", "read", r#"{"path":"a.txt"}"#),
+            tool_call("b", "read", r#"{"path":"b.txt"}"#),
+            tool_call("c", "bash", r#"{"command":"printf c"}"#),
+        ];
+        let provider = ScriptedProvider::new(vec![
+            ScriptedStep {
+                events: Vec::new(),
+                response: ModelResponse {
+                    items: calls
+                        .iter()
+                        .cloned()
+                        .map(ModelAssistantItem::ToolCall)
+                        .collect(),
+                    stop_reason: StopReason::ToolCalls,
+                    usage: None,
+                },
+            },
+            final_step("done"),
+        ]);
+        let requests = Arc::clone(&provider.requests);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let runtime = AgentRuntime::with_workspace_root(provider, &root).unwrap();
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "inspect all".to_owned(),
+            })
+            .await
+            .unwrap();
+        let events = collect_turn(&mut event_rx).await;
+        let order: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolExecutionStarted { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, ["a", "b", "c"]);
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert!(matches!(
+            &requests[1].messages[1],
+            ModelMessage::Assistant { items } if items.len() == 3
+        ));
+        assert!(
+            matches!(&requests[1].messages[2], ModelMessage::ToolResult { tool_call_id, .. } if tool_call_id == "a")
+        );
+        assert!(
+            matches!(&requests[1].messages[3], ModelMessage::ToolResult { tool_call_id, .. } if tool_call_id == "b")
+        );
+        assert!(
+            matches!(&requests[1].messages[4], ModelMessage::ToolResult { tool_call_id, .. } if tool_call_id == "c")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_arguments_and_unknown_tools_recover_in_later_rounds() {
+        let provider = ScriptedProvider::new(vec![
+            ScriptedStep {
+                events: Vec::new(),
+                response: ModelResponse {
+                    items: vec![ModelAssistantItem::ToolCall(tool_call(
+                        "bad-json",
+                        "read",
+                        "{not json}",
+                    ))],
+                    stop_reason: StopReason::ToolCalls,
+                    usage: None,
+                },
+            },
+            ScriptedStep {
+                events: Vec::new(),
+                response: ModelResponse {
+                    items: vec![ModelAssistantItem::ToolCall(tool_call(
+                        "unknown",
+                        "totally_fake_tool",
+                        "{}",
+                    ))],
+                    stop_reason: StopReason::ToolCalls,
+                    usage: None,
+                },
+            },
+            final_step("recovered"),
+        ]);
+        let requests = Arc::clone(&provider.requests);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let runtime = AgentRuntime::new(provider);
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "recover".to_owned(),
+            })
+            .await
+            .unwrap();
+        let events = collect_turn(&mut event_rx).await;
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, AgentEvent::Error(_))));
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            matches!(&requests[1].messages[2], ModelMessage::ToolResult { content, .. } if content.contains("invalid JSON"))
+        );
+        assert!(
+            matches!(&requests[2].messages[4], ModelMessage::ToolResult { content, .. } if content.contains("unknown tool"))
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_resolves_remaining_tool_calls_and_preserves_history() {
+        let root = unique_test_dir("agent-cancel-batch");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("other.txt"), "other").unwrap();
+        let provider = ScriptedProvider::new(vec![
+            ScriptedStep {
+                events: Vec::new(),
+                response: ModelResponse {
+                    items: vec![
+                        ModelAssistantItem::ToolCall(tool_call(
+                            "long",
+                            "bash",
+                            r#"{"command":"sleep 5"}"#,
+                        )),
+                        ModelAssistantItem::ToolCall(tool_call(
+                            "later",
+                            "read",
+                            r#"{"path":"other.txt"}"#,
+                        )),
+                    ],
+                    stop_reason: StopReason::ToolCalls,
+                    usage: None,
+                },
+            },
+            final_step("cancelled turn was replayable"),
+        ]);
+        let requests = Arc::clone(&provider.requests);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let runtime = AgentRuntime::with_workspace_root(provider, &root).unwrap();
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "stop the command".to_owned(),
+            })
+            .await
+            .unwrap();
+        loop {
+            let event = event_rx.recv().await.unwrap();
+            if matches!(
+                event,
+                AgentEvent::ToolExecutionStarted { ref call_id, .. } if call_id == "long"
+            ) {
+                command_tx.send(AgentCommand::Cancel).await.unwrap();
+                break;
+            }
+        }
+        let cancelled_events = collect_turn(&mut event_rx).await;
+        assert!(cancelled_events.iter().any(|event| {
+            matches!(event, AgentEvent::ToolExecutionFinished { call_id, result, .. } if call_id == "long" && result.metadata.cancelled)
+        }));
+        assert!(cancelled_events.iter().any(|event| {
+            matches!(event, AgentEvent::ToolExecutionFinished { call_id, result, .. } if call_id == "later" && result.metadata.cancelled)
+        }));
+        assert!(cancelled_events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::TurnFinished {
+                    reason: StopReason::Cancelled
+                }
+            )
+        }));
+
+        tokio::task::yield_now().await;
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "continue".to_owned(),
+            })
+            .await
+            .unwrap();
+        let continued_events = collect_turn(&mut event_rx).await;
+        assert!(continued_events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::TurnFinished {
+                    reason: StopReason::Stop
+                }
+            )
+        }));
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].messages.len(), 5);
+        assert!(
+            matches!(&requests[1].messages[1], ModelMessage::Assistant { items } if items.len() == 2)
+        );
+        assert!(
+            matches!(&requests[1].messages[2], ModelMessage::ToolResult { tool_call_id, .. } if tool_call_id == "long")
+        );
+        assert!(
+            matches!(&requests[1].messages[3], ModelMessage::ToolResult { tool_call_id, .. } if tool_call_id == "later")
+        );
+        assert!(
+            matches!(&requests[1].messages[4], ModelMessage::User { content } if content == "continue")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_loop_limit_stops_a_provider_that_never_finishes() {
+        let steps = (0..=MAX_TOOL_ROUNDS_PER_TURN)
+            .map(|index| ScriptedStep {
+                events: Vec::new(),
+                response: ModelResponse {
+                    items: vec![ModelAssistantItem::ToolCall(tool_call(
+                        &format!("call-{index}"),
+                        "bash",
+                        r#"{"command":"printf ok"}"#,
+                    ))],
+                    stop_reason: StopReason::ToolCalls,
+                    usage: None,
+                },
+            })
+            .collect();
+        let provider = ScriptedProvider::new(steps);
+        let requests = Arc::clone(&provider.requests);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let runtime = AgentRuntime::new(provider);
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "loop forever".to_owned(),
+            })
+            .await
+            .unwrap();
+        let events = collect_turn(&mut event_rx).await;
+        assert!(events.iter().any(|event| {
+            matches!(event, AgentEvent::Error(error) if error.message.contains("tool loop limit"))
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::TurnFinished {
+                    reason: StopReason::Error
+                }
+            )
+        }));
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), MAX_TOOL_ROUNDS_PER_TURN + 1);
+    }
+
+    #[tokio::test]
+    async fn conversation_history_survives_the_next_user_turn() {
+        let provider = ScriptedProvider::new(vec![final_step("alpha"), final_step("remembered")]);
+        let requests = Arc::clone(&provider.requests);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let runtime = AgentRuntime::new(provider);
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "remember alpha".to_owned(),
+            })
+            .await
+            .unwrap();
+        let _ = collect_turn(&mut event_rx).await;
+        tokio::task::yield_now().await;
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "what did I say?".to_owned(),
+            })
+            .await
+            .unwrap();
+        let _ = collect_turn(&mut event_rx).await;
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].messages,
+            vec![
+                ModelMessage::user("remember alpha"),
+                ModelMessage::Assistant {
+                    items: vec![ModelAssistantItem::Text {
+                        content: "alpha".to_owned(),
+                    }],
+                },
+                ModelMessage::user("what did I say?"),
+            ]
+        );
+    }
+
+    #[derive(Clone)]
+    struct ScriptedProvider {
+        steps: Arc<Mutex<VecDeque<ScriptedStep>>>,
+        requests: Arc<Mutex<Vec<ModelRequest>>>,
+    }
+
+    struct ScriptedStep {
+        events: Vec<ModelEvent>,
+        response: ModelResponse,
+    }
+
+    impl ScriptedProvider {
+        fn new(steps: Vec<ScriptedStep>) -> Self {
+            Self {
+                steps: Arc::new(Mutex::new(steps.into_iter().collect())),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ScriptedProvider {
+        async fn stream(
+            &self,
+            request: ModelRequest,
+            events: mpsc::Sender<ModelEvent>,
+            cancel: CancellationToken,
+        ) -> Result<ModelResponse, ProviderError> {
+            self.requests.lock().unwrap().push(request);
+            let step = self
+                .steps
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted step");
+            for event in step.events {
+                tokio::select! {
+                    _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
+                    result = events.send(event) => result.map_err(|_| ProviderError::Failed {
+                        message: "scripted event receiver closed".to_owned(),
+                    })?,
+                }
+            }
+            Ok(step.response)
+        }
+    }
+
+    fn tool_call(call_id: &str, name: &str, arguments: &str) -> ModelToolCall {
+        ModelToolCall {
+            index: 0,
+            call_id: Some(call_id.to_owned()),
+            item_id: None,
+            name: Some(name.to_owned()),
+            arguments: arguments.to_owned(),
+        }
+    }
+
+    fn final_step(text: &str) -> ScriptedStep {
+        ScriptedStep {
+            events: vec![ModelEvent::AssistantTextDelta {
+                index: None,
+                text: text.to_owned(),
+            }],
+            response: ModelResponse {
+                items: vec![ModelAssistantItem::Text {
+                    content: text.to_owned(),
+                }],
+                stop_reason: StopReason::Stop,
+                usage: None,
+            },
+        }
+    }
+
+    async fn collect_turn(event_rx: &mut mpsc::Receiver<AgentEvent>) -> Vec<AgentEvent> {
+        let mut events = Vec::new();
+        loop {
+            let event = event_rx.recv().await.expect("turn event");
+            let finished = matches!(event, AgentEvent::TurnFinished { .. });
+            events.push(event);
+            if finished {
+                return events;
+            }
+        }
+    }
+
+    fn unique_test_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "ri-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
     }
 }
