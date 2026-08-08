@@ -63,32 +63,49 @@ impl ModelProvider for ConfiguredProvider {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MessageRole {
-    System,
-    Developer,
-    User,
-    Assistant,
-    Tool,
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelThinking {
+    /// The Responses reasoning item identifier, when the provider supplies one.
+    pub item_id: Option<String>,
+    pub summary: String,
+    pub content: String,
+    /// Opaque provider-returned state required to replay encrypted reasoning.
+    pub encrypted_content: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelMessage {
-    pub role: MessageRole,
-    pub content: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
+pub enum ModelAssistantItem {
+    Text { content: String },
+    Reasoning(ModelThinking),
+    Refusal { content: String },
+    ToolCall(ModelToolCall),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModelMessage {
+    System {
+        content: String,
+    },
+    Developer {
+        content: String,
+    },
+    User {
+        content: String,
+    },
+    Assistant {
+        items: Vec<ModelAssistantItem>,
+    },
+    ToolResult {
+        tool_call_id: String,
+        tool_name: String,
+        content: String,
+    },
 }
 
 impl ModelMessage {
     pub fn user(content: impl Into<String>) -> Self {
-        Self {
-            role: MessageRole::User,
+        Self::User {
             content: content.into(),
-            name: None,
-            tool_call_id: None,
         }
     }
 }
@@ -106,7 +123,7 @@ pub struct ModelRequest {
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: Option<u64>,
     pub reasoning_effort: Option<String>,
-    pub sampling: BTreeMap<String, Value>,
+    pub sampling_params: BTreeMap<String, Value>,
 }
 
 impl ModelRequest {
@@ -116,7 +133,7 @@ impl ModelRequest {
             tools: Vec::new(),
             max_tokens: None,
             reasoning_effort: None,
-            sampling: BTreeMap::new(),
+            sampling_params: BTreeMap::new(),
         }
     }
 
@@ -124,8 +141,10 @@ impl ModelRequest {
         self.messages
             .iter()
             .rev()
-            .find(|message| message.role == MessageRole::User)
-            .map(|message| message.content.as_str())
+            .find_map(|message| match message {
+                ModelMessage::User { content } => Some(content.as_str()),
+                _ => None,
+            })
             .unwrap_or_default()
     }
 }
@@ -133,14 +152,39 @@ impl ModelRequest {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ModelEvent {
     AssistantTextDelta {
+        index: Option<usize>,
         text: String,
     },
-    AssistantThinkingDelta {
+    AssistantTextItem {
+        index: usize,
+        content: Option<String>,
+    },
+    AssistantRefusalDelta {
+        index: Option<usize>,
         text: String,
+    },
+    AssistantRefusalItem {
+        index: usize,
+        content: Option<String>,
+    },
+    AssistantThinkingDelta {
+        item_id: Option<String>,
+        text: String,
+    },
+    AssistantThinkingContentDelta {
+        item_id: Option<String>,
+        text: String,
+    },
+    AssistantThinkingItem {
+        index: usize,
+        item_id: Option<String>,
+        summary: Option<String>,
+        content: Option<String>,
+        encrypted_content: Option<String>,
     },
     ToolCallDelta {
         index: usize,
-        id: Option<String>,
+        call_id: Option<String>,
         item_id: Option<String>,
         name: Option<String>,
         arguments: String,
@@ -158,11 +202,11 @@ pub struct Usage {
     pub cache_write_tokens: Option<u64>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelToolCall {
     pub index: usize,
     /// The callable tool identifier (`call_...` for Responses API calls).
-    pub id: Option<String>,
+    pub call_id: Option<String>,
     /// The output item identifier (`fc_...` for Responses API calls).
     pub item_id: Option<String>,
     pub name: Option<String>,
@@ -171,8 +215,8 @@ pub struct ModelToolCall {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelResponse {
+    pub items: Vec<ModelAssistantItem>,
     pub stop_reason: StopReason,
-    pub tool_calls: Vec<ModelToolCall>,
     pub usage: Option<Usage>,
 }
 
@@ -274,7 +318,7 @@ impl ModelProvider for MockProvider {
             let text: String = chunk.iter().collect();
             tokio::select! {
                 _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
-                result = events.send(ModelEvent::AssistantTextDelta { text }) => {
+                result = events.send(ModelEvent::AssistantTextDelta { index: None, text }) => {
                     result.map_err(|_| ProviderError::Failed {
                         message: "agent event stream closed".to_owned(),
                     })?;
@@ -287,8 +331,8 @@ impl ModelProvider for MockProvider {
         }
 
         Ok(ModelResponse {
+            items: vec![ModelAssistantItem::Text { content: response }],
             stop_reason: StopReason::Stop,
-            tool_calls: Vec::new(),
             usage: None,
         })
     }
@@ -327,7 +371,7 @@ mod tests {
 
         let mut chunks = Vec::new();
         while let Some(event) = rx.recv().await {
-            let ModelEvent::AssistantTextDelta { text } = event else {
+            let ModelEvent::AssistantTextDelta { text, .. } = event else {
                 continue;
             };
             chunks.push(text);
@@ -335,7 +379,12 @@ mod tests {
 
         assert_eq!(chunks, ["ab", "cd", "ef"]);
         assert_eq!(response.stop_reason, StopReason::Stop);
-        assert!(response.tool_calls.is_empty());
+        assert_eq!(
+            response.items,
+            [ModelAssistantItem::Text {
+                content: "abcdef".to_owned()
+            }]
+        );
     }
 
     #[tokio::test]

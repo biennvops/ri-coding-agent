@@ -172,17 +172,33 @@ impl AppState {
                 self.last_error = None;
                 self.last_stop_reason = None;
             }
-            AgentEvent::AssistantTextDelta { text } => {
+            AgentEvent::AssistantTextDelta { text, .. } => {
                 self.streaming_assistant
                     .get_or_insert_with(StreamingAssistant::default)
                     .content
                     .push_str(&text);
             }
-            AgentEvent::AssistantThinkingDelta { text } => {
+            AgentEvent::AssistantThinkingDelta { text, .. } => {
                 self.streaming_assistant
                     .get_or_insert_with(StreamingAssistant::default)
                     .thinking
                     .push_str(&text);
+            }
+            AgentEvent::AssistantRefusalDelta { text, .. } => {
+                self.streaming_assistant
+                    .get_or_insert_with(StreamingAssistant::default)
+                    .content
+                    .push_str(&text);
+            }
+            AgentEvent::AssistantRefusalItem { content, .. } => {
+                if let Some(content) = content {
+                    let assistant = self
+                        .streaming_assistant
+                        .get_or_insert_with(StreamingAssistant::default);
+                    if assistant.content.is_empty() {
+                        assistant.content = content;
+                    }
+                }
             }
             AgentEvent::TurnFinished { reason } => {
                 if let Some(assistant) = self.streaming_assistant.take() {
@@ -198,7 +214,11 @@ impl AppState {
                 self.turn_active = false;
                 self.last_stop_reason = Some(reason);
             }
-            AgentEvent::ToolCallDelta { .. } | AgentEvent::UsageUpdated(_) => {}
+            AgentEvent::AssistantTextItem { .. }
+            | AgentEvent::AssistantThinkingContentDelta { .. }
+            | AgentEvent::AssistantThinkingItem { .. }
+            | AgentEvent::ToolCallDelta { .. }
+            | AgentEvent::UsageUpdated(_) => {}
             AgentEvent::ModelChanged(model) => {
                 self.active_model = Some(model);
             }
@@ -251,10 +271,12 @@ mod tests {
 
         state.reduce(AgentEvent::TurnStarted);
         state.reduce(AgentEvent::AssistantTextDelta {
+            index: None,
             text: "hello ".to_owned(),
         });
         assert_eq!(state.messages().len(), 1);
         state.reduce(AgentEvent::AssistantTextDelta {
+            index: None,
             text: "world".to_owned(),
         });
         state.reduce(AgentEvent::TurnFinished {
@@ -275,6 +297,7 @@ mod tests {
         state.submit_input();
         state.reduce(AgentEvent::TurnStarted);
         state.reduce(AgentEvent::AssistantTextDelta {
+            index: None,
             text: "partial".to_owned(),
         });
         state.reduce(AgentEvent::TurnFinished {

@@ -10,6 +10,6 @@ pub use config::{
     ResolvedModel,
 };
 pub use model::{
-    ConfiguredProvider, MockProvider, ModelEvent, ModelMessage, ModelProvider, ModelRequest,
-    ModelResponse, ProviderError, StopReason, Usage,
+    ConfiguredProvider, MockProvider, ModelAssistantItem, ModelEvent, ModelMessage, ModelProvider,
+    ModelRequest, ModelResponse, ModelThinking, ModelToolCall, ProviderError, StopReason, Usage,
 };

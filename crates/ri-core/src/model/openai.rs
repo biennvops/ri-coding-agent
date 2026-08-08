@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{ApiKind, ResolvedModel};
 
 use super::{
-    MessageRole, ModelEvent, ModelMessage, ModelProvider, ModelRequest, ModelResponse,
-    ModelToolCall, ProviderError, StopReason, ToolDefinition, Usage,
+    ModelAssistantItem, ModelEvent, ModelMessage, ModelProvider, ModelRequest, ModelResponse,
+    ModelThinking, ModelToolCall, ProviderError, StopReason, ToolDefinition, Usage,
 };
 
 #[derive(Clone)]
@@ -213,9 +213,10 @@ async fn read_error_body(
 
 #[derive(Default)]
 struct ResponseCollector {
+    items: BTreeMap<usize, ModelAssistantItem>,
+    unindexed_items: Vec<ModelAssistantItem>,
     stop_reason: Option<StopReason>,
     terminal_seen: bool,
-    tool_calls: BTreeMap<usize, ModelToolCall>,
     usage: Option<Usage>,
 }
 
@@ -224,21 +225,23 @@ impl ResponseCollector {
         match event {
             ModelEvent::ToolCallDelta {
                 index,
-                id,
+                call_id,
                 item_id,
                 name,
                 arguments,
                 arguments_complete,
             } => {
-                let tool_call = self
-                    .tool_calls
-                    .entry(*index)
-                    .or_insert_with(|| ModelToolCall {
+                let item = self.items.entry(*index).or_insert_with(|| {
+                    ModelAssistantItem::ToolCall(ModelToolCall {
                         index: *index,
                         ..ModelToolCall::default()
-                    });
-                if id.is_some() {
-                    tool_call.id = id.clone();
+                    })
+                });
+                let ModelAssistantItem::ToolCall(tool_call) = item else {
+                    return;
+                };
+                if call_id.is_some() {
+                    tool_call.call_id = call_id.clone();
                 }
                 if item_id.is_some() {
                     tool_call.item_id = item_id.clone();
@@ -252,9 +255,204 @@ impl ResponseCollector {
                     tool_call.arguments.push_str(arguments);
                 }
             }
+            ModelEvent::AssistantTextDelta { index, text } => {
+                if let Some(index) = index {
+                    let item =
+                        self.items
+                            .entry(*index)
+                            .or_insert_with(|| ModelAssistantItem::Text {
+                                content: String::new(),
+                            });
+                    if let ModelAssistantItem::Text { content } = item {
+                        content.push_str(text);
+                    }
+                } else {
+                    self.append_unindexed_text(text);
+                }
+            }
+            ModelEvent::AssistantTextItem { index, content } => {
+                let item = self
+                    .items
+                    .entry(*index)
+                    .or_insert_with(|| ModelAssistantItem::Text {
+                        content: String::new(),
+                    });
+                if let ModelAssistantItem::Text { content: current } = item {
+                    if let Some(content) = content {
+                        *current = content.clone();
+                    }
+                }
+            }
+            ModelEvent::AssistantRefusalDelta { index, text } => {
+                if let Some(index) = index {
+                    let item =
+                        self.items
+                            .entry(*index)
+                            .or_insert_with(|| ModelAssistantItem::Refusal {
+                                content: String::new(),
+                            });
+                    if matches!(item, ModelAssistantItem::Text { content } if content.is_empty()) {
+                        *item = ModelAssistantItem::Refusal {
+                            content: String::new(),
+                        };
+                    }
+                    if let ModelAssistantItem::Refusal { content } = item {
+                        content.push_str(text);
+                    }
+                } else {
+                    self.append_unindexed_refusal(text);
+                }
+            }
+            ModelEvent::AssistantRefusalItem { index, content } => {
+                let item =
+                    self.items
+                        .entry(*index)
+                        .or_insert_with(|| ModelAssistantItem::Refusal {
+                            content: String::new(),
+                        });
+                if matches!(item, ModelAssistantItem::Text { content } if content.is_empty()) {
+                    *item = ModelAssistantItem::Refusal {
+                        content: String::new(),
+                    };
+                }
+                if let ModelAssistantItem::Refusal { content: current } = item {
+                    if let Some(content) = content {
+                        *current = content.clone();
+                    }
+                }
+            }
+            ModelEvent::AssistantThinkingDelta { item_id, text } => {
+                if let Some(index) = self.reasoning_index(item_id.as_deref()) {
+                    if let Some(ModelAssistantItem::Reasoning(thinking)) =
+                        self.items.get_mut(&index)
+                    {
+                        thinking.summary.push_str(text);
+                    }
+                } else {
+                    self.append_unindexed_summary(item_id.as_deref(), text);
+                }
+            }
+            ModelEvent::AssistantThinkingContentDelta { item_id, text } => {
+                if let Some(index) = self.reasoning_index(item_id.as_deref()) {
+                    if let Some(ModelAssistantItem::Reasoning(thinking)) =
+                        self.items.get_mut(&index)
+                    {
+                        thinking.content.push_str(text);
+                    }
+                } else {
+                    self.append_unindexed_content(item_id.as_deref(), text);
+                }
+            }
+            ModelEvent::AssistantThinkingItem {
+                index,
+                item_id,
+                summary,
+                content,
+                encrypted_content,
+            } => {
+                let item = self
+                    .items
+                    .entry(*index)
+                    .or_insert_with(|| ModelAssistantItem::Reasoning(ModelThinking::default()));
+                let ModelAssistantItem::Reasoning(thinking) = item else {
+                    return;
+                };
+                if item_id.is_some() {
+                    thinking.item_id = item_id.clone();
+                }
+                if summary.is_some() {
+                    thinking.summary = summary.clone().unwrap_or_default();
+                }
+                if content.is_some() {
+                    thinking.content = content.clone().unwrap_or_default();
+                }
+                if encrypted_content.is_some() {
+                    thinking.encrypted_content = encrypted_content.clone();
+                }
+            }
             ModelEvent::UsageUpdated(usage) => self.usage = Some(usage.clone()),
-            ModelEvent::AssistantTextDelta { .. } | ModelEvent::AssistantThinkingDelta { .. } => {}
         }
+    }
+
+    fn append_unindexed_text(&mut self, text: &str) {
+        if let Some(ModelAssistantItem::Text { content }) = self
+            .unindexed_items
+            .iter_mut()
+            .rev()
+            .find(|item| matches!(item, ModelAssistantItem::Text { .. }))
+        {
+            content.push_str(text);
+        } else {
+            self.unindexed_items.push(ModelAssistantItem::Text {
+                content: text.to_owned(),
+            });
+        }
+    }
+
+    fn append_unindexed_refusal(&mut self, text: &str) {
+        if let Some(ModelAssistantItem::Refusal { content }) = self
+            .unindexed_items
+            .iter_mut()
+            .rev()
+            .find(|item| matches!(item, ModelAssistantItem::Refusal { .. }))
+        {
+            content.push_str(text);
+        } else {
+            self.unindexed_items.push(ModelAssistantItem::Refusal {
+                content: text.to_owned(),
+            });
+        }
+    }
+
+    fn append_unindexed_summary(&mut self, item_id: Option<&str>, text: &str) {
+        let index = self.unindexed_items.iter().rposition(|item| {
+            matches!(item, ModelAssistantItem::Reasoning(thinking)
+                if item_id.is_none() || thinking.item_id.as_deref() == item_id)
+        });
+        if let Some(index) = index {
+            if let ModelAssistantItem::Reasoning(thinking) = &mut self.unindexed_items[index] {
+                thinking.summary.push_str(text);
+            }
+        } else {
+            self.unindexed_items
+                .push(ModelAssistantItem::Reasoning(ModelThinking {
+                    item_id: item_id.map(str::to_owned),
+                    summary: text.to_owned(),
+                    ..ModelThinking::default()
+                }));
+        }
+    }
+
+    fn append_unindexed_content(&mut self, item_id: Option<&str>, text: &str) {
+        let index = self.unindexed_items.iter().rposition(|item| {
+            matches!(item, ModelAssistantItem::Reasoning(thinking)
+                if item_id.is_none() || thinking.item_id.as_deref() == item_id)
+        });
+        if let Some(index) = index {
+            if let ModelAssistantItem::Reasoning(thinking) = &mut self.unindexed_items[index] {
+                thinking.content.push_str(text);
+            }
+        } else {
+            self.unindexed_items
+                .push(ModelAssistantItem::Reasoning(ModelThinking {
+                    item_id: item_id.map(str::to_owned),
+                    content: text.to_owned(),
+                    ..ModelThinking::default()
+                }));
+        }
+    }
+
+    fn reasoning_index(&self, item_id: Option<&str>) -> Option<usize> {
+        self.items.iter().rev().find_map(|(index, item)| {
+            let ModelAssistantItem::Reasoning(thinking) = item else {
+                return None;
+            };
+            if item_id.is_none() || thinking.item_id.as_deref() == item_id {
+                Some(*index)
+            } else {
+                None
+            }
+        })
     }
 
     fn finish(self) -> Result<ModelResponse, ProviderError> {
@@ -264,15 +462,20 @@ impl ResponseCollector {
             });
         }
 
+        let mut items = self.unindexed_items;
+        items.extend(self.items.into_values());
+        let has_tool_calls = items
+            .iter()
+            .any(|item| matches!(item, ModelAssistantItem::ToolCall(_)));
         let stop_reason = match self.stop_reason {
-            Some(StopReason::Stop) if !self.tool_calls.is_empty() => StopReason::ToolCalls,
+            Some(StopReason::Stop) if has_tool_calls => StopReason::ToolCalls,
             Some(reason) => reason,
-            None if !self.tool_calls.is_empty() => StopReason::ToolCalls,
+            None if has_tool_calls => StopReason::ToolCalls,
             None => StopReason::Stop,
         };
         Ok(ModelResponse {
+            items,
             stop_reason,
-            tool_calls: self.tool_calls.into_values().collect(),
             usage: self.usage,
         })
     }
@@ -325,17 +528,59 @@ fn parse_responses_payload(value: &Value) -> Result<ParsedPayload, ProviderError
         "response.output_text.delta" => {
             if let Some(text) = value.get("delta").and_then(Value::as_str) {
                 parsed.events.push(ModelEvent::AssistantTextDelta {
+                    index: value
+                        .get("output_index")
+                        .and_then(Value::as_u64)
+                        .map(|index| index as usize),
                     text: text.to_owned(),
                 });
             }
         }
-        "response.reasoning_summary_text.delta"
-        | "response.reasoning_text.delta"
-        | "response.reasoning.delta" => {
+        "response.refusal.delta" => {
             if let Some(text) = value.get("delta").and_then(Value::as_str) {
-                parsed.events.push(ModelEvent::AssistantThinkingDelta {
+                parsed.events.push(ModelEvent::AssistantRefusalDelta {
+                    index: value
+                        .get("output_index")
+                        .and_then(Value::as_u64)
+                        .map(|index| index as usize),
                     text: text.to_owned(),
                 });
+            }
+        }
+        "response.refusal.done" => {
+            parsed.events.push(ModelEvent::AssistantRefusalItem {
+                index: value
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize,
+                content: value
+                    .get("refusal")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            });
+        }
+        "response.reasoning_summary_text.delta" | "response.reasoning.delta" => {
+            if let Some(text) = value.get("delta").and_then(Value::as_str) {
+                parsed.events.push(ModelEvent::AssistantThinkingDelta {
+                    item_id: value
+                        .get("item_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    text: text.to_owned(),
+                });
+            }
+        }
+        "response.reasoning_text.delta" => {
+            if let Some(text) = value.get("delta").and_then(Value::as_str) {
+                parsed
+                    .events
+                    .push(ModelEvent::AssistantThinkingContentDelta {
+                        item_id: value
+                            .get("item_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        text: text.to_owned(),
+                    });
             }
         }
         "response.function_call_arguments.delta" => {
@@ -345,7 +590,7 @@ fn parse_responses_payload(value: &Value) -> Result<ParsedPayload, ProviderError
                 .unwrap_or(0) as usize;
             parsed.events.push(ModelEvent::ToolCallDelta {
                 index,
-                id: value
+                call_id: value
                     .get("call_id")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
@@ -370,7 +615,7 @@ fn parse_responses_payload(value: &Value) -> Result<ParsedPayload, ProviderError
                         .get("output_index")
                         .and_then(Value::as_u64)
                         .unwrap_or(0) as usize,
-                    id: item
+                    call_id: item
                         .get("call_id")
                         .and_then(Value::as_str)
                         .map(str::to_owned),
@@ -383,6 +628,42 @@ fn parse_responses_payload(value: &Value) -> Result<ParsedPayload, ProviderError
                         .to_owned(),
                     arguments_complete: false,
                 });
+            } else if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+                parsed.events.push(reasoning_item_event(
+                    value
+                        .get("output_index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as usize,
+                    item,
+                ));
+            } else if item.get("type").and_then(Value::as_str) == Some("message") {
+                parsed.events.push(message_item_event(
+                    value
+                        .get("output_index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as usize,
+                    item,
+                ));
+            }
+        }
+        "response.output_item.done" => {
+            let item = value.get("item").unwrap_or(&Value::Null);
+            if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+                parsed.events.push(reasoning_item_event(
+                    value
+                        .get("output_index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as usize,
+                    item,
+                ));
+            } else if item.get("type").and_then(Value::as_str) == Some("message") {
+                parsed.events.push(message_item_event(
+                    value
+                        .get("output_index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as usize,
+                    item,
+                ));
             }
         }
         "response.function_call_arguments.done" => {
@@ -392,7 +673,7 @@ fn parse_responses_payload(value: &Value) -> Result<ParsedPayload, ProviderError
                     .get("output_index")
                     .and_then(Value::as_u64)
                     .unwrap_or(0) as usize,
-                id: value
+                call_id: value
                     .get("call_id")
                     .or_else(|| item.get("call_id"))
                     .and_then(Value::as_str)
@@ -477,12 +758,20 @@ fn parse_completions_payload(value: &Value) -> Result<ParsedPayload, ProviderErr
     if let Some(delta) = choice.and_then(|choice| choice.get("delta")) {
         if let Some(text) = delta.get("content").and_then(Value::as_str) {
             parsed.events.push(ModelEvent::AssistantTextDelta {
+                index: None,
+                text: text.to_owned(),
+            });
+        }
+        if let Some(text) = delta.get("refusal").and_then(Value::as_str) {
+            parsed.events.push(ModelEvent::AssistantRefusalDelta {
+                index: None,
                 text: text.to_owned(),
             });
         }
         for key in ["reasoning_content", "reasoning", "thinking"] {
             if let Some(text) = delta.get(key).and_then(Value::as_str) {
                 parsed.events.push(ModelEvent::AssistantThinkingDelta {
+                    item_id: None,
                     text: text.to_owned(),
                 });
             }
@@ -492,7 +781,7 @@ fn parse_completions_payload(value: &Value) -> Result<ParsedPayload, ProviderErr
                 let function = tool_call.get("function").unwrap_or(&Value::Null);
                 parsed.events.push(ModelEvent::ToolCallDelta {
                     index: tool_call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize,
-                    id: tool_call
+                    call_id: tool_call
                         .get("id")
                         .and_then(Value::as_str)
                         .map(str::to_owned),
@@ -524,6 +813,61 @@ fn parse_completions_payload(value: &Value) -> Result<ParsedPayload, ProviderErr
     }
 
     Ok(parsed)
+}
+
+fn message_item_event(index: usize, item: &Value) -> ModelEvent {
+    if let Some(refusal) = refusal_text(item.get("content")) {
+        ModelEvent::AssistantRefusalItem {
+            index,
+            content: Some(refusal),
+        }
+    } else {
+        ModelEvent::AssistantTextItem {
+            index,
+            content: reasoning_text(item.get("content")),
+        }
+    }
+}
+
+fn refusal_text(value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(Value::Array(parts)) => {
+            let text: String = parts
+                .iter()
+                .filter_map(|part| part.get("refusal").and_then(Value::as_str))
+                .collect();
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
+fn reasoning_item_event(index: usize, item: &Value) -> ModelEvent {
+    ModelEvent::AssistantThinkingItem {
+        index,
+        item_id: item.get("id").and_then(Value::as_str).map(str::to_owned),
+        summary: reasoning_text(item.get("summary")),
+        content: reasoning_text(item.get("content")),
+        encrypted_content: item
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    }
+}
+
+fn reasoning_text(value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(Value::Array(parts)) => {
+            let text: String = parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect();
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
 }
 
 fn parse_usage(value: &Value) -> Option<Usage> {
@@ -608,12 +952,7 @@ fn responses_body(model: &ResolvedModel, request: &ModelRequest) -> Value {
             request
                 .messages
                 .iter()
-                .map(|message| {
-                    json!({
-                        "role": role_name(message, model),
-                        "content": message.content,
-                    })
-                })
+                .flat_map(|message| responses_message_items(message, model))
                 .collect(),
         ),
     );
@@ -635,6 +974,33 @@ fn responses_body(model: &ResolvedModel, request: &ModelRequest) -> Value {
     Value::Object(body)
 }
 
+fn responses_message_items(message: &ModelMessage, model: &ResolvedModel) -> Vec<Value> {
+    match message {
+        ModelMessage::System { content } => vec![json!({
+            "role": "system",
+            "content": content,
+        })],
+        ModelMessage::Developer { content } => vec![json!({
+            "role": role_name("developer", model),
+            "content": content,
+        })],
+        ModelMessage::User { content } => vec![json!({
+            "role": "user",
+            "content": content,
+        })],
+        ModelMessage::Assistant { items } => items.iter().map(responses_assistant_item).collect(),
+        ModelMessage::ToolResult {
+            tool_call_id,
+            content,
+            ..
+        } => vec![json!({
+            "type": "function_call_output",
+            "call_id": tool_call_id,
+            "output": content,
+        })],
+    }
+}
+
 fn completions_body(model: &ResolvedModel, request: &ModelRequest) -> Value {
     let mut body = sampling_body(model, request);
     body.insert(
@@ -647,24 +1013,7 @@ fn completions_body(model: &ResolvedModel, request: &ModelRequest) -> Value {
             request
                 .messages
                 .iter()
-                .map(|message| {
-                    let mut value = Map::new();
-                    value.insert(
-                        "role".to_owned(),
-                        Value::String(role_name(message, model).to_owned()),
-                    );
-                    value.insert("content".to_owned(), Value::String(message.content.clone()));
-                    if let Some(name) = &message.name {
-                        value.insert("name".to_owned(), Value::String(name.clone()));
-                    }
-                    if let Some(tool_call_id) = &message.tool_call_id {
-                        value.insert(
-                            "tool_call_id".to_owned(),
-                            Value::String(tool_call_id.clone()),
-                        );
-                    }
-                    Value::Object(value)
-                })
+                .map(|message| completions_message(message, model))
                 .collect(),
         ),
     );
@@ -690,21 +1039,93 @@ fn completions_body(model: &ResolvedModel, request: &ModelRequest) -> Value {
     Value::Object(body)
 }
 
+fn completions_message(message: &ModelMessage, model: &ResolvedModel) -> Value {
+    match message {
+        ModelMessage::System { content } => json!({
+            "role": "system",
+            "content": content,
+        }),
+        ModelMessage::Developer { content } => json!({
+            "role": role_name("developer", model),
+            "content": content,
+        }),
+        ModelMessage::User { content } => json!({
+            "role": "user",
+            "content": content,
+        }),
+        ModelMessage::Assistant { items } => {
+            let content: String = items
+                .iter()
+                .filter_map(|item| match item {
+                    ModelAssistantItem::Text { content } => Some(content.as_str()),
+                    ModelAssistantItem::Reasoning(_)
+                    | ModelAssistantItem::Refusal { .. }
+                    | ModelAssistantItem::ToolCall(_) => None,
+                })
+                .collect();
+            let tool_calls: Vec<&ModelToolCall> = items
+                .iter()
+                .filter_map(|item| match item {
+                    ModelAssistantItem::ToolCall(tool_call) => Some(tool_call),
+                    ModelAssistantItem::Text { .. }
+                    | ModelAssistantItem::Reasoning(_)
+                    | ModelAssistantItem::Refusal { .. } => None,
+                })
+                .collect();
+            let refusals: String = items
+                .iter()
+                .filter_map(|item| match item {
+                    ModelAssistantItem::Refusal { content } => Some(content.as_str()),
+                    ModelAssistantItem::Text { .. }
+                    | ModelAssistantItem::Reasoning(_)
+                    | ModelAssistantItem::ToolCall(_) => None,
+                })
+                .collect();
+            let mut value = Map::new();
+            value.insert("role".to_owned(), Value::String("assistant".to_owned()));
+            value.insert(
+                "content".to_owned(),
+                if content.is_empty() && (!tool_calls.is_empty() || !refusals.is_empty()) {
+                    Value::Null
+                } else {
+                    Value::String(content)
+                },
+            );
+            if !refusals.is_empty() {
+                value.insert("refusal".to_owned(), Value::String(refusals));
+            }
+            if !tool_calls.is_empty() {
+                value.insert(
+                    "tool_calls".to_owned(),
+                    Value::Array(tool_calls.into_iter().map(completions_tool_call).collect()),
+                );
+            }
+            Value::Object(value)
+        }
+        ModelMessage::ToolResult {
+            tool_call_id,
+            content,
+            ..
+        } => json!({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": content,
+        }),
+    }
+}
+
 fn sampling_body(model: &ResolvedModel, request: &ModelRequest) -> Map<String, Value> {
     let mut body = Map::new();
-    body.extend(model.sampling.clone());
-    body.extend(request.sampling.clone());
+    body.extend(model.sampling_params.clone());
+    body.extend(request.sampling_params.clone());
     body
 }
 
-fn role_name(message: &ModelMessage, model: &ResolvedModel) -> &'static str {
-    match message.role {
-        MessageRole::System => "system",
-        MessageRole::Developer if model.compatibility.supports_developer_role => "developer",
-        MessageRole::Developer => "system",
-        MessageRole::User => "user",
-        MessageRole::Assistant => "assistant",
-        MessageRole::Tool => "tool",
+fn role_name(role: &'static str, model: &ResolvedModel) -> &'static str {
+    match role {
+        "developer" if model.compatibility.supports_developer_role => "developer",
+        "developer" => "system",
+        _ => role,
     }
 }
 
@@ -714,6 +1135,69 @@ fn responses_tool(tool: &ToolDefinition) -> Value {
         "name": tool.name,
         "description": tool.description,
         "parameters": tool.parameters,
+    })
+}
+
+fn responses_assistant_item(item: &ModelAssistantItem) -> Value {
+    match item {
+        ModelAssistantItem::Text { content } => json!({
+            "role": "assistant",
+            "content": content,
+        }),
+        ModelAssistantItem::Reasoning(thinking) => responses_reasoning_item(thinking),
+        ModelAssistantItem::Refusal { content } => json!({
+            "role": "assistant",
+            "content": [{"type": "refusal", "refusal": content}],
+        }),
+        ModelAssistantItem::ToolCall(tool_call) => responses_tool_call(tool_call),
+    }
+}
+
+fn responses_reasoning_item(thinking: &ModelThinking) -> Value {
+    let mut value = Map::new();
+    value.insert("type".to_owned(), Value::String("reasoning".to_owned()));
+    if let Some(item_id) = &thinking.item_id {
+        value.insert("id".to_owned(), Value::String(item_id.clone()));
+    }
+    if !thinking.summary.is_empty() {
+        value.insert(
+            "summary".to_owned(),
+            json!([{"type": "summary_text", "text": thinking.summary}]),
+        );
+    }
+    if !thinking.content.is_empty() {
+        value.insert(
+            "content".to_owned(),
+            json!([{"type": "reasoning_text", "text": thinking.content}]),
+        );
+    }
+    if let Some(encrypted_content) = &thinking.encrypted_content {
+        value.insert(
+            "encrypted_content".to_owned(),
+            Value::String(encrypted_content.clone()),
+        );
+    }
+    Value::Object(value)
+}
+
+fn responses_tool_call(tool_call: &ModelToolCall) -> Value {
+    json!({
+        "type": "function_call",
+        "id": tool_call.item_id,
+        "call_id": tool_call.call_id,
+        "name": tool_call.name,
+        "arguments": tool_call.arguments,
+    })
+}
+
+fn completions_tool_call(tool_call: &ModelToolCall) -> Value {
+    json!({
+        "id": tool_call.call_id,
+        "type": "function",
+        "function": {
+            "name": tool_call.name,
+            "arguments": tool_call.arguments,
+        }
     })
 }
 
@@ -836,11 +1320,17 @@ mod tests {
             .expect("completed response should finish");
 
         assert_eq!(response.stop_reason, StopReason::ToolCalls);
-        assert_eq!(response.tool_calls[0].name.as_deref(), Some("read"));
         assert_eq!(
-            response.tool_calls[0].arguments,
-            "{\"path\":\"src/main.rs\"}"
+            response.items[0],
+            ModelAssistantItem::Text {
+                content: "hello".to_owned()
+            }
         );
+        let ModelAssistantItem::ToolCall(tool_call) = &response.items[1] else {
+            panic!("expected a tool call item");
+        };
+        assert_eq!(tool_call.name.as_deref(), Some("read"));
+        assert_eq!(tool_call.arguments, "{\"path\":\"src/main.rs\"}");
         assert_eq!(
             response.usage,
             Some(Usage {
@@ -850,6 +1340,84 @@ mod tests {
                 cache_read_tokens: None,
                 cache_write_tokens: None,
             })
+        );
+    }
+
+    #[test]
+    fn completions_refusal_deltas_are_retained_and_replayed() {
+        let parsed = parse_payload(
+            ApiKind::OpenAiCompletions,
+            r#"{"choices":[{"delta":{"refusal":"I cannot help with that."},"finish_reason":null}]}"#,
+        )
+        .expect("payload should parse");
+        let finished = parse_payload(
+            ApiKind::OpenAiCompletions,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        )
+        .expect("finish payload should parse");
+        let mut collector = ResponseCollector::default();
+        for event in parsed.events.into_iter().chain(finished.events) {
+            collector.record(&event);
+        }
+        collector.stop_reason = finished.stop_reason;
+        collector.terminal_seen = true;
+        let response = collector
+            .finish()
+            .expect("completed response should finish");
+
+        assert_eq!(
+            response.items,
+            [ModelAssistantItem::Refusal {
+                content: "I cannot help with that.".to_owned()
+            }]
+        );
+
+        let model = test_model(
+            ApiKind::OpenAiCompletions,
+            "https://example.test/v1".to_owned(),
+        );
+        let request = ModelRequest {
+            messages: vec![ModelMessage::Assistant {
+                items: response.items,
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: None,
+            sampling_params: BTreeMap::new(),
+        };
+        let (_, body) = request_for(&model, &request).expect("request should build");
+        assert_eq!(
+            body["messages"][0],
+            json!({
+                "role": "assistant",
+                "content": null,
+                "refusal": "I cannot help with that."
+            })
+        );
+    }
+
+    #[test]
+    fn completions_reasoning_deltas_are_retained_in_response_items() {
+        let parsed = parse_payload(
+            ApiKind::OpenAiCompletions,
+            r#"{"choices":[{"delta":{"reasoning_content":"thinking..."},"finish_reason":null}]}"#,
+        )
+        .expect("payload should parse");
+        let mut collector = ResponseCollector::default();
+        for event in parsed.events {
+            collector.record(&event);
+        }
+        collector.terminal_seen = true;
+        let response = collector
+            .finish()
+            .expect("completed response should finish");
+
+        assert_eq!(
+            response.items,
+            [ModelAssistantItem::Reasoning(ModelThinking {
+                summary: "thinking...".to_owned(),
+                ..ModelThinking::default()
+            })]
         );
     }
 
@@ -884,7 +1452,60 @@ mod tests {
             .expect("incomplete response should finish");
 
         assert_eq!(response.stop_reason, StopReason::Length);
-        assert_eq!(response.tool_calls.len(), 1);
+        assert!(matches!(
+            response.items.as_slice(),
+            [ModelAssistantItem::ToolCall(_)]
+        ));
+    }
+
+    #[test]
+    fn responses_refusal_stream_is_preserved_and_replayed() {
+        let payloads = [
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","content":[]}}"#,
+            r#"{"type":"response.refusal.delta","output_index":0,"delta":"I cannot help with that."}"#,
+            r#"{"type":"response.refusal.done","output_index":0,"refusal":"I cannot help with that."}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"I cannot help with that."}]}}"#,
+            r#"{"type":"response.completed","response":{"status":"completed"}}"#,
+        ];
+        let mut collector = ResponseCollector::default();
+        for payload in payloads {
+            let parsed = parse_payload(ApiKind::OpenAiResponses, payload)
+                .expect("Responses refusal event should parse");
+            collector.terminal_seen |= parsed.terminal;
+            collector.stop_reason = parsed.stop_reason.or(collector.stop_reason);
+            for event in parsed.events {
+                collector.record(&event);
+            }
+        }
+        let response = collector.finish().expect("refusal response should finish");
+        assert_eq!(
+            response.items,
+            [ModelAssistantItem::Refusal {
+                content: "I cannot help with that.".to_owned()
+            }]
+        );
+
+        let model = test_model(
+            ApiKind::OpenAiResponses,
+            "https://example.test/v1".to_owned(),
+        );
+        let request = ModelRequest {
+            messages: vec![ModelMessage::Assistant {
+                items: response.items,
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: None,
+            sampling_params: BTreeMap::new(),
+        };
+        let (_, body) = request_for(&model, &request).expect("request should build");
+        assert_eq!(
+            body["input"][0],
+            json!({
+                "role": "assistant",
+                "content": [{"type": "refusal", "refusal": "I cannot help with that."}]
+            })
+        );
     }
 
     #[test]
@@ -918,6 +1539,7 @@ mod tests {
         assert_eq!(
             text.events,
             [ModelEvent::AssistantTextDelta {
+                index: None,
                 text: "hello".to_owned()
             }]
         );
@@ -930,6 +1552,7 @@ mod tests {
         assert_eq!(
             reasoning.events,
             [ModelEvent::AssistantThinkingDelta {
+                item_id: None,
                 text: "thinking".to_owned()
             }]
         );
@@ -943,12 +1566,179 @@ mod tests {
             tool.events,
             [ModelEvent::ToolCallDelta {
                 index: 1,
-                id: None,
+                call_id: None,
                 item_id: Some("fc-2".to_owned()),
                 name: None,
                 arguments: "{}".to_owned(),
                 arguments_complete: false,
             }]
+        );
+    }
+
+    #[test]
+    fn responses_reasoning_replays_before_function_call_and_output() {
+        let payloads = [
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_123","summary":[],"content":[],"encrypted_content":"enc_123"}}"#,
+            r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_123","delta":"inspect the file"}"#,
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_123","call_id":"call_123","name":"read","arguments":"{\"path\":\"src/main.rs\"}"}}"#,
+            r#"{"type":"response.completed","response":{"status":"completed"}}"#,
+        ];
+        let mut collector = ResponseCollector::default();
+        for payload in payloads {
+            let parsed = parse_payload(ApiKind::OpenAiResponses, payload)
+                .expect("Responses event should parse");
+            collector.terminal_seen |= parsed.terminal;
+            if parsed.stop_reason.is_some() {
+                collector.stop_reason = parsed.stop_reason;
+            }
+            for event in parsed.events {
+                collector.record(&event);
+            }
+        }
+
+        let response = collector
+            .finish()
+            .expect("completed response should finish");
+        assert!(matches!(
+            response.items.first(),
+            Some(ModelAssistantItem::Reasoning(ModelThinking {
+                item_id: Some(item_id),
+                summary,
+                encrypted_content: Some(encrypted_content),
+                ..
+            })) if item_id == "rs_123"
+                && summary == "inspect the file"
+                && encrypted_content == "enc_123"
+        ));
+
+        let model = test_model(
+            ApiKind::OpenAiResponses,
+            "https://example.test/v1".to_owned(),
+        );
+        let request = ModelRequest {
+            messages: vec![
+                ModelMessage::user("inspect src/main.rs"),
+                ModelMessage::Assistant {
+                    items: response.items,
+                },
+                ModelMessage::ToolResult {
+                    tool_call_id: "call_123".to_owned(),
+                    tool_name: "read".to_owned(),
+                    content: "file contents".to_owned(),
+                },
+            ],
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: None,
+            sampling_params: BTreeMap::new(),
+        };
+        let (_, body) = request_for(&model, &request).expect("request should build");
+
+        assert_eq!(
+            body["input"][1],
+            json!({
+                "type": "reasoning",
+                "id": "rs_123",
+                "summary": [{"type": "summary_text", "text": "inspect the file"}],
+                "encrypted_content": "enc_123"
+            })
+        );
+        assert_eq!(body["input"][2]["type"], "function_call");
+        assert_eq!(body["input"][2]["id"], "fc_123");
+        assert_eq!(body["input"][2]["call_id"], "call_123");
+        assert_eq!(
+            body["input"][3],
+            json!({
+                "type": "function_call_output",
+                "call_id": "call_123",
+                "output": "file contents"
+            })
+        );
+    }
+
+    #[test]
+    fn responses_replay_preserves_multiple_interleaved_reasoning_and_tool_items() {
+        let payloads = [
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"reasoning A"}]}}"#,
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"read","arguments":"{\"path\":\"a\"}"}}"#,
+            r#"{"type":"response.output_item.added","output_index":2,"item":{"type":"reasoning","id":"rs_2","summary":[{"type":"summary_text","text":"reasoning B"}]}}"#,
+            r#"{"type":"response.output_item.added","output_index":3,"item":{"type":"function_call","id":"fc_2","call_id":"call_2","name":"read","arguments":"{\"path\":\"b\"}"}}"#,
+            r#"{"type":"response.completed","response":{"status":"completed"}}"#,
+        ];
+        let mut collector = ResponseCollector::default();
+        for payload in payloads {
+            let parsed = parse_payload(ApiKind::OpenAiResponses, payload)
+                .expect("Responses event should parse");
+            collector.terminal_seen |= parsed.terminal;
+            collector.stop_reason = parsed.stop_reason.or(collector.stop_reason);
+            for event in parsed.events {
+                collector.record(&event);
+            }
+        }
+        let response = collector
+            .finish()
+            .expect("completed response should finish");
+
+        assert!(matches!(
+            response.items.as_slice(),
+            [
+                ModelAssistantItem::Reasoning(ModelThinking { item_id: Some(first), .. }),
+                ModelAssistantItem::ToolCall(ModelToolCall { item_id: Some(first_item), call_id: Some(first_call), .. }),
+                ModelAssistantItem::Reasoning(ModelThinking { item_id: Some(second), .. }),
+                ModelAssistantItem::ToolCall(ModelToolCall { item_id: Some(second_item), call_id: Some(second_call), .. }),
+            ] if first == "rs_1"
+                && first_item == "fc_1"
+                && first_call == "call_1"
+                && second == "rs_2"
+                && second_item == "fc_2"
+                && second_call == "call_2"
+        ));
+
+        let model = test_model(
+            ApiKind::OpenAiResponses,
+            "https://example.test/v1".to_owned(),
+        );
+        let request = ModelRequest {
+            messages: vec![
+                ModelMessage::Assistant {
+                    items: response.items,
+                },
+                ModelMessage::ToolResult {
+                    tool_call_id: "call_1".to_owned(),
+                    tool_name: "read".to_owned(),
+                    content: "result A".to_owned(),
+                },
+                ModelMessage::ToolResult {
+                    tool_call_id: "call_2".to_owned(),
+                    tool_name: "read".to_owned(),
+                    content: "result B".to_owned(),
+                },
+            ],
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: None,
+            sampling_params: BTreeMap::new(),
+        };
+        let (_, body) = request_for(&model, &request).expect("request should build");
+        assert_eq!(body["input"][0]["id"], "rs_1");
+        assert_eq!(body["input"][1]["id"], "fc_1");
+        assert_eq!(body["input"][2]["id"], "rs_2");
+        assert_eq!(body["input"][3]["id"], "fc_2");
+        assert_eq!(
+            body["input"][4],
+            json!({
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "result A"
+            })
+        );
+        assert_eq!(
+            body["input"][5],
+            json!({
+                "type": "function_call_output",
+                "call_id": "call_2",
+                "output": "result B"
+            })
         );
     }
 
@@ -980,13 +1770,174 @@ mod tests {
             .finish()
             .expect("completed response should finish");
         assert_eq!(response.stop_reason, StopReason::ToolCalls);
-        assert_eq!(response.tool_calls.len(), 1);
-        assert_eq!(response.tool_calls[0].id.as_deref(), Some("call_123"));
-        assert_eq!(response.tool_calls[0].item_id.as_deref(), Some("fc_123"));
-        assert_eq!(
-            response.tool_calls[0].arguments,
-            "{\"path\":\"src/main.rs\"}"
+        assert!(matches!(
+            response.items.as_slice(),
+            [ModelAssistantItem::ToolCall(ModelToolCall {
+                call_id: Some(call_id),
+                item_id: Some(item_id),
+                arguments,
+                ..
+            })] if call_id == "call_123"
+                && item_id == "fc_123"
+                && arguments == "{\"path\":\"src/main.rs\"}"
+        ));
+    }
+
+    #[test]
+    fn sampling_params_are_included_in_generated_request() {
+        let mut model = test_model(
+            ApiKind::OpenAiResponses,
+            "https://example.test/v1".to_owned(),
         );
+        model
+            .sampling_params
+            .insert("temperature".to_owned(), json!(0.7));
+        model.sampling_params.insert("top_p".to_owned(), json!(0.9));
+        let (_, body) =
+            request_for(&model, &ModelRequest::single_user("hello")).expect("request should build");
+
+        assert_eq!(body["temperature"], 0.7);
+        assert_eq!(body["top_p"], 0.9);
+    }
+
+    #[test]
+    fn replays_assistant_tool_call_and_result_for_completions() {
+        let model = test_model(
+            ApiKind::OpenAiCompletions,
+            "https://example.test/v1".to_owned(),
+        );
+        let request = ModelRequest {
+            messages: vec![
+                ModelMessage::user("inspect src/main.rs"),
+                ModelMessage::Assistant {
+                    items: vec![ModelAssistantItem::ToolCall(ModelToolCall {
+                        index: 0,
+                        call_id: Some("call_123".to_owned()),
+                        item_id: None,
+                        name: Some("read".to_owned()),
+                        arguments: r#"{"path":"src/main.rs"}"#.to_owned(),
+                    })],
+                },
+                ModelMessage::ToolResult {
+                    tool_call_id: "call_123".to_owned(),
+                    tool_name: "read".to_owned(),
+                    content: "file contents".to_owned(),
+                },
+            ],
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: None,
+            sampling_params: BTreeMap::new(),
+        };
+        let (_, body) = request_for(&model, &request).expect("request should build");
+
+        assert_eq!(
+            body["messages"][0],
+            json!({
+                "role": "user",
+                "content": "inspect src/main.rs"
+            })
+        );
+        assert_eq!(body["messages"][1]["content"], Value::Null);
+        assert_eq!(
+            body["messages"][1]["tool_calls"][0],
+            json!({
+                "id": "call_123",
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "arguments": r#"{"path":"src/main.rs"}"#
+                }
+            })
+        );
+        assert_eq!(
+            body["messages"][2],
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_123",
+                "content": "file contents"
+            })
+        );
+
+        let plain_request = ModelRequest {
+            messages: vec![ModelMessage::Assistant {
+                items: vec![ModelAssistantItem::Text {
+                    content: "continuing".to_owned(),
+                }],
+            }],
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: None,
+            sampling_params: BTreeMap::new(),
+        };
+        let (_, plain_body) = request_for(&model, &plain_request).expect("request should build");
+        assert_eq!(
+            plain_body["messages"][0],
+            json!({
+                "role": "assistant",
+                "content": "continuing"
+            })
+        );
+        assert!(plain_body["messages"][0].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn replays_responses_function_call_and_output_with_distinct_ids() {
+        let model = test_model(
+            ApiKind::OpenAiResponses,
+            "https://example.test/v1".to_owned(),
+        );
+        let request = ModelRequest {
+            messages: vec![
+                ModelMessage::user("inspect src/main.rs"),
+                ModelMessage::Assistant {
+                    items: vec![ModelAssistantItem::ToolCall(ModelToolCall {
+                        index: 0,
+                        call_id: Some("call_123".to_owned()),
+                        item_id: Some("fc_123".to_owned()),
+                        name: Some("read".to_owned()),
+                        arguments: r#"{"path":"src/main.rs"}"#.to_owned(),
+                    })],
+                },
+                ModelMessage::ToolResult {
+                    tool_call_id: "call_123".to_owned(),
+                    tool_name: "read".to_owned(),
+                    content: "file contents".to_owned(),
+                },
+            ],
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: None,
+            sampling_params: BTreeMap::new(),
+        };
+        let (_, body) = request_for(&model, &request).expect("request should build");
+
+        assert_eq!(
+            body["input"][0],
+            json!({
+                "role": "user",
+                "content": "inspect src/main.rs"
+            })
+        );
+        assert_eq!(
+            body["input"][1],
+            json!({
+                "type": "function_call",
+                "id": "fc_123",
+                "call_id": "call_123",
+                "name": "read",
+                "arguments": r#"{"path":"src/main.rs"}"#
+            })
+        );
+        assert_eq!(
+            body["input"][2],
+            json!({
+                "type": "function_call_output",
+                "call_id": "call_123",
+                "output": "file contents"
+            })
+        );
+        assert_ne!(body["input"][1]["id"], body["input"][1]["call_id"]);
     }
 
     #[test]
@@ -999,27 +1950,27 @@ mod tests {
             api_key: None,
             headers: BTreeMap::new(),
             auth_header: true,
-            compatibility: Compatibility::default(),
+            compatibility: Compatibility {
+                supports_developer_role: false,
+                ..Compatibility::default()
+            },
             reasoning: false,
             input: vec!["text".to_owned()],
             context_window: None,
             max_tokens: Some(123),
             cost: CostMetadata::default(),
-            sampling: BTreeMap::new(),
+            sampling_params: BTreeMap::new(),
         };
         let (endpoint, body) = request_for(
             &model,
             &ModelRequest {
-                messages: vec![ModelMessage {
-                    role: MessageRole::Developer,
+                messages: vec![ModelMessage::Developer {
                     content: "instructions".to_owned(),
-                    name: None,
-                    tool_call_id: None,
                 }],
                 tools: Vec::new(),
                 max_tokens: None,
                 reasoning_effort: None,
-                sampling: BTreeMap::new(),
+                sampling_params: BTreeMap::new(),
             },
         )
         .expect("request should build");
@@ -1043,7 +1994,7 @@ mod tests {
             context_window: None,
             max_tokens: None,
             cost: CostMetadata::default(),
-            sampling: BTreeMap::new(),
+            sampling_params: BTreeMap::new(),
         }
     }
 
@@ -1094,7 +2045,7 @@ mod tests {
         let mut usage = None;
         while let Some(event) = rx.recv().await {
             match event {
-                ModelEvent::AssistantTextDelta { text: chunk } => text.push_str(&chunk),
+                ModelEvent::AssistantTextDelta { text: chunk, .. } => text.push_str(&chunk),
                 ModelEvent::UsageUpdated(value) => usage = Some(value),
                 _ => {}
             }

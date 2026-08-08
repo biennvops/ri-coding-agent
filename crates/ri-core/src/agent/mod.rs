@@ -31,14 +31,39 @@ impl AgentError {
 pub enum AgentEvent {
     TurnStarted,
     AssistantTextDelta {
+        index: Option<usize>,
         text: String,
     },
-    AssistantThinkingDelta {
+    AssistantTextItem {
+        index: usize,
+        content: Option<String>,
+    },
+    AssistantRefusalDelta {
+        index: Option<usize>,
         text: String,
+    },
+    AssistantRefusalItem {
+        index: usize,
+        content: Option<String>,
+    },
+    AssistantThinkingDelta {
+        item_id: Option<String>,
+        text: String,
+    },
+    AssistantThinkingContentDelta {
+        item_id: Option<String>,
+        text: String,
+    },
+    AssistantThinkingItem {
+        index: usize,
+        item_id: Option<String>,
+        summary: Option<String>,
+        content: Option<String>,
+        encrypted_content: Option<String>,
     },
     ToolCallDelta {
         index: usize,
-        id: Option<String>,
+        call_id: Option<String>,
         item_id: Option<String>,
         name: Option<String>,
         arguments: String,
@@ -232,18 +257,47 @@ async fn run_turn<P>(
 
 fn agent_event_from_model(event: ModelEvent) -> AgentEvent {
     match event {
-        ModelEvent::AssistantTextDelta { text } => AgentEvent::AssistantTextDelta { text },
-        ModelEvent::AssistantThinkingDelta { text } => AgentEvent::AssistantThinkingDelta { text },
+        ModelEvent::AssistantTextDelta { index, text } => {
+            AgentEvent::AssistantTextDelta { index, text }
+        }
+        ModelEvent::AssistantTextItem { index, content } => {
+            AgentEvent::AssistantTextItem { index, content }
+        }
+        ModelEvent::AssistantRefusalDelta { index, text } => {
+            AgentEvent::AssistantRefusalDelta { index, text }
+        }
+        ModelEvent::AssistantRefusalItem { index, content } => {
+            AgentEvent::AssistantRefusalItem { index, content }
+        }
+        ModelEvent::AssistantThinkingDelta { item_id, text } => {
+            AgentEvent::AssistantThinkingDelta { item_id, text }
+        }
+        ModelEvent::AssistantThinkingContentDelta { item_id, text } => {
+            AgentEvent::AssistantThinkingContentDelta { item_id, text }
+        }
+        ModelEvent::AssistantThinkingItem {
+            index,
+            item_id,
+            summary,
+            content,
+            encrypted_content,
+        } => AgentEvent::AssistantThinkingItem {
+            index,
+            item_id,
+            summary,
+            content,
+            encrypted_content,
+        },
         ModelEvent::ToolCallDelta {
             index,
-            id,
+            call_id,
             item_id,
             name,
             arguments,
             arguments_complete,
         } => AgentEvent::ToolCallDelta {
             index,
-            id,
+            call_id,
             item_id,
             name,
             arguments,
@@ -293,7 +347,7 @@ mod tests {
             received
                 .iter()
                 .filter_map(|event| match event {
-                    AgentEvent::AssistantTextDelta { text } => Some(text.as_str()),
+                    AgentEvent::AssistantTextDelta { text, .. } => Some(text.as_str()),
                     _ => None,
                 })
                 .collect::<String>(),
