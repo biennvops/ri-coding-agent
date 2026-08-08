@@ -22,6 +22,7 @@ use super::{
 pub const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const TERMINATION_GRACE: Duration = Duration::from_millis(75);
+const STREAM_OUTPUT_LIMIT: usize = MAX_TOOL_OUTPUT_BYTES / 2;
 const BASH_CHUNK_BYTES: usize = 8 * 1024;
 
 pub(crate) struct BashTool;
@@ -386,8 +387,8 @@ struct BashOutput {
 impl BashOutput {
     fn new() -> Self {
         Self {
-            stdout: BoundedText::new(MAX_TOOL_OUTPUT_BYTES / 2),
-            stderr: BoundedText::new(MAX_TOOL_OUTPUT_BYTES / 2),
+            stdout: BoundedText::new(STREAM_OUTPUT_LIMIT),
+            stderr: BoundedText::new(STREAM_OUTPUT_LIMIT),
             combined: BoundedText::new(MAX_TOOL_OUTPUT_BYTES),
             spill: None,
             spill_path: None,
@@ -395,10 +396,14 @@ impl BashOutput {
     }
 
     fn push(&mut self, stream: ToolOutputStream, text: &str) -> Result<(), ToolError> {
-        match stream {
-            ToolOutputStream::Stdout => self.stdout.push(text),
-            ToolOutputStream::Stderr => self.stderr.push(text),
-        }
+        let stream_would_truncate = match stream {
+            ToolOutputStream::Stdout => {
+                self.stdout.total_bytes().saturating_add(text.len()) > STREAM_OUTPUT_LIMIT
+            }
+            ToolOutputStream::Stderr => {
+                self.stderr.total_bytes().saturating_add(text.len()) > STREAM_OUTPUT_LIMIT
+            }
+        };
         let label = match stream {
             ToolOutputStream::Stdout => "[stdout]\n",
             ToolOutputStream::Stderr => "[stderr]\n",
@@ -407,31 +412,40 @@ impl BashOutput {
         combined.push_str(label);
         combined.push_str(text);
 
-        if self.spill.is_none()
-            && self.combined.total_bytes().saturating_add(combined.len()) > MAX_TOOL_OUTPUT_BYTES
-        {
-            let path = temporary_path(&std::env::temp_dir());
-            let mut spill = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .map_err(|error| {
-                    ToolError::Failed(format!("could not create output spill file: {error}"))
-                })?;
-            spill
-                .write_all(self.combined.retained().as_bytes())
-                .map_err(|error| {
-                    ToolError::Failed(format!("could not initialize output spill file: {error}"))
-                })?;
-            self.spill_path = Some(path);
-            self.spill = Some(spill);
+        let combined_would_truncate =
+            self.combined.total_bytes().saturating_add(combined.len()) > MAX_TOOL_OUTPUT_BYTES;
+        if self.spill.is_none() && (stream_would_truncate || combined_would_truncate) {
+            self.create_spill()?;
         }
         if let Some(spill) = &mut self.spill {
             spill.write_all(combined.as_bytes()).map_err(|error| {
                 ToolError::Failed(format!("could not append output spill file: {error}"))
             })?;
         }
+        match stream {
+            ToolOutputStream::Stdout => self.stdout.push(text),
+            ToolOutputStream::Stderr => self.stderr.push(text),
+        }
         self.combined.push(&combined);
+        Ok(())
+    }
+
+    fn create_spill(&mut self) -> Result<(), ToolError> {
+        let path = temporary_path(&std::env::temp_dir());
+        let mut spill = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| {
+                ToolError::Failed(format!("could not create output spill file: {error}"))
+            })?;
+        spill
+            .write_all(self.combined.retained().as_bytes())
+            .map_err(|error| {
+                ToolError::Failed(format!("could not initialize output spill file: {error}"))
+            })?;
+        self.spill_path = Some(path);
+        self.spill = Some(spill);
         Ok(())
     }
 
@@ -537,6 +551,57 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdout_truncation_spills_before_combined_limit() {
+        let root = unique_test_dir("bash-stdout-boundary");
+        fs::create_dir_all(&root).unwrap();
+        let context = ToolContext::new(&root).unwrap();
+        let result = BashTool
+            .execute(
+                json!({"command": format!("yes x | head -c {}", STREAM_OUTPUT_LIMIT + 1024)}),
+                &context,
+                mpsc::channel(128).0,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.metadata.truncated);
+        let path = result
+            .metadata
+            .full_output_path
+            .expect("stdout truncation should spill");
+        assert!(fs::metadata(path).unwrap().len() > STREAM_OUTPUT_LIMIT as u64);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stderr_truncation_spills_before_combined_limit() {
+        let root = unique_test_dir("bash-stderr-boundary");
+        fs::create_dir_all(&root).unwrap();
+        let context = ToolContext::new(&root).unwrap();
+        let result = BashTool
+            .execute(
+                json!({"command": format!("yes x | head -c {} 1>&2", STREAM_OUTPUT_LIMIT + 1024)}),
+                &context,
+                mpsc::channel(128).0,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.metadata.truncated);
+        let path = result
+            .metadata
+            .full_output_path
+            .expect("stderr truncation should spill");
+        assert!(fs::metadata(path).unwrap().len() > STREAM_OUTPUT_LIMIT as u64);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn large_output_is_bounded_and_spilled() {
         let root = unique_test_dir("bash-large");
