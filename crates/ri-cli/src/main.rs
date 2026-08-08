@@ -1,6 +1,7 @@
 mod app;
 mod input;
 mod render;
+mod session_picker;
 mod terminal;
 
 use anyhow::Result;

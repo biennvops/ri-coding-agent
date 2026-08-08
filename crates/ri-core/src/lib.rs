@@ -3,6 +3,7 @@ pub mod app;
 pub mod config;
 pub mod context;
 pub mod model;
+pub mod session;
 pub mod tools;
 
 pub use agent::{
@@ -20,6 +21,12 @@ pub use model::{
     ConfiguredProvider, MockProvider, ModelAssistantItem, ModelEvent, ModelMessage, ModelProvider,
     ModelRequest, ModelResponse, ModelThinking, ModelToolCall, ProviderError, StopReason,
     ToolDefinition, Usage,
+};
+pub use session::{
+    read_session, validate_name, workspace_id, MessageId, OpenedSession, SessionAssistantItem,
+    SessionError, SessionHandle, SessionHeader, SessionId, SessionInfo, SessionMessage,
+    SessionMode, SessionRecord, SessionRepository, SessionSnapshot, SessionSummary, WorkspaceId,
+    MAX_SESSION_RECORD_BYTES, SESSION_VERSION,
 };
 pub use tools::{
     Tool, ToolContext, ToolError, ToolEvent, ToolEventSender, ToolExecutionMetadata,

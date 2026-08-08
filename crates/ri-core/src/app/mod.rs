@@ -2,7 +2,8 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::agent::{AgentError, AgentEvent};
 use crate::config::ModelRef;
-use crate::model::{ModelAssistantItem, StopReason};
+use crate::model::{ModelAssistantItem, ModelMessage, StopReason};
+use crate::session::SessionInfo;
 use crate::tools::{ToolExecutionMetadata, ToolOutputStream};
 
 const MAX_TOOL_TRANSCRIPT_OUTPUT_BYTES: usize = 256 * 1024;
@@ -62,6 +63,7 @@ pub struct AppState {
     last_error: Option<String>,
     last_stop_reason: Option<StopReason>,
     active_model: Option<ModelRef>,
+    session_info: Option<SessionInfo>,
 }
 
 impl AppState {
@@ -111,6 +113,28 @@ impl AppState {
 
     pub fn active_model(&self) -> Option<&ModelRef> {
         self.active_model.as_ref()
+    }
+
+    pub fn session_info(&self) -> Option<&SessionInfo> {
+        self.session_info.as_ref()
+    }
+
+    pub fn replace_history(&mut self, history: &[ModelMessage]) {
+        self.messages.clear();
+        self.entries.clear();
+        self.streaming_assistant = None;
+        self.input.clear();
+        self.cursor = 0;
+        self.turn_active = false;
+        self.last_error = None;
+        self.last_stop_reason = None;
+        for message in history {
+            self.append_semantic_message(message);
+        }
+    }
+
+    pub fn set_session_info(&mut self, info: Option<SessionInfo>) {
+        self.session_info = info;
     }
 
     pub fn insert_text(&mut self, text: &str) {
@@ -324,6 +348,13 @@ impl AppState {
             AgentEvent::ModelChanged(model) => {
                 self.active_model = Some(model);
             }
+            AgentEvent::SessionChanged { info } => {
+                self.session_info = Some(info);
+            }
+            AgentEvent::SessionLoaded { info, history } => {
+                self.session_info = Some(info);
+                self.replace_history(&history);
+            }
             AgentEvent::Error(AgentError { message }) => {
                 self.last_error = Some(message);
             }
@@ -333,6 +364,97 @@ impl AppState {
     fn push_message(&mut self, message: TranscriptMessage) {
         self.messages.push(message.clone());
         self.entries.push(TranscriptEntry::Message(message));
+    }
+
+    fn append_semantic_message(&mut self, message: &ModelMessage) {
+        match message {
+            ModelMessage::User { content } => self.push_message(TranscriptMessage {
+                role: MessageRole::User,
+                content: content.clone(),
+                thinking: None,
+            }),
+            ModelMessage::Assistant { items } => {
+                let content = items
+                    .iter()
+                    .filter_map(|item| match item {
+                        ModelAssistantItem::Text { content }
+                        | ModelAssistantItem::Refusal { content } => Some(content.as_str()),
+                        ModelAssistantItem::Reasoning(_) | ModelAssistantItem::ToolCall(_) => None,
+                    })
+                    .collect::<String>();
+                let thinking = items
+                    .iter()
+                    .filter_map(|item| match item {
+                        ModelAssistantItem::Reasoning(thinking) => {
+                            if thinking.content.is_empty() {
+                                (!thinking.summary.is_empty()).then_some(thinking.summary.as_str())
+                            } else {
+                                Some(thinking.content.as_str())
+                            }
+                        }
+                        ModelAssistantItem::Text { .. }
+                        | ModelAssistantItem::Refusal { .. }
+                        | ModelAssistantItem::ToolCall(_) => None,
+                    })
+                    .collect::<String>();
+                if !content.is_empty() || !thinking.is_empty() {
+                    self.push_message(TranscriptMessage {
+                        role: MessageRole::Assistant,
+                        content,
+                        thinking: (!thinking.is_empty()).then_some(thinking),
+                    });
+                }
+                for item in items {
+                    let ModelAssistantItem::ToolCall(call) = item else {
+                        continue;
+                    };
+                    let (Some(call_id), Some(name)) = (call.call_id.clone(), call.name.clone())
+                    else {
+                        continue;
+                    };
+                    self.entries
+                        .push(TranscriptEntry::Tool(ToolTranscriptEntry {
+                            call_id,
+                            name,
+                            arguments: truncate_text(
+                                &call.arguments,
+                                MAX_TOOL_TRANSCRIPT_ARGUMENT_BYTES,
+                            ),
+                            output: String::new(),
+                            output_truncated: false,
+                            status: ToolStatus::Running,
+                        }));
+                }
+            }
+            ModelMessage::ToolResult {
+                tool_call_id,
+                tool_name,
+                content,
+            } => {
+                let found = self.entries.iter_mut().rev().find_map(|entry| match entry {
+                    TranscriptEntry::Tool(tool) if tool.call_id == *tool_call_id => Some(tool),
+                    _ => None,
+                });
+                if let Some(tool) = found {
+                    tool.output.clear();
+                    tool.output_truncated = false;
+                    append_tool_output(tool, content);
+                    tool.status = ToolStatus::Finished(ToolExecutionMetadata::success());
+                } else {
+                    let mut tool = ToolTranscriptEntry {
+                        call_id: tool_call_id.clone(),
+                        name: tool_name.clone(),
+                        arguments: String::new(),
+                        output: String::new(),
+                        output_truncated: false,
+                        status: ToolStatus::Finished(ToolExecutionMetadata::success()),
+                    };
+                    append_tool_output(&mut tool, content);
+                    self.entries.push(TranscriptEntry::Tool(tool));
+                }
+            }
+            ModelMessage::System { .. } | ModelMessage::Developer { .. } => {}
+        }
     }
 
     fn finalize_streaming_assistant(&mut self) {
@@ -591,6 +713,59 @@ mod tests {
                 metadata: ToolExecutionMetadata::success(),
             }
         }
+    }
+
+    #[test]
+    fn semantic_history_rebuilds_messages_and_historical_tools() {
+        let call = crate::model::ModelToolCall {
+            index: 0,
+            call_id: Some("call-1".to_owned()),
+            item_id: Some("item-1".to_owned()),
+            name: Some("read".to_owned()),
+            arguments: r#"{"path":"note.txt"}"#.to_owned(),
+        };
+        let history = vec![
+            ModelMessage::user("inspect note"),
+            ModelMessage::Assistant {
+                items: vec![
+                    ModelAssistantItem::Reasoning(crate::model::ModelThinking {
+                        item_id: Some("reasoning-1".to_owned()),
+                        summary: "summary".to_owned(),
+                        content: "thinking".to_owned(),
+                        encrypted_content: Some("encrypted".to_owned()),
+                    }),
+                    ModelAssistantItem::Text {
+                        content: "I will inspect it.".to_owned(),
+                    },
+                    ModelAssistantItem::ToolCall(call),
+                ],
+            },
+            ModelMessage::ToolResult {
+                tool_call_id: "call-1".to_owned(),
+                tool_name: "read".to_owned(),
+                content: "1 | note".to_owned(),
+            },
+            ModelMessage::Assistant {
+                items: vec![ModelAssistantItem::Text {
+                    content: "The note is present.".to_owned(),
+                }],
+            },
+        ];
+        let mut state = AppState::new();
+        state.replace_history(&history);
+
+        assert_eq!(state.messages().len(), 3);
+        assert_eq!(state.messages()[0].role, MessageRole::User);
+        assert_eq!(state.messages()[1].content, "I will inspect it.");
+        assert_eq!(state.messages()[1].thinking.as_deref(), Some("thinking"));
+        assert_eq!(state.messages()[2].content, "The note is present.");
+        assert_eq!(state.transcript_entries().len(), 4);
+        let TranscriptEntry::Tool(tool) = &state.transcript_entries()[2] else {
+            panic!("expected historical tool entry");
+        };
+        assert_eq!(tool.call_id, "call-1");
+        assert_eq!(tool.output, "1 | note");
+        assert!(matches!(tool.status, ToolStatus::Finished(_)));
     }
 
     #[test]

@@ -11,6 +11,7 @@ use crate::model::{
     ModelAssistantItem, ModelEvent, ModelMessage, ModelProvider, ModelRequest, ModelResponse,
     ModelToolCall, ProviderError, StopReason, Usage,
 };
+use crate::session::{SessionInfo, SessionMode};
 use crate::tools::{
     ToolContext, ToolError, ToolEvent, ToolExecutionMetadata, ToolExecutionResult,
     ToolOutputStream, ToolRegistry,
@@ -22,8 +23,20 @@ const TOOL_EVENT_CHANNEL_CAPACITY: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentCommand {
-    Submit { text: String },
+    Submit {
+        text: String,
+    },
     Cancel,
+    NewSession {
+        session: crate::session::SessionHandle,
+    },
+    LoadSession {
+        session: crate::session::SessionHandle,
+        history: Vec<ModelMessage>,
+    },
+    RenameSession {
+        name: String,
+    },
     Shutdown,
 }
 
@@ -103,6 +116,13 @@ pub enum AgentEvent {
     },
     UsageUpdated(Usage),
     ModelChanged(ModelRef),
+    SessionChanged {
+        info: SessionInfo,
+    },
+    SessionLoaded {
+        info: SessionInfo,
+        history: Vec<ModelMessage>,
+    },
     TurnFinished {
         reason: StopReason,
     },
@@ -113,6 +133,8 @@ pub enum AgentEvent {
 pub struct AgentRuntimeConfig {
     pub tool_context: ToolContext,
     pub base_messages: Vec<ModelMessage>,
+    pub initial_history: Vec<ModelMessage>,
+    pub session: SessionMode,
 }
 
 impl AgentRuntimeConfig {
@@ -120,6 +142,8 @@ impl AgentRuntimeConfig {
         Self {
             tool_context,
             base_messages: Vec::new(),
+            initial_history: Vec::new(),
+            session: SessionMode::Disabled,
         }
     }
 }
@@ -140,6 +164,7 @@ pub struct AgentRuntime<P> {
     context: ToolContext,
     base_messages: Vec<ModelMessage>,
     history: Vec<ModelMessage>,
+    session: SessionMode,
 }
 
 impl<P> AgentRuntime<P>
@@ -163,7 +188,8 @@ where
             registry: Arc::new(ToolRegistry::new()),
             context: config.tool_context,
             base_messages: config.base_messages,
-            history: Vec::new(),
+            history: config.initial_history,
+            session: config.session,
         }
     }
 
@@ -211,7 +237,10 @@ where
                         command = commands.recv() => {
                             match command {
                                 Some(AgentCommand::Cancel) => active_turn.cancel.cancel(),
-                                Some(AgentCommand::Submit { .. }) => {
+                                Some(AgentCommand::Submit { .. })
+                                | Some(AgentCommand::NewSession { .. })
+                                | Some(AgentCommand::LoadSession { .. })
+                                | Some(AgentCommand::RenameSession { .. }) => {
                                     let _ = events.send(AgentEvent::Error(AgentError::new(
                                         "a turn is already active",
                                     ))).await;
@@ -252,6 +281,8 @@ where
                         let turn_config = AgentRuntimeConfig {
                             tool_context: self.context.clone(),
                             base_messages: self.base_messages.clone(),
+                            initial_history: Vec::new(),
+                            session: self.session.clone(),
                         };
                         let history = self.history.clone();
                         let turn_events = events.clone();
@@ -270,6 +301,35 @@ where
                         });
                         active = Some(ActiveTurn { cancel, task });
                     }
+                    Some(AgentCommand::NewSession { session }) => {
+                        self.session = SessionMode::Enabled(session);
+                        self.history.clear();
+                        emit_session_loaded(&events, &self.session, &self.history).await;
+                    }
+                    Some(AgentCommand::LoadSession { session, history }) => {
+                        self.session = SessionMode::Enabled(session);
+                        self.history = history;
+                        emit_session_loaded(&events, &self.session, &self.history).await;
+                    }
+                    Some(AgentCommand::RenameSession { name }) => match &self.session {
+                        SessionMode::Disabled => {
+                            let _ = events
+                                .send(AgentEvent::Error(AgentError::new(
+                                    "sessions are disabled for this run",
+                                )))
+                                .await;
+                        }
+                        SessionMode::Enabled(session) => match session.rename(&name) {
+                            Ok(info) => {
+                                let _ = events.send(AgentEvent::SessionChanged { info }).await;
+                            }
+                            Err(error) => {
+                                let _ = events
+                                    .send(AgentEvent::Error(AgentError::new(error.to_string())))
+                                    .await;
+                            }
+                        },
+                    },
                     Some(AgentCommand::Cancel) => {
                         let _ = events
                             .send(AgentEvent::Error(AgentError::new("no turn is active")))
@@ -278,6 +338,29 @@ where
                     Some(AgentCommand::Shutdown) | None => return,
                 }
             }
+        }
+    }
+}
+
+async fn emit_session_loaded(
+    events: &mpsc::Sender<AgentEvent>,
+    session: &SessionMode,
+    history: &[ModelMessage],
+) {
+    match session.info() {
+        Ok(Some(info)) => {
+            let _ = events
+                .send(AgentEvent::SessionLoaded {
+                    info,
+                    history: history.to_vec(),
+                })
+                .await;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let _ = events
+                .send(AgentEvent::Error(AgentError::new(error.to_string())))
+                .await;
         }
     }
 }
@@ -294,7 +377,11 @@ async fn run_turn<P>(
 where
     P: ModelProvider,
 {
-    history.push(ModelMessage::user(text));
+    let user_message = ModelMessage::user(text);
+    if let Err(error) = commit_message(&mut history, &config.session, user_message, &events).await {
+        fail_turn(&events, error).await;
+        return turn_outcome(history, StopReason::Error);
+    }
     if events.send(AgentEvent::TurnStarted).await.is_err() {
         return turn_outcome(history, StopReason::Error);
     }
@@ -359,9 +446,15 @@ where
             return turn_outcome(history, StopReason::Error);
         }
 
-        history.push(ModelMessage::Assistant {
+        let assistant_message = ModelMessage::Assistant {
             items: response.items.clone(),
-        });
+        };
+        if let Err(error) =
+            commit_message(&mut history, &config.session, assistant_message, &events).await
+        {
+            fail_turn(&events, error).await;
+            return turn_outcome(history, StopReason::Error);
+        }
         if events
             .send(AgentEvent::AssistantMessageFinished {
                 items: response.items.clone(),
@@ -382,13 +475,17 @@ where
 
         tool_rounds += 1;
         if tool_rounds > MAX_TOOL_ROUNDS_PER_TURN {
-            append_synthetic_results(
+            if let Err(error) = append_synthetic_results(
                 &mut history,
+                &config.session,
                 &calls,
                 &events,
                 "tool loop limit reached; this tool call was not executed",
             )
-            .await;
+            .await
+            {
+                fail_turn(&events, error).await;
+            }
             fail_turn(
                 &events,
                 format!(
@@ -401,13 +498,18 @@ where
 
         for (index, call) in calls.iter().enumerate() {
             if cancel.is_cancelled() {
-                append_synthetic_results(
+                if let Err(error) = append_synthetic_results(
                     &mut history,
+                    &config.session,
                     &calls[index..],
                     &events,
                     "Tool execution cancelled by user.",
                 )
-                .await;
+                .await
+                {
+                    fail_turn(&events, error).await;
+                    return turn_outcome(history, StopReason::Error);
+                }
                 return turn_outcome(history, StopReason::Cancelled);
             }
 
@@ -419,21 +521,41 @@ where
                 cancel.clone(),
             )
             .await;
-            history.push(ModelMessage::ToolResult {
-                tool_call_id: call.call_id.clone().expect("validated call id"),
-                tool_name: call.name.clone().expect("validated tool name"),
+            let tool_call_id = call.call_id.clone().expect("validated call id");
+            let tool_name = call.name.clone().expect("validated tool name");
+            let tool_message = ModelMessage::ToolResult {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
                 content: result.model_content.clone(),
-            });
+            };
+            let persistence_error =
+                commit_message(&mut history, &config.session, tool_message, &events).await;
+            let _ = events
+                .send(AgentEvent::ToolExecutionFinished {
+                    call_id: tool_call_id,
+                    name: tool_name,
+                    result: result.clone(),
+                })
+                .await;
+            if let Err(error) = persistence_error {
+                fail_turn(&events, error).await;
+                return turn_outcome(history, StopReason::Error);
+            }
 
             if cancel.is_cancelled() || result.metadata.cancelled {
                 if index + 1 < calls.len() {
-                    append_synthetic_results(
+                    if let Err(error) = append_synthetic_results(
                         &mut history,
+                        &config.session,
                         &calls[index + 1..],
                         &events,
                         "Tool execution cancelled by user.",
                     )
-                    .await;
+                    .await
+                    {
+                        fail_turn(&events, error).await;
+                        return turn_outcome(history, StopReason::Error);
+                    }
                 }
                 return turn_outcome(history, StopReason::Cancelled);
             }
@@ -587,13 +709,6 @@ async fn execute_tool_call(
         }
     };
 
-    let _ = events
-        .send(AgentEvent::ToolExecutionFinished {
-            call_id,
-            name,
-            result: result.clone(),
-        })
-        .await;
     result
 }
 
@@ -643,12 +758,32 @@ fn tool_error_result(error: ToolError, cancelled: bool) -> ToolExecutionResult {
     }
 }
 
+async fn commit_message(
+    history: &mut Vec<ModelMessage>,
+    session: &SessionMode,
+    message: ModelMessage,
+    events: &mpsc::Sender<AgentEvent>,
+) -> Result<(), String> {
+    let info = session
+        .append_message(&message)
+        .map_err(|error| format!("session persistence failed: {error}"))?;
+    history.push(message);
+    if let Some(info) = info {
+        events
+            .send(AgentEvent::SessionChanged { info })
+            .await
+            .map_err(|_| "agent event stream closed".to_owned())?;
+    }
+    Ok(())
+}
+
 async fn append_synthetic_results(
     history: &mut Vec<ModelMessage>,
+    session: &SessionMode,
     calls: &[ModelToolCall],
     events: &mpsc::Sender<AgentEvent>,
     message: &str,
-) {
+) -> Result<(), String> {
     for call in calls {
         let call_id = call.call_id.clone().expect("validated call id");
         let name = call.name.clone().expect("validated tool name");
@@ -660,26 +795,30 @@ async fn append_synthetic_results(
                 metadata,
             }
         };
-        let _ = events
+        events
             .send(AgentEvent::ToolExecutionStarted {
                 call_id: call_id.clone(),
                 name: name.clone(),
                 arguments: call.arguments.clone(),
             })
-            .await;
-        history.push(ModelMessage::ToolResult {
+            .await
+            .map_err(|_| "agent event stream closed".to_owned())?;
+        let tool_message = ModelMessage::ToolResult {
             tool_call_id: call_id.clone(),
             tool_name: name.clone(),
             content: result.model_content.clone(),
-        });
-        let _ = events
+        };
+        commit_message(history, session, tool_message, events).await?;
+        events
             .send(AgentEvent::ToolExecutionFinished {
                 call_id,
                 name,
                 result,
             })
-            .await;
+            .await
+            .map_err(|_| "agent event stream closed".to_owned())?;
     }
+    Ok(())
 }
 
 async fn fail_turn(events: &mpsc::Sender<AgentEvent>, message: impl Into<String>) {
@@ -1221,6 +1360,169 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persisted_runtime_history_is_incremental_and_excludes_base_context() {
+        let root = unique_test_dir("agent-session");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("note.txt"), "alpha\n").unwrap();
+        let repository =
+            crate::session::SessionRepository::new(root.join("sessions"), &root, &root).unwrap();
+        let handle = repository.create().unwrap();
+        let path = handle.info().unwrap().path.clone();
+        let call = tool_call("read-call", "read", r#"{"path":"note.txt"}"#);
+        let provider = ScriptedProvider::new(vec![
+            ScriptedStep {
+                events: Vec::new(),
+                response: ModelResponse {
+                    items: vec![ModelAssistantItem::ToolCall(call.clone())],
+                    stop_reason: StopReason::ToolCalls,
+                    usage: None,
+                },
+            },
+            final_step("read complete"),
+        ]);
+        let requests = Arc::clone(&provider.requests);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let runtime = AgentRuntime::with_config(
+            provider,
+            AgentRuntimeConfig {
+                tool_context: ToolContext::new(&root).unwrap(),
+                base_messages: vec![ModelMessage::System {
+                    content: "SECRET BASE CONTEXT".to_owned(),
+                }],
+                initial_history: Vec::new(),
+                session: SessionMode::Enabled(handle.clone()),
+            },
+        );
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "inspect note".to_owned(),
+            })
+            .await
+            .unwrap();
+        let events = collect_turn(&mut event_rx).await;
+        assert!(events.iter().any(|event| {
+            matches!(event, AgentEvent::SessionChanged { info } if info.message_count == 1)
+        }));
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("SECRET BASE CONTEXT"));
+        assert_eq!(raw.lines().count(), 5);
+        let snapshot = crate::session::read_session(&path).unwrap();
+        assert_eq!(snapshot.history.len(), 4);
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests[0].messages[0],
+            ModelMessage::System {
+                content: "SECRET BASE CONTEXT".to_owned(),
+            }
+        );
+        assert_eq!(requests[0].messages.len(), 2);
+        assert_eq!(requests[1].messages.len(), 4);
+        std::mem::drop(handle);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_write_failure_stops_the_turn_instead_of_falling_back() {
+        let root = unique_test_dir("agent-session-failure");
+        std::fs::create_dir_all(&root).unwrap();
+        let sessions_file = root.join("sessions-file");
+        std::fs::write(&sessions_file, "not a directory").unwrap();
+        let repository =
+            crate::session::SessionRepository::new(&sessions_file, &root, &root).unwrap();
+        let handle = repository.create().unwrap();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let runtime = AgentRuntime::with_config(
+            MockProvider::with_response("should not run").with_delay(Duration::ZERO),
+            AgentRuntimeConfig {
+                tool_context: ToolContext::new(&root).unwrap(),
+                base_messages: Vec::new(),
+                initial_history: Vec::new(),
+                session: SessionMode::Enabled(handle),
+            },
+        );
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "cannot save".to_owned(),
+            })
+            .await
+            .unwrap();
+        let events = collect_turn(&mut event_rx).await;
+        assert!(events.iter().any(|event| {
+            matches!(event, AgentEvent::Error(error) if error.message.contains("session persistence failed"))
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::TurnFinished {
+                    reason: StopReason::Error
+                }
+            )
+        }));
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_persisted_turn_keeps_the_valid_user_history() {
+        let root = unique_test_dir("agent-session-cancel");
+        std::fs::create_dir_all(&root).unwrap();
+        let repository =
+            crate::session::SessionRepository::new(root.join("sessions"), &root, &root).unwrap();
+        let handle = repository.create().unwrap();
+        let path = handle.info().unwrap().path.clone();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let runtime = AgentRuntime::with_config(
+            MockProvider::with_response("a long response")
+                .with_chunk_size(1)
+                .with_delay(Duration::from_millis(10)),
+            AgentRuntimeConfig {
+                tool_context: ToolContext::new(&root).unwrap(),
+                base_messages: Vec::new(),
+                initial_history: Vec::new(),
+                session: SessionMode::Enabled(handle.clone()),
+            },
+        );
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "cancel this".to_owned(),
+            })
+            .await
+            .unwrap();
+        loop {
+            let event = event_rx.recv().await.unwrap();
+            if matches!(event, AgentEvent::TurnStarted) {
+                break;
+            }
+        }
+        command_tx.send(AgentCommand::Cancel).await.unwrap();
+        let events = collect_turn(&mut event_rx).await;
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::TurnFinished {
+                    reason: StopReason::Cancelled
+                }
+            )
+        }));
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+        let snapshot = crate::session::read_session(&path).unwrap();
+        assert_eq!(snapshot.history, vec![ModelMessage::user("cancel this")]);
+        drop(handle);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn conversation_history_survives_the_next_user_turn() {
         let provider = ScriptedProvider::new(vec![final_step("alpha"), final_step("remembered")]);
         let requests = Arc::clone(&provider.requests);
@@ -1291,6 +1593,8 @@ mod tests {
             AgentRuntimeConfig {
                 tool_context: ToolContext::new(&root).unwrap(),
                 base_messages: vec![base.clone()],
+                initial_history: Vec::new(),
+                session: SessionMode::Disabled,
             },
         );
         let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
