@@ -2,7 +2,8 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::agent::{AgentError, AgentEvent};
 use crate::config::ModelRef;
-use crate::model::{ModelAssistantItem, ModelMessage, StopReason};
+use crate::context::ContextUsage;
+use crate::model::{ModelAssistantItem, ModelLimits, ModelMessage, StopReason, Usage};
 use crate::session::SessionInfo;
 use crate::tools::{ToolExecutionMetadata, ToolOutputStream};
 
@@ -60,10 +61,13 @@ pub struct AppState {
     input: String,
     cursor: usize,
     turn_active: bool,
+    compaction_active: bool,
     last_error: Option<String>,
     last_stop_reason: Option<StopReason>,
     active_model: Option<ModelRef>,
     session_info: Option<SessionInfo>,
+    context_usage: ContextUsage,
+    latest_usage: Option<Usage>,
 }
 
 impl AppState {
@@ -94,13 +98,27 @@ impl AppState {
     }
 
     pub fn set_cursor(&mut self, cursor: usize) {
-        if !self.turn_active && cursor <= self.input.len() && self.input.is_char_boundary(cursor) {
+        if !self.is_busy() && cursor <= self.input.len() && self.input.is_char_boundary(cursor) {
             self.cursor = cursor;
         }
     }
 
     pub fn is_turn_active(&self) -> bool {
         self.turn_active
+    }
+
+    pub fn is_compaction_active(&self) -> bool {
+        self.compaction_active
+    }
+
+    pub fn set_compaction_active(&mut self, active: bool) {
+        if !self.turn_active {
+            self.compaction_active = active;
+        }
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.turn_active || self.compaction_active
     }
 
     pub fn last_error(&self) -> Option<&str> {
@@ -119,6 +137,21 @@ impl AppState {
         self.session_info.as_ref()
     }
 
+    pub fn context_usage(&self) -> ContextUsage {
+        self.context_usage
+    }
+
+    pub fn latest_usage(&self) -> Option<&Usage> {
+        self.latest_usage.as_ref()
+    }
+
+    pub fn set_context_limits(&mut self, limits: ModelLimits) {
+        self.context_usage.context_window = limits.context_window;
+        self.context_usage.max_output_tokens = limits.max_output_tokens;
+        self.context_usage.input_tokens = None;
+        self.context_usage.source = crate::context::UsageSource::Estimated;
+    }
+
     pub fn replace_history(&mut self, history: &[ModelMessage]) {
         self.messages.clear();
         self.entries.clear();
@@ -126,8 +159,13 @@ impl AppState {
         self.input.clear();
         self.cursor = 0;
         self.turn_active = false;
+        self.compaction_active = false;
         self.last_error = None;
         self.last_stop_reason = None;
+        self.context_usage.input_tokens = None;
+        self.context_usage.estimated_input_tokens = 0;
+        self.context_usage.source = crate::context::UsageSource::Estimated;
+        self.latest_usage = None;
         for message in history {
             self.append_semantic_message(message);
         }
@@ -138,7 +176,7 @@ impl AppState {
     }
 
     pub fn insert_text(&mut self, text: &str) {
-        if self.turn_active || text.is_empty() {
+        if self.is_busy() || text.is_empty() {
             return;
         }
         self.input.insert_str(self.cursor, text);
@@ -150,7 +188,7 @@ impl AppState {
     }
 
     pub fn backspace(&mut self) {
-        if self.turn_active || self.cursor == 0 {
+        if self.is_busy() || self.cursor == 0 {
             return;
         }
         let previous = previous_grapheme_boundary(&self.input, self.cursor);
@@ -159,7 +197,7 @@ impl AppState {
     }
 
     pub fn delete(&mut self) {
-        if self.turn_active || self.cursor == self.input.len() {
+        if self.is_busy() || self.cursor == self.input.len() {
             return;
         }
         let next = next_grapheme_boundary(&self.input, self.cursor);
@@ -167,31 +205,31 @@ impl AppState {
     }
 
     pub fn move_left(&mut self) {
-        if !self.turn_active {
+        if !self.is_busy() {
             self.cursor = previous_grapheme_boundary(&self.input, self.cursor);
         }
     }
 
     pub fn move_right(&mut self) {
-        if !self.turn_active {
+        if !self.is_busy() {
             self.cursor = next_grapheme_boundary(&self.input, self.cursor);
         }
     }
 
     pub fn move_home(&mut self) {
-        if !self.turn_active {
+        if !self.is_busy() {
             self.cursor = line_start(&self.input, self.cursor);
         }
     }
 
     pub fn move_end(&mut self) {
-        if !self.turn_active {
+        if !self.is_busy() {
             self.cursor = line_end(&self.input, self.cursor);
         }
     }
 
     pub fn take_input(&mut self) -> Option<String> {
-        if self.turn_active || self.input.trim().is_empty() {
+        if self.is_busy() || self.input.trim().is_empty() {
             return None;
         }
         let text = std::mem::take(&mut self.input);
@@ -340,11 +378,52 @@ impl AppState {
                 self.turn_active = false;
                 self.last_stop_reason = Some(reason);
             }
+            AgentEvent::CompactionStarted { .. } => {
+                self.compaction_active = true;
+                self.last_error = None;
+            }
+            AgentEvent::CompactionFinished {
+                before_tokens,
+                after_tokens,
+                ..
+            } => {
+                self.compaction_active = false;
+                self.push_message(TranscriptMessage {
+                    role: MessageRole::System,
+                    content: format!(
+                        "context compacted · ~{} → ~{} tokens",
+                        compact_token_count(before_tokens),
+                        compact_token_count(after_tokens)
+                    ),
+                    thinking: None,
+                });
+            }
+            AgentEvent::CompactionFailed { message } => {
+                self.compaction_active = false;
+                self.last_error = Some(message.clone());
+                self.push_message(TranscriptMessage {
+                    role: MessageRole::System,
+                    content: message,
+                    thinking: None,
+                });
+            }
             AgentEvent::AssistantTextItem { .. }
             | AgentEvent::AssistantThinkingContentDelta { .. }
             | AgentEvent::AssistantThinkingItem { .. }
-            | AgentEvent::ToolCallDelta { .. }
-            | AgentEvent::UsageUpdated(_) => {}
+            | AgentEvent::ToolCallDelta { .. } => {}
+            AgentEvent::UsageUpdated(usage) => {
+                self.latest_usage = Some(usage.clone());
+                if let Some(input_tokens) = usage.input_tokens {
+                    self.context_usage.input_tokens = Some(input_tokens);
+                    self.context_usage.source = crate::context::UsageSource::Provider;
+                }
+            }
+            AgentEvent::ContextUsageUpdated(usage) => {
+                self.context_usage = usage;
+            }
+            AgentEvent::ContextLimitsUpdated(limits) => {
+                self.set_context_limits(limits);
+            }
             AgentEvent::ModelChanged(model) => {
                 self.active_model = Some(model);
             }
@@ -468,6 +547,22 @@ impl AppState {
                 thinking: (!assistant.thinking.is_empty()).then_some(assistant.thinking),
             });
         }
+    }
+}
+
+fn compact_token_count(value: u64) -> String {
+    if value < 1_000 {
+        value.to_string()
+    } else if value < 1_000_000 {
+        format!("{:.1}k", value as f64 / 1_000.0)
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_owned()
+    } else {
+        format!("{:.1}m", value as f64 / 1_000_000.0)
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_owned()
     }
 }
 
@@ -766,6 +861,56 @@ mod tests {
         assert_eq!(tool.call_id, "call-1");
         assert_eq!(tool.output, "1 | note");
         assert!(matches!(tool.status, ToolStatus::Finished(_)));
+    }
+
+    #[test]
+    fn context_usage_reducer_keeps_provider_and_estimated_signals() {
+        let mut state = AppState::new();
+        state.reduce(AgentEvent::ContextLimitsUpdated(
+            crate::model::ModelLimits {
+                context_window: Some(200_000),
+                max_output_tokens: Some(32_000),
+            },
+        ));
+        state.reduce(AgentEvent::ContextUsageUpdated(ContextUsage::estimated(
+            42_000,
+            crate::model::ModelLimits {
+                context_window: Some(200_000),
+                max_output_tokens: Some(32_000),
+            },
+        )));
+        assert_eq!(state.context_usage().estimated_input_tokens, 42_000);
+        assert_eq!(state.context_usage().input_tokens, None);
+        state.reduce(AgentEvent::UsageUpdated(crate::model::Usage {
+            input_tokens: Some(43_000),
+            output_tokens: Some(100),
+            ..crate::model::Usage::default()
+        }));
+        assert_eq!(state.context_usage().input_tokens, Some(43_000));
+        assert_eq!(state.context_usage().context_window, Some(200_000));
+        assert_eq!(
+            state.latest_usage().and_then(|usage| usage.output_tokens),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn compaction_busy_state_disables_editor_until_finished() {
+        let mut state = AppState::new();
+        state.insert_text("/compact");
+        state.set_compaction_active(true);
+        assert!(state.is_busy());
+        assert_eq!(state.take_input(), None);
+        state.reduce(AgentEvent::CompactionFinished {
+            automatic: false,
+            before_tokens: 142_000,
+            after_tokens: 71_000,
+        });
+        assert!(!state.is_busy());
+        assert!(state
+            .messages()
+            .iter()
+            .any(|message| { message.content.contains("context compacted") }));
     }
 
     #[test]

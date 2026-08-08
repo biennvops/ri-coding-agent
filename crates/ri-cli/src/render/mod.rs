@@ -63,7 +63,7 @@ fn render_frame(frame: &mut Frame<'_>, state: &AppState, scroll_from_bottom: usi
     let editor_scroll = cursor
         .row
         .saturating_sub(editor_visible_lines.saturating_sub(1));
-    let editor_title = if state.is_turn_active() {
+    let editor_title = if state.is_busy() {
         " input · Esc cancels "
     } else {
         " input · Enter submits · Shift+Enter newline "
@@ -76,7 +76,7 @@ fn render_frame(frame: &mut Frame<'_>, state: &AppState, scroll_from_bottom: usi
     let footer = footer_text(state, chunks[2].width);
     frame.render_widget(Paragraph::new(footer), chunks[2]);
 
-    if !state.is_turn_active() && chunks[1].height > 2 {
+    if !state.is_busy() && chunks[1].height > 2 {
         let x = chunks[1]
             .x
             .saturating_add(1)
@@ -248,16 +248,42 @@ fn footer_text(state: &AppState, width: u16) -> Line<'static> {
         .session_info()
         .map(|info| format!("session: {}", info.display_name()))
         .unwrap_or_else(|| "session: ephemeral".to_owned());
+    let usage = state.context_usage();
+    let current = format_token_count(usage.current_tokens());
+    let context = match usage.context_window {
+        Some(window)
+            if matches!(usage.source, ri_core::UsageSource::Provider)
+                && usage.input_tokens.is_some() =>
+        {
+            format!("ctx {current}/{}", format_token_count(window))
+        }
+        Some(window) => format!("ctx ~{current}/{}", format_token_count(window)),
+        None => format!("ctx ~{current}"),
+    };
     let text = if let Some(error) = state.last_error() {
-        format!("{model} · {session} · error: {error}")
-    } else if state.is_turn_active() {
-        format!("{model} · {session} · streaming · Esc cancel · Ctrl+C cancel")
+        format!("{model} · {context} · {session} · error: {error}")
+    } else if state.is_busy() {
+        format!("{model} · {context} · {session} · busy · Esc cancel")
     } else {
-        format!("{model} · {session} · ready · Enter submit · Ctrl+C exit")
+        format!("{model} · {context} · {session} · ready · Enter submit · Ctrl+C exit")
     };
     let truncated: String = text
         .chars()
         .take(width.saturating_sub(1) as usize)
         .collect();
     Line::from(Span::styled(truncated, Style::default().fg(Color::Gray)))
+}
+
+fn format_token_count(value: u64) -> String {
+    if value < 1_000 {
+        value.to_string()
+    } else if value < 1_000_000 {
+        trim_decimal(format!("{:.1}k", value as f64 / 1_000.0))
+    } else {
+        trim_decimal(format!("{:.1}m", value as f64 / 1_000_000.0))
+    }
+}
+
+fn trim_decimal(value: String) -> String {
+    value.trim_end_matches('0').trim_end_matches('.').to_owned()
 }

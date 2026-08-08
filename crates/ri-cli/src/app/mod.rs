@@ -135,6 +135,8 @@ struct AppSetup {
     repository: Option<SessionRepository>,
     session: Option<SessionHandle>,
     initial_history: Vec<ModelMessage>,
+    initial_transcript: Vec<ModelMessage>,
+    compaction_enabled: bool,
     resume_requested: bool,
 }
 
@@ -184,46 +186,65 @@ impl AppSetup {
         let tool_context =
             ToolContext::new(&project.launch_cwd).map_err(|error| anyhow!(error.to_string()))?;
 
-        let (repository, session, initial_history, resume_requested) = if options.no_session {
-            (None, None, Vec::new(), false)
-        } else {
-            let repository =
-                SessionRepository::for_workspace(&project.launch_cwd, &project.project_root)
-                    .map_err(|error| anyhow!(error.to_string()))?;
-            if options.resume_session {
-                (Some(repository), None, Vec::new(), true)
-            } else if options.continue_session {
-                let summary = repository
-                    .latest()
-                    .map_err(|error| anyhow!(error.to_string()))?
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "no saved sessions found for {}",
-                            project.launch_cwd.display()
-                        )
-                    })?;
-                let opened = repository
-                    .open_path(&summary.path)
-                    .map_err(|error| anyhow!(error.to_string()))?;
-                for warning in &opened.warnings {
-                    eprintln!("{warning}");
-                }
-                (Some(repository), Some(opened.handle), opened.history, false)
-            } else if let Some(selector) = options.session.as_deref() {
-                let opened = repository
-                    .open_selector(selector)
-                    .map_err(|error| anyhow!(error.to_string()))?;
-                for warning in &opened.warnings {
-                    eprintln!("{warning}");
-                }
-                (Some(repository), Some(opened.handle), opened.history, false)
+        let (repository, session, initial_history, initial_transcript, resume_requested) =
+            if options.no_session {
+                (None, None, Vec::new(), Vec::new(), false)
             } else {
-                let session = repository
-                    .create()
-                    .map_err(|error| anyhow!(error.to_string()))?;
-                (Some(repository), Some(session), Vec::new(), false)
-            }
-        };
+                let repository =
+                    SessionRepository::for_workspace(&project.launch_cwd, &project.project_root)
+                        .map_err(|error| anyhow!(error.to_string()))?;
+                if options.resume_session {
+                    (Some(repository), None, Vec::new(), Vec::new(), true)
+                } else if options.continue_session {
+                    let summary = repository
+                        .latest()
+                        .map_err(|error| anyhow!(error.to_string()))?
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "no saved sessions found for {}",
+                                project.launch_cwd.display()
+                            )
+                        })?;
+                    let opened = repository
+                        .open_path(&summary.path)
+                        .map_err(|error| anyhow!(error.to_string()))?;
+                    for warning in &opened.warnings {
+                        eprintln!("{warning}");
+                    }
+                    (
+                        Some(repository),
+                        Some(opened.handle),
+                        opened.history,
+                        opened.transcript,
+                        false,
+                    )
+                } else if let Some(selector) = options.session.as_deref() {
+                    let opened = repository
+                        .open_selector(selector)
+                        .map_err(|error| anyhow!(error.to_string()))?;
+                    for warning in &opened.warnings {
+                        eprintln!("{warning}");
+                    }
+                    (
+                        Some(repository),
+                        Some(opened.handle),
+                        opened.history,
+                        opened.transcript,
+                        false,
+                    )
+                } else {
+                    let session = repository
+                        .create()
+                        .map_err(|error| anyhow!(error.to_string()))?;
+                    (
+                        Some(repository),
+                        Some(session),
+                        Vec::new(),
+                        Vec::new(),
+                        false,
+                    )
+                }
+            };
 
         Ok(Self {
             provider,
@@ -235,6 +256,8 @@ impl AppSetup {
             repository,
             session,
             initial_history,
+            initial_transcript,
+            compaction_enabled: settings.settings.compaction.enabled,
             resume_requested,
         })
     }
@@ -264,6 +287,7 @@ impl AppSetup {
     fn apply_opened(&mut self, opened: OpenedSession) {
         self.session = Some(opened.handle);
         self.initial_history = opened.history;
+        self.initial_transcript = opened.transcript;
         self.resume_requested = false;
         for warning in opened.warnings {
             eprintln!("{warning}");
@@ -288,7 +312,11 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
     }
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (event_tx, mut event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-    let runtime = AgentRuntime::with_config(setup.provider.clone(), setup.runtime_config());
+    let runtime = AgentRuntime::with_config_and_compaction(
+        setup.provider.clone(),
+        setup.runtime_config(),
+        setup.compaction_enabled,
+    );
     let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
 
     command_tx
@@ -297,9 +325,10 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
         .context("could not start the mock agent")?;
 
     let mut state = AppState::new();
-    state.replace_history(&setup.initial_history);
+    state.replace_history(&setup.initial_transcript);
     state.set_session_info(setup.session_info()?);
     state.reduce(AgentEvent::ModelChanged(setup.model_ref()));
+    state.reduce(AgentEvent::ContextLimitsUpdated(setup.provider.limits()));
     let mut turn_reason = None;
     let mut output = io::stdout();
     let mut error_message = None;
@@ -317,6 +346,12 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
                 eprintln!("ri: {}", error.message);
             }
             AgentEvent::TurnFinished { reason } => turn_reason = Some(reason.clone()),
+            AgentEvent::CompactionFinished {
+                before_tokens,
+                after_tokens,
+                ..
+            } => eprintln!("ri: context compacted · ~{before_tokens} → ~{after_tokens} tokens"),
+            AgentEvent::CompactionFailed { message } => eprintln!("ri: {message}"),
             AgentEvent::TurnStarted
             | AgentEvent::AssistantMessageStarted
             | AgentEvent::AssistantMessageFinished { .. }
@@ -330,6 +365,9 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
             | AgentEvent::ToolExecutionOutput { .. }
             | AgentEvent::ToolExecutionFinished { .. }
             | AgentEvent::UsageUpdated(_)
+            | AgentEvent::ContextUsageUpdated(_)
+            | AgentEvent::ContextLimitsUpdated(_)
+            | AgentEvent::CompactionStarted { .. }
             | AgentEvent::ModelChanged(_)
             | AgentEvent::SessionChanged { .. }
             | AgentEvent::SessionLoaded { .. } => {}
@@ -369,15 +407,20 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
 async fn run_tui(mut setup: AppSetup) -> Result<()> {
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (event_tx, mut event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-    let runtime = AgentRuntime::with_config(setup.provider.clone(), setup.runtime_config());
+    let runtime = AgentRuntime::with_config_and_compaction(
+        setup.provider.clone(),
+        setup.runtime_config(),
+        setup.compaction_enabled,
+    );
     let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
 
     let mut terminal = TerminalGuard::new().context("could not initialize terminal")?;
     let mut state = AppState::new();
-    state.replace_history(&setup.initial_history);
+    state.replace_history(&setup.initial_transcript);
     state.add_system_message(setup.context.diagnostic());
     state.set_session_info(setup.session_info()?);
     state.reduce(AgentEvent::ModelChanged(setup.model_ref()));
+    state.reduce(AgentEvent::ContextLimitsUpdated(setup.provider.limits()));
     let tui_result = run_tui_loop(
         &mut terminal,
         &mut state,
@@ -441,8 +484,8 @@ async fn run_tui_loop(
                             match action {
                                 Action::Submit => {
                                     if let Some(command) = slash_command(state.input()) {
-                                        if state.is_turn_active() {
-                                            state.add_system_message("a turn is already active");
+                                        if state.is_busy() {
+                                            state.add_system_message("a turn or compaction is already active");
                                         } else {
                                             state.take_input();
                                             handle_slash_command(
@@ -464,17 +507,17 @@ async fn run_tui_loop(
                                 }
                                 Action::Newline => state.insert_newline(),
                                 Action::Escape => {
-                                    if state.is_turn_active() {
+                                    if state.is_busy() {
                                         command_tx
                                             .try_send(AgentCommand::Cancel)
-                                            .context("could not cancel the active turn")?;
+                                            .context("could not cancel the active operation")?;
                                     }
                                 }
                                 Action::CtrlC => {
-                                    if state.is_turn_active() {
+                                    if state.is_busy() {
                                         command_tx
                                             .try_send(AgentCommand::Cancel)
-                                            .context("could not cancel the active turn")?;
+                                            .context("could not cancel the active operation")?;
                                     } else {
                                         exit = true;
                                     }
@@ -573,6 +616,7 @@ fn settings_selection_description(settings: &ResolvedSettings) -> String {
 
 enum SlashCommand {
     Model(Option<String>),
+    Compact,
     New,
     Resume,
     Name(Option<String>),
@@ -591,7 +635,9 @@ fn slash_command(input: &str) -> Option<SlashCommand> {
             .then_some(SlashCommand::Model(None))
             .or_else(|| Some(SlashCommand::Model(Some(argument.trim().to_owned()))));
     }
-    if input == "/new" {
+    if input == "/compact" {
+        Some(SlashCommand::Compact)
+    } else if input == "/new" {
         Some(SlashCommand::New)
     } else if input == "/resume" {
         Some(SlashCommand::Resume)
@@ -615,6 +661,13 @@ async fn handle_slash_command(
 ) -> Result<()> {
     match command {
         SlashCommand::Model(argument) => handle_model_command(state, setup, argument.as_deref()),
+        SlashCommand::Compact => {
+            state.set_compaction_active(true);
+            command_tx
+                .send(AgentCommand::Compact)
+                .await
+                .context("could not start compaction")?;
+        }
         SlashCommand::Session => state.add_system_message(session_diagnostic(setup)?),
         SlashCommand::Name(None) => state.add_system_message(session_diagnostic(setup)?),
         SlashCommand::Name(Some(name)) => {
@@ -638,6 +691,7 @@ async fn handle_slash_command(
             let handle = session.clone();
             setup.session = Some(session);
             setup.initial_history.clear();
+            setup.initial_transcript.clear();
             command_tx
                 .send(AgentCommand::NewSession { session: handle })
                 .await
@@ -676,7 +730,7 @@ async fn handle_slash_command(
                 })
                 .await
                 .context("could not resume the session")?;
-            state.replace_history(&setup.initial_history);
+            state.replace_history(&setup.initial_transcript);
             state.set_session_info(setup.session_info()?);
             state.add_system_message(setup.context.diagnostic());
         }
@@ -748,6 +802,7 @@ fn handle_model_command(state: &mut AppState, setup: &mut AppSetup, argument: Op
                 let name = selected.model_ref.display_name();
                 setup.selected = Some(selected.clone());
                 state.reduce(AgentEvent::ModelChanged(selected.model_ref));
+                state.reduce(AgentEvent::ContextLimitsUpdated(setup.provider.limits()));
                 state.add_system_message(format!("active model: {name}"));
             }
             Err(error) => state.add_system_message(error.to_string()),
@@ -954,6 +1009,10 @@ mod tests {
 
     #[test]
     fn recognizes_direct_and_cycling_model_commands() {
+        assert!(matches!(
+            slash_command("/compact"),
+            Some(SlashCommand::Compact)
+        ));
         assert_eq!(model_command("/model"), Some(None));
         assert_eq!(
             model_command("  /model custom/coding  "),

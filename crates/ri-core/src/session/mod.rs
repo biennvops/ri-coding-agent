@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::conversation::{CompactionSummary, ConversationHistory};
 use crate::model::{ModelAssistantItem, ModelMessage, ModelThinking, ModelToolCall};
 
 pub const SESSION_VERSION: u32 = 1;
@@ -337,6 +338,16 @@ pub enum SessionRecord {
     },
     #[serde(rename = "metadata")]
     Metadata { timestamp: String, name: String },
+    #[serde(rename = "compaction")]
+    Compaction {
+        id: MessageId,
+        #[serde(rename = "parentId")]
+        parent_id: Option<MessageId>,
+        timestamp: String,
+        summary: String,
+        #[serde(rename = "retainedMessageIds")]
+        retained_message_ids: Vec<MessageId>,
+    },
 }
 
 impl SessionRecord {
@@ -356,14 +367,16 @@ impl SessionRecord {
                 workspace_root: workspace_root.clone(),
                 project_root: project_root.clone(),
             }),
-            Self::Message { .. } | Self::Metadata { .. } => None,
+            Self::Message { .. } | Self::Metadata { .. } | Self::Compaction { .. } => None,
         }
     }
 
     fn timestamp(&self) -> Option<&str> {
         match self {
             Self::Session { created_at, .. } => Some(created_at),
-            Self::Message { timestamp, .. } | Self::Metadata { timestamp, .. } => Some(timestamp),
+            Self::Message { timestamp, .. }
+            | Self::Metadata { timestamp, .. }
+            | Self::Compaction { timestamp, .. } => Some(timestamp),
         }
     }
 }
@@ -482,8 +495,13 @@ fn io_error(path: impl Into<PathBuf>, source: io::Error) -> SessionError {
 #[derive(Clone, Debug)]
 pub struct SessionSnapshot {
     pub info: SessionInfo,
+    /// The active provider projection, including a generated summary when present.
     pub history: Vec<ModelMessage>,
+    /// Every persisted semantic message, including messages summarized out of `history`.
+    pub transcript: Vec<ModelMessage>,
+    pub active_summary: Option<CompactionSummary>,
     pub warnings: Vec<String>,
+    active_message_ids: Vec<MessageId>,
     truncate_at: Option<u64>,
     needs_newline: bool,
     last_message_id: Option<MessageId>,
@@ -523,6 +541,24 @@ impl SessionHandle {
             .lock()
             .map_err(|_| SessionError::WriterPoisoned)?
             .append_message(message)
+    }
+
+    pub fn append_compaction(
+        &self,
+        summary: &str,
+        retained_messages: &[ModelMessage],
+    ) -> Result<SessionInfo, SessionError> {
+        self.inner
+            .lock()
+            .map_err(|_| SessionError::WriterPoisoned)?
+            .append_compaction(summary, retained_messages)
+    }
+
+    pub fn transcript_history(&self) -> Result<Vec<ModelMessage>, SessionError> {
+        self.inner
+            .lock()
+            .map(|writer| writer.transcript.clone())
+            .map_err(|_| SessionError::WriterPoisoned)
     }
 
     pub fn rename(&self, name: &str) -> Result<SessionInfo, SessionError> {
@@ -567,12 +603,36 @@ impl SessionMode {
             Self::Enabled(handle) => handle.append_message(message).map(Some),
         }
     }
+
+    pub(crate) fn append_compaction(
+        &self,
+        summary: &str,
+        retained_messages: &[ModelMessage],
+    ) -> Result<Option<SessionInfo>, SessionError> {
+        match self {
+            Self::Disabled => Ok(None),
+            Self::Enabled(handle) => handle
+                .append_compaction(summary, retained_messages)
+                .map(Some),
+        }
+    }
+
+    pub(crate) fn transcript_history(&self) -> Result<Option<Vec<ModelMessage>>, SessionError> {
+        match self {
+            Self::Disabled => Ok(None),
+            Self::Enabled(handle) => handle.transcript_history().map(Some),
+        }
+    }
 }
 
 pub struct OpenedSession {
     pub handle: SessionHandle,
     pub info: SessionInfo,
+    /// The active provider projection, including a generated summary when present.
     pub history: Vec<ModelMessage>,
+    /// The full semantic transcript, independent of active provider compaction.
+    pub transcript: Vec<ModelMessage>,
+    pub active_summary: Option<CompactionSummary>,
     pub warnings: Vec<String>,
 }
 
@@ -581,6 +641,8 @@ struct SessionWriter {
     header: SessionHeader,
     file: Option<File>,
     head: Option<MessageId>,
+    active_messages: Vec<(MessageId, ModelMessage)>,
+    transcript: Vec<ModelMessage>,
 }
 
 impl SessionWriter {
@@ -623,6 +685,8 @@ impl SessionWriter {
                 header,
                 file: None,
                 head: None,
+                active_messages: Vec::new(),
+                transcript: Vec::new(),
             })),
         })
     }
@@ -673,6 +737,18 @@ impl SessionWriter {
         }
         let mut info = snapshot.info.clone();
         info.materialized = true;
+        let active_messages = snapshot
+            .active_message_ids
+            .iter()
+            .cloned()
+            .zip(
+                snapshot
+                    .history
+                    .iter()
+                    .filter(|message| !matches!(message, ModelMessage::Developer { .. }))
+                    .cloned(),
+            )
+            .collect();
         let writer = Self {
             info,
             header: SessionHeader {
@@ -685,6 +761,8 @@ impl SessionWriter {
             },
             file: Some(file),
             head: snapshot.last_message_id.clone(),
+            active_messages,
+            transcript: snapshot.transcript.clone(),
         };
         let handle = SessionHandle {
             inner: Arc::new(Mutex::new(writer)),
@@ -709,7 +787,10 @@ impl SessionWriter {
             &record,
             &self.info.path,
         )?;
-        self.head = Some(id);
+        self.head = Some(id.clone());
+        self.active_messages
+            .push((id, message.clone().into_model()));
+        self.transcript.push(message.clone().into_model());
         self.info.message_count += 1;
         self.info.updated_at = timestamp;
         if self.info.first_user_preview.is_none() {
@@ -717,6 +798,63 @@ impl SessionWriter {
                 self.info.first_user_preview = Some(preview(&content));
             }
         }
+        Ok(self.info.clone())
+    }
+
+    fn append_compaction(
+        &mut self,
+        summary: &str,
+        retained_messages: &[ModelMessage],
+    ) -> Result<SessionInfo, SessionError> {
+        let mut retained_ids = Vec::with_capacity(retained_messages.len());
+        let mut search_end = self.active_messages.len();
+        for retained in retained_messages.iter().rev() {
+            let Some(index) = self.active_messages[..search_end]
+                .iter()
+                .rposition(|(_, message)| message == retained)
+            else {
+                return Err(SessionError::InvalidRecord {
+                    path: self.info.path.clone(),
+                    message: "compaction retained message is not in the active session history"
+                        .to_owned(),
+                });
+            };
+            retained_ids.push(self.active_messages[index].0.clone());
+            search_end = index;
+        }
+        retained_ids.reverse();
+
+        self.materialize()?;
+        let id = MessageId::new();
+        let timestamp = now_timestamp();
+        let record = SessionRecord::Compaction {
+            id: id.clone(),
+            parent_id: self.head.clone(),
+            timestamp: timestamp.clone(),
+            summary: summary.to_owned(),
+            retained_message_ids: retained_ids,
+        };
+        append_record(
+            self.file.as_mut().expect("materialized session"),
+            &record,
+            &self.info.path,
+        )?;
+        self.head = Some(id);
+        self.active_messages = retained_messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                let retained_id = match &record {
+                    SessionRecord::Compaction {
+                        retained_message_ids,
+                        ..
+                    } => retained_message_ids[index].clone(),
+                    _ => unreachable!(),
+                };
+                (retained_id, message.clone())
+            })
+            .collect();
+        self.info.updated_at = timestamp;
         Ok(self.info.clone())
     }
 
@@ -918,6 +1056,7 @@ impl SessionRepository {
             fs::canonicalize(path.as_ref()).map_err(|source| io_error(path.as_ref(), source))?;
         let (handle, snapshot) = SessionWriter::open(path, &self.workspace_root)?;
         let mut history = snapshot.history.clone();
+        let mut transcript = snapshot.transcript.clone();
         let unresolved = unresolved_tool_calls(&history);
         for call in unresolved {
             let Some(call_id) = call.call_id.clone() else {
@@ -932,13 +1071,16 @@ impl SessionRepository {
                 content: SYNTHETIC_TOOL_RESULT.to_owned(),
             };
             handle.append_message(&message)?;
-            history.push(message);
+            history.push(message.clone());
+            transcript.push(message);
         }
         let info = handle.info()?;
         Ok(OpenedSession {
             handle,
             info,
             history,
+            transcript,
+            active_summary: snapshot.active_summary,
             warnings: snapshot.warnings,
         })
     }
@@ -993,10 +1135,12 @@ fn read_session_inner(path: &Path, include_history: bool) -> Result<SessionSnaps
     let mut pending_invalid: Option<(usize, u64, String)> = None;
     let mut header: Option<SessionHeader> = None;
     let mut messages = Vec::new();
+    let mut compactions = Vec::new();
     let mut message_count = 0usize;
     let mut first_user_preview_record = None;
     let mut last_message_id = None;
     let mut message_ids = HashSet::new();
+    let mut entry_ids = HashSet::new();
     let mut name = None;
     let mut updated_at = None;
 
@@ -1080,70 +1224,101 @@ fn read_session_inner(path: &Path, include_history: bool) -> Result<SessionSnaps
             });
         }
 
-        if let SessionRecord::Message {
-            id,
-            parent_id,
-            timestamp,
-            message,
-        } = &record
-        {
-            if message_ids.contains(id) {
-                return Err(SessionError::Corrupted {
-                    path: path.to_path_buf(),
-                    line: line_number,
-                    message: format!("duplicate message id {id}"),
-                });
-            }
-            if message_count == 0 {
-                if parent_id.is_some() {
-                    return Err(SessionError::InvalidParent {
+        match &record {
+            SessionRecord::Message {
+                id,
+                parent_id,
+                timestamp,
+                message,
+            } => {
+                if entry_ids.contains(id) {
+                    return Err(SessionError::Corrupted {
+                        path: path.to_path_buf(),
                         line: line_number,
-                        message: "the first message must have parentId null".to_owned(),
+                        message: format!("duplicate session record id {id}"),
                     });
                 }
-            } else if let Some(parent_id) = parent_id {
-                if !message_ids.contains(parent_id) {
-                    return Err(SessionError::InvalidParent {
-                        line: line_number,
-                        message: format!("parent message {parent_id} does not precede this record"),
+                validate_parent(
+                    parent_id.as_ref(),
+                    entry_ids.is_empty(),
+                    &entry_ids,
+                    line_number,
+                )?;
+                entry_ids.insert(id.clone());
+                message_ids.insert(id.clone());
+                message_count += 1;
+                last_message_id = Some(id.clone());
+                if first_user_preview_record.is_none() {
+                    if let SessionMessage::User { content } = message {
+                        first_user_preview_record = Some(preview(content));
+                    }
+                }
+                if include_history {
+                    messages.push(StoredMessage {
+                        id: id.clone(),
+                        message: message.clone(),
+                        sequence: line_number,
                     });
                 }
-            } else {
-                return Err(SessionError::InvalidParent {
-                    line: line_number,
-                    message: "a later message must have a parentId".to_owned(),
-                });
+                updated_at = Some(timestamp.clone());
             }
-            message_ids.insert(id.clone());
-            message_count += 1;
-            last_message_id = Some(id.clone());
-            if first_user_preview_record.is_none() {
-                if let SessionMessage::User { content } = message {
-                    first_user_preview_record = Some(preview(content));
+            SessionRecord::Compaction {
+                id,
+                parent_id,
+                timestamp,
+                summary,
+                retained_message_ids,
+            } => {
+                if entry_ids.is_empty() || parent_id.is_none() {
+                    return Err(SessionError::InvalidParent {
+                        line: line_number,
+                        message: "a compaction checkpoint must follow a session record".to_owned(),
+                    });
                 }
+                validate_parent(parent_id.as_ref(), false, &entry_ids, line_number)?;
+                if entry_ids.contains(id) {
+                    return Err(SessionError::Corrupted {
+                        path: path.to_path_buf(),
+                        line: line_number,
+                        message: format!("duplicate session record id {id}"),
+                    });
+                }
+                let mut retained = HashSet::new();
+                for retained_id in retained_message_ids {
+                    if !message_ids.contains(retained_id) || !retained.insert(retained_id) {
+                        return Err(SessionError::InvalidRecord {
+                            path: path.to_path_buf(),
+                            message: format!(
+                                "compaction retained unknown or duplicate message {retained_id}"
+                            ),
+                        });
+                    }
+                }
+                entry_ids.insert(id.clone());
+                last_message_id = Some(id.clone());
+                if include_history {
+                    compactions.push(StoredCompaction {
+                        summary: summary.clone(),
+                        retained_message_ids: retained_message_ids.clone(),
+                        sequence: line_number,
+                    });
+                }
+                updated_at = Some(timestamp.clone());
             }
-            if include_history {
-                messages.push(StoredMessage {
-                    id: id.clone(),
-                    parent_id: parent_id.clone(),
-                    message: message.clone(),
-                });
+            SessionRecord::Metadata {
+                timestamp,
+                name: value,
+            } => {
+                let normalized_name =
+                    validate_name(value).map_err(|error| SessionError::Corrupted {
+                        path: path.to_path_buf(),
+                        line: line_number,
+                        message: error.to_string(),
+                    })?;
+                name = Some(normalized_name);
+                updated_at = Some(timestamp.clone());
             }
-            updated_at = Some(timestamp.clone());
-        }
-        if let SessionRecord::Metadata {
-            timestamp,
-            name: value,
-        } = &record
-        {
-            let normalized_name =
-                validate_name(value).map_err(|error| SessionError::Corrupted {
-                    path: path.to_path_buf(),
-                    line: line_number,
-                    message: error.to_string(),
-                })?;
-            name = Some(normalized_name);
-            updated_at = Some(timestamp.clone());
+            SessionRecord::Session { .. } => {}
         }
         if let Some(timestamp) = record.timestamp() {
             if updated_at.is_none() {
@@ -1173,18 +1348,10 @@ fn read_session_inner(path: &Path, include_history: bool) -> Result<SessionSnaps
             path: path.to_path_buf(),
         });
     };
-    let history = if include_history {
-        active_history(&messages)?
+    let (history, transcript, active_summary, active_message_ids) = if include_history {
+        active_projection(&messages, &compactions)
     } else {
-        Vec::new()
-    };
-    let first_user_preview = if include_history {
-        history.iter().find_map(|message| match message {
-            ModelMessage::User { content } => Some(preview(content)),
-            _ => None,
-        })
-    } else {
-        first_user_preview_record
+        (Vec::new(), Vec::new(), None, Vec::new())
     };
     let info = SessionInfo {
         id: header.id.clone(),
@@ -1195,13 +1362,16 @@ fn read_session_inner(path: &Path, include_history: bool) -> Result<SessionSnaps
         workspace_root: header.workspace_root.clone(),
         project_root: header.project_root.clone(),
         message_count,
-        first_user_preview,
+        first_user_preview: first_user_preview_record,
         materialized: true,
     };
     Ok(SessionSnapshot {
         info,
         history,
+        transcript,
+        active_summary,
         warnings,
+        active_message_ids,
         truncate_at,
         needs_newline,
         last_message_id,
@@ -1211,36 +1381,79 @@ fn read_session_inner(path: &Path, include_history: bool) -> Result<SessionSnaps
 #[derive(Clone)]
 struct StoredMessage {
     id: MessageId,
-    parent_id: Option<MessageId>,
     message: SessionMessage,
+    sequence: usize,
 }
 
-fn active_history(messages: &[StoredMessage]) -> Result<Vec<ModelMessage>, SessionError> {
-    let Some(last) = messages.last() else {
-        return Ok(Vec::new());
-    };
-    let by_id: HashMap<&MessageId, &StoredMessage> = messages
-        .iter()
-        .map(|message| (&message.id, message))
-        .collect();
-    let mut chain = Vec::new();
-    let mut current = Some(last);
-    let mut seen = HashSet::new();
-    while let Some(message) = current {
-        if !seen.insert(message.id.clone()) {
-            return Err(SessionError::InvalidRecord {
-                path: PathBuf::from("session"),
-                message: "message parent chain contains a cycle".to_owned(),
+#[derive(Clone)]
+struct StoredCompaction {
+    summary: String,
+    retained_message_ids: Vec<MessageId>,
+    sequence: usize,
+}
+
+fn validate_parent(
+    parent_id: Option<&MessageId>,
+    first: bool,
+    known_ids: &HashSet<MessageId>,
+    line: usize,
+) -> Result<(), SessionError> {
+    if first {
+        if parent_id.is_some() {
+            return Err(SessionError::InvalidParent {
+                line,
+                message: "the first history record must have parentId null".to_owned(),
             });
         }
-        chain.push(message.message.clone().into_model());
-        current = message
-            .parent_id
-            .as_ref()
-            .and_then(|parent| by_id.get(parent).copied());
+    } else if let Some(parent_id) = parent_id {
+        if !known_ids.contains(parent_id) {
+            return Err(SessionError::InvalidParent {
+                line,
+                message: format!("parent record {parent_id} does not precede this record"),
+            });
+        }
+    } else {
+        return Err(SessionError::InvalidParent {
+            line,
+            message: "a later history record must have a parentId".to_owned(),
+        });
     }
-    chain.reverse();
-    Ok(chain)
+    Ok(())
+}
+
+fn active_projection(
+    messages: &[StoredMessage],
+    compactions: &[StoredCompaction],
+) -> (
+    Vec<ModelMessage>,
+    Vec<ModelMessage>,
+    Option<CompactionSummary>,
+    Vec<MessageId>,
+) {
+    let transcript: Vec<ModelMessage> = messages
+        .iter()
+        .map(|message| message.message.clone().into_model())
+        .collect();
+    let Some(compaction) = compactions.last() else {
+        let ids = messages.iter().map(|message| message.id.clone()).collect();
+        return (transcript.clone(), transcript, None, ids);
+    };
+
+    let retained: HashSet<&MessageId> = compaction.retained_message_ids.iter().collect();
+    let mut active_messages = Vec::new();
+    let mut active_ids = Vec::new();
+    for message in messages {
+        if (message.sequence < compaction.sequence && retained.contains(&message.id))
+            || message.sequence > compaction.sequence
+        {
+            active_ids.push(message.id.clone());
+            active_messages.push(message.message.clone().into_model());
+        }
+    }
+    let summary = CompactionSummary::new(compaction.summary.clone());
+    let history =
+        ConversationHistory::new(Some(summary.clone()), active_messages).provider_messages();
+    (history, transcript, Some(summary), active_ids)
 }
 
 fn unresolved_tool_calls(history: &[ModelMessage]) -> Vec<ModelToolCall> {
@@ -1787,6 +2000,104 @@ mod tests {
     }
 
     #[test]
+    fn compaction_checkpoint_preserves_full_transcript_and_active_projection() {
+        let root = test_dir("compaction");
+        fs::create_dir_all(&root).unwrap();
+        let repository = SessionRepository::new(root.join("sessions"), &root, &root).unwrap();
+        let handle = repository.create().unwrap();
+        let old_messages = vec![
+            ModelMessage::user("old request"),
+            ModelMessage::Assistant {
+                items: vec![ModelAssistantItem::Text {
+                    content: "old answer".to_owned(),
+                }],
+            },
+            ModelMessage::user("recent request"),
+            ModelMessage::Assistant {
+                items: vec![ModelAssistantItem::Text {
+                    content: "recent answer".to_owned(),
+                }],
+            },
+        ];
+        for message in &old_messages {
+            handle.append_message(message).unwrap();
+        }
+        let retained = old_messages[2..].to_vec();
+        handle
+            .append_compaction("remember the old work", &retained)
+            .unwrap();
+        let new_request = ModelMessage::user("new request");
+        handle.append_message(&new_request).unwrap();
+        handle
+            .append_compaction(
+                "remember the newest work",
+                &[
+                    old_messages[2].clone(),
+                    old_messages[3].clone(),
+                    new_request,
+                ],
+            )
+            .unwrap();
+        let path = handle.info().unwrap().path;
+        drop(handle);
+
+        let snapshot = read_session(&path).unwrap();
+        assert_eq!(
+            snapshot.transcript,
+            [
+                old_messages.clone(),
+                vec![ModelMessage::user("new request")]
+            ]
+            .concat()
+        );
+        assert_eq!(
+            snapshot.active_summary,
+            Some(CompactionSummary::new("remember the newest work"))
+        );
+        assert!(matches!(
+            snapshot.history.first(),
+            Some(ModelMessage::Developer { content }) if content.contains("remember the newest work")
+        ));
+        assert!(snapshot
+            .history
+            .contains(&ModelMessage::user("recent request")));
+        assert!(snapshot
+            .history
+            .contains(&ModelMessage::user("new request")));
+        assert!(!snapshot
+            .history
+            .contains(&ModelMessage::user("old request")));
+
+        let opened = repository.open_path(&path).unwrap();
+        assert_eq!(opened.transcript.len(), 5);
+        assert_eq!(opened.history.len(), 4);
+        assert!(opened.history.iter().any(|message| {
+            matches!(message, ModelMessage::Developer { content } if content.contains("remember the newest work"))
+        }));
+        let raw = fs::read_to_string(&path).unwrap();
+        let records: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record["type"] == "compaction")
+                .count(),
+            2
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record["type"] == "message")
+                .count(),
+            5
+        );
+        drop(opened);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn names_are_validated_and_metadata_is_append_only() {
         let root = test_dir("name");
         fs::create_dir_all(&root).unwrap();
@@ -1804,8 +2115,12 @@ mod tests {
 
     fn test_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "ri-session-{name}-{}-{}",
+            "ri-session-{name}-{}-{}-{}",
             std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
             ID_COUNTER.fetch_add(1, Ordering::Relaxed)
         ))
     }

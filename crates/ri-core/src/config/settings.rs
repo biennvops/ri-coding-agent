@@ -15,6 +15,7 @@ pub struct ResolvedSettings {
     pub default_provider: Option<String>,
     pub default_model: Option<String>,
     pub context: ContextSettings,
+    pub compaction: CompactionSettings,
 }
 
 pub type Settings = ResolvedSettings;
@@ -25,6 +26,17 @@ pub struct ContextSettings {
 }
 
 impl Default for ContextSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactionSettings {
+    pub enabled: bool,
+}
+
+impl Default for CompactionSettings {
     fn default() -> Self {
         Self { enabled: true }
     }
@@ -123,6 +135,12 @@ fn apply_raw_settings(
             message: "unknown field".to_owned(),
         });
     }
+    for key in raw.compaction.extra.keys() {
+        load.warnings.push(ConfigWarning {
+            path: format!("settings.compaction.{key}"),
+            message: "unknown field".to_owned(),
+        });
+    }
 
     let default_provider = optional_string(
         raw.default_provider,
@@ -139,6 +157,11 @@ fn apply_raw_settings(
         &format_path(source_path, "context.enabled"),
         "context.enabled",
     )?;
+    let compaction_enabled = optional_bool(
+        raw.compaction.enabled,
+        &format_path(source_path, "compaction.enabled"),
+        "compaction.enabled",
+    )?;
 
     if default_provider.is_some() {
         load.settings.default_provider = default_provider;
@@ -148,6 +171,9 @@ fn apply_raw_settings(
     }
     if let Some(enabled) = context_enabled {
         load.settings.context.enabled = enabled;
+    }
+    if let Some(enabled) = compaction_enabled {
+        load.settings.compaction.enabled = enabled;
     }
     Ok(())
 }
@@ -209,6 +235,8 @@ struct RawSettings {
     default_model: RawField<String>,
     #[serde(default)]
     context: RawContextSettings,
+    #[serde(default)]
+    compaction: RawCompactionSettings,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
 }
@@ -238,6 +266,14 @@ where
 
 #[derive(Debug, Deserialize, Default)]
 struct RawContextSettings {
+    #[serde(default)]
+    enabled: RawField<bool>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawCompactionSettings {
     #[serde(default)]
     enabled: RawField<bool>,
     #[serde(flatten)]
@@ -291,6 +327,21 @@ mod tests {
         assert_eq!(load.settings.default_provider.as_deref(), Some("remote"));
         assert_eq!(load.settings.default_model.as_deref(), Some("coding"));
         assert!(!load.settings.context.enabled);
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn compaction_setting_merges_with_project_precedence() {
+        let root = unique_test_dir("settings-compaction");
+        fs::create_dir_all(&root).unwrap();
+        let global = root.join("global.json");
+        let project = root.join("project.json");
+        fs::write(&global, r#"{"compaction":{"enabled":false}}"#).unwrap();
+        fs::write(&project, r#"{"compaction":{"enabled":true}}"#).unwrap();
+
+        let load = load_settings_from_paths(Some(&global), Some(&project)).unwrap();
+
+        assert!(load.settings.compaction.enabled);
         remove_test_dir(root);
     }
 

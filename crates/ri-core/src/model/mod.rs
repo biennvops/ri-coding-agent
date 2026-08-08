@@ -13,6 +13,12 @@ pub mod openai;
 
 pub use openai::{OpenAiProvider, SseParser};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ModelLimits {
+    pub context_window: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+}
+
 #[derive(Clone)]
 pub enum ConfiguredProvider {
     Mock(MockProvider),
@@ -46,6 +52,13 @@ impl ConfiguredProvider {
             Self::OpenAi(provider) => provider.current_model().model_ref,
         }
     }
+
+    pub fn limits(&self) -> ModelLimits {
+        match self {
+            Self::Mock(_) => ModelLimits::default(),
+            Self::OpenAi(provider) => provider.limits(),
+        }
+    }
 }
 
 #[async_trait]
@@ -60,6 +73,10 @@ impl ModelProvider for ConfiguredProvider {
             Self::Mock(provider) => provider.stream(request, events, cancel).await,
             Self::OpenAi(provider) => provider.stream(request, events, cancel).await,
         }
+    }
+
+    fn limits(&self) -> ModelLimits {
+        ConfiguredProvider::limits(self)
     }
 }
 
@@ -246,6 +263,10 @@ pub trait ModelProvider: Send + Sync + 'static {
         events: mpsc::Sender<ModelEvent>,
         cancel: CancellationToken,
     ) -> Result<ModelResponse, ProviderError>;
+
+    fn limits(&self) -> ModelLimits {
+        ModelLimits::default()
+    }
 }
 
 #[derive(Clone, Debug)]

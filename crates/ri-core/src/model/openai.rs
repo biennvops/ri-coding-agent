@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{ApiKind, ResolvedModel};
 
 use super::{
-    ModelAssistantItem, ModelEvent, ModelMessage, ModelProvider, ModelRequest, ModelResponse,
-    ModelThinking, ModelToolCall, ProviderError, StopReason, ToolDefinition, Usage,
+    ModelAssistantItem, ModelEvent, ModelLimits, ModelMessage, ModelProvider, ModelRequest,
+    ModelResponse, ModelThinking, ModelToolCall, ProviderError, StopReason, ToolDefinition, Usage,
 };
 
 #[derive(Clone)]
@@ -51,10 +51,22 @@ impl OpenAiProvider {
             .write()
             .expect("selected model lock should not be poisoned") = model;
     }
+
+    pub fn limits(&self) -> ModelLimits {
+        let model = self.current_model();
+        ModelLimits {
+            context_window: model.context_window,
+            max_output_tokens: model.max_tokens,
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl ModelProvider for OpenAiProvider {
+    fn limits(&self) -> ModelLimits {
+        OpenAiProvider::limits(self)
+    }
+
     async fn stream(
         &self,
         request: ModelRequest,
@@ -1977,6 +1989,33 @@ mod tests {
         assert_eq!(endpoint, "https://example.test/v1/chat/completions");
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["max_tokens"], 123);
+    }
+
+    #[test]
+    fn provider_limits_follow_the_currently_selected_model() {
+        let mut first = test_model(ApiKind::OpenAiResponses, "https://example.test".to_owned());
+        first.context_window = Some(200_000);
+        first.max_tokens = Some(32_000);
+        let mut second = first.clone();
+        second.context_window = Some(32_000);
+        second.max_tokens = None;
+        let provider = OpenAiProvider::with_client(first, Client::new());
+
+        assert_eq!(
+            ModelProvider::limits(&provider),
+            ModelLimits {
+                context_window: Some(200_000),
+                max_output_tokens: Some(32_000),
+            }
+        );
+        provider.set_model(second);
+        assert_eq!(
+            ModelProvider::limits(&provider),
+            ModelLimits {
+                context_window: Some(32_000),
+                max_output_tokens: None,
+            }
+        );
     }
 
     fn test_model(api: ApiKind, base_url: String) -> ResolvedModel {

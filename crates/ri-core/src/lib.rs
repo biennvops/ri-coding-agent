@@ -2,6 +2,7 @@ pub mod agent;
 pub mod app;
 pub mod config;
 pub mod context;
+pub mod conversation;
 pub mod model;
 pub mod session;
 pub mod tools;
@@ -14,13 +15,20 @@ pub use app::{
     AppState, MessageRole, ToolStatus, ToolTranscriptEntry, TranscriptEntry, TranscriptMessage,
 };
 pub use config::{
-    ApiKind, Compatibility, ConfigError, ConfigWarning, ContextSettings, CostMetadata,
-    ModelCatalog, ModelRef, ResolvedModel, ResolvedSettings, Settings, SettingsError, SettingsLoad,
+    ApiKind, CompactionSettings, Compatibility, ConfigError, ConfigWarning, ContextSettings,
+    CostMetadata, ModelCatalog, ModelRef, ResolvedModel, ResolvedSettings, Settings, SettingsError,
+    SettingsLoad,
 };
+pub use context::{
+    automatic_trigger, compaction_target, input_budget, ConservativeTokenEstimator, ContextUsage,
+    GenericTokenEstimator, TokenEstimator, UsageSource, AUTO_COMPACTION_TARGET_PERCENT,
+    AUTO_COMPACTION_TRIGGER_PERCENT, COMPACTION_MAX_OUTPUT_TOKENS, DEFAULT_RESERVED_OUTPUT_TOKENS,
+};
+pub use conversation::{segment_history, CompactionSummary, ConversationHistory, HistorySegment};
 pub use model::{
-    ConfiguredProvider, MockProvider, ModelAssistantItem, ModelEvent, ModelMessage, ModelProvider,
-    ModelRequest, ModelResponse, ModelThinking, ModelToolCall, ProviderError, StopReason,
-    ToolDefinition, Usage,
+    ConfiguredProvider, MockProvider, ModelAssistantItem, ModelEvent, ModelLimits, ModelMessage,
+    ModelProvider, ModelRequest, ModelResponse, ModelThinking, ModelToolCall, ProviderError,
+    StopReason, ToolDefinition, Usage,
 };
 pub use session::{
     read_session, validate_name, workspace_id, MessageId, OpenedSession, SessionAssistantItem,
