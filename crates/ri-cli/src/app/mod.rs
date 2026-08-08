@@ -4,8 +4,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures_util::StreamExt;
 use ri_core::{
-    config::load_default_models, AgentCommand, AgentEvent, AgentRuntime, AppState,
-    ConfiguredProvider, ModelCatalog, ModelRef, ResolvedModel, StopReason,
+    config::{load_default_models, load_default_settings},
+    context::{build_system_prompt, discover_project, load_context, ContextBundle},
+    AgentCommand, AgentEvent, AgentRuntime, AgentRuntimeConfig, AppState, ConfiguredProvider,
+    ModelCatalog, ModelMessage, ModelRef, ResolvedModel, ResolvedSettings, StopReason, ToolContext,
 };
 use tokio::sync::mpsc;
 
@@ -21,6 +23,7 @@ pub struct Options {
     pub print_prompt: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub no_context: bool,
     pub show_help: bool,
 }
 
@@ -38,7 +41,15 @@ impl Options {
                     let prompt = args
                         .next()
                         .ok_or_else(|| anyhow!("{argument} requires a prompt"))?;
-                    options.print_prompt = Some(prompt);
+                    if prompt == "--no-context" {
+                        options.no_context = true;
+                        options.print_prompt = Some(
+                            args.next()
+                                .ok_or_else(|| anyhow!("{argument} requires a prompt"))?,
+                        );
+                    } else {
+                        options.print_prompt = Some(prompt);
+                    }
                 }
                 "--provider" => {
                     options.provider = Some(
@@ -52,6 +63,7 @@ impl Options {
                             .ok_or_else(|| anyhow!("--model requires a model id"))?,
                     );
                 }
+                "--no-context" => options.no_context = true,
                 "-h" | "--help" => options.show_help = true,
                 unknown => bail!("unknown argument: {unknown}"),
             }
@@ -63,13 +75,13 @@ impl Options {
     pub fn print_help() {
         println!(
             "ri — a small Rust coding agent\n\n\
-             Usage:\n  ri                              start the interactive TUI\n  ri -p <prompt>                  run one prompt without the TUI\n  ri --provider <id> --model <id> select a configured model\n  ri --help                       show this help"
+             Usage:\n  ri                              start the interactive TUI\n  ri -p <prompt>                  run one prompt without the TUI\n  ri --provider <id> --model <id> select a configured model\n  ri --no-context                 disable AGENTS context loading\n  ri --help                       show this help"
         );
     }
 }
 
 pub async fn run(options: Options) -> Result<()> {
-    let setup = ModelSetup::load(&options)?;
+    let setup = AppSetup::load(&options)?;
     if let Some(prompt) = options.print_prompt {
         run_print(prompt, setup).await
     } else {
@@ -77,39 +89,68 @@ pub async fn run(options: Options) -> Result<()> {
     }
 }
 
-struct ModelSetup {
+struct AppSetup {
     provider: ConfiguredProvider,
     catalog: Option<ModelCatalog>,
     selected: Option<ResolvedModel>,
+    tool_context: ToolContext,
+    context: ContextBundle,
+    system_prompt: String,
 }
 
-impl ModelSetup {
+impl AppSetup {
     fn load(options: &Options) -> Result<Self> {
+        let launch_cwd = std::env::current_dir().context("could not determine launch cwd")?;
+        let project = discover_project(&launch_cwd).context("could not discover project root")?;
+        let settings =
+            load_default_settings(&project.project_root).context("could not load settings.json")?;
+        for warning in &settings.warnings {
+            eprintln!("ri: warning: {}: {}", warning.path, warning.message);
+        }
+
+        let (requested_provider, requested_model) = model_selection(options, &settings.settings);
         let catalog = load_default_models().context("could not load models.json")?;
-        if let Some(catalog) = catalog {
+        let (provider, catalog, selected) = if let Some(catalog) = catalog {
             for warning in catalog.warnings() {
                 eprintln!("ri: warning: {}: {}", warning.path, warning.message);
             }
             let selected = catalog
-                .resolve(options.provider.as_deref(), options.model.as_deref())
+                .resolve(requested_provider, requested_model)
                 .context("could not select configured model")?;
             let provider = ConfiguredProvider::openai(selected.clone())
                 .map_err(|error| anyhow!(error.to_string()))?;
-            return Ok(Self {
-                provider,
-                catalog: Some(catalog),
-                selected: Some(selected),
-            });
-        }
-
-        if options.provider.is_some() || options.model.is_some() {
+            (provider, Some(catalog), Some(selected))
+        } else if requested_provider.is_some() || requested_model.is_some() {
+            if settings.settings.default_provider.is_some()
+                || settings.settings.default_model.is_some()
+            {
+                bail!(
+                    "settings select {}, but no models.json is available; create ~/.ri/agent/models.json or set RI_MODELS_FILE",
+                    settings_selection_description(&settings.settings)
+                );
+            }
             bail!("no models.json found; create ~/.ri/agent/models.json or set RI_MODELS_FILE");
-        }
+        } else {
+            (ConfiguredProvider::mock(), None, None)
+        };
+
+        let context = if settings.settings.context.enabled && !options.no_context {
+            load_context(&project.launch_cwd, &project.project_root)
+                .context("could not load AGENTS context")?
+        } else {
+            ContextBundle::disabled(project.launch_cwd.clone(), project.project_root.clone())
+        };
+        let system_prompt = build_system_prompt(&context);
+        let tool_context =
+            ToolContext::new(&project.launch_cwd).map_err(|error| anyhow!(error.to_string()))?;
 
         Ok(Self {
-            provider: ConfiguredProvider::mock(),
-            catalog: None,
-            selected: None,
+            provider,
+            catalog,
+            selected,
+            tool_context,
+            context,
+            system_prompt,
         })
     }
 
@@ -119,12 +160,22 @@ impl ModelSetup {
             .map(|model| model.model_ref.clone())
             .unwrap_or_else(|| self.provider.model_ref())
     }
+
+    fn runtime_config(&self) -> AgentRuntimeConfig {
+        AgentRuntimeConfig {
+            tool_context: self.tool_context.clone(),
+            base_messages: vec![ModelMessage::System {
+                content: self.system_prompt.clone(),
+            }],
+        }
+    }
 }
 
-async fn run_print(prompt: String, setup: ModelSetup) -> Result<()> {
+async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
+    eprintln!("{}", setup.context.diagnostic());
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (event_tx, mut event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-    let runtime = AgentRuntime::new(setup.provider.clone());
+    let runtime = AgentRuntime::with_config(setup.provider.clone(), setup.runtime_config());
     let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
 
     command_tx
@@ -198,14 +249,15 @@ async fn run_print(prompt: String, setup: ModelSetup) -> Result<()> {
     Ok(())
 }
 
-async fn run_tui(mut setup: ModelSetup) -> Result<()> {
+async fn run_tui(mut setup: AppSetup) -> Result<()> {
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (event_tx, mut event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-    let runtime = AgentRuntime::new(setup.provider.clone());
+    let runtime = AgentRuntime::with_config(setup.provider.clone(), setup.runtime_config());
     let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
 
     let mut terminal = TerminalGuard::new().context("could not initialize terminal")?;
     let mut state = AppState::new();
+    state.add_system_message(setup.context.diagnostic());
     state.reduce(AgentEvent::ModelChanged(setup.model_ref()));
     let tui_result = run_tui_loop(
         &mut terminal,
@@ -233,7 +285,7 @@ async fn run_tui_loop(
     state: &mut AppState,
     command_tx: &mpsc::Sender<AgentCommand>,
     event_rx: &mut mpsc::Receiver<AgentEvent>,
-    setup: &mut ModelSetup,
+    setup: &mut AppSetup,
 ) -> Result<()> {
     let mut dirty = true;
     let mut scroll_from_bottom = 0usize;
@@ -348,6 +400,43 @@ async fn run_tui_loop(
     Ok(())
 }
 
+fn model_selection<'a>(
+    options: &'a Options,
+    settings: &'a ResolvedSettings,
+) -> (Option<&'a str>, Option<&'a str>) {
+    let model = options
+        .model
+        .as_deref()
+        .or(settings.default_model.as_deref());
+    let provider = if let Some(provider) = options.provider.as_deref() {
+        Some(provider)
+    } else if options
+        .model
+        .as_deref()
+        .is_some_and(|model| model.contains('/'))
+    {
+        // An explicitly qualified CLI model overrides an inherited provider.
+        None
+    } else {
+        settings.default_provider.as_deref()
+    };
+    (provider, model)
+}
+
+fn settings_selection_description(settings: &ResolvedSettings) -> String {
+    match (
+        settings.default_provider.as_deref(),
+        settings.default_model.as_deref(),
+    ) {
+        (Some(provider), Some(model)) => {
+            format!("provider {provider:?} and model {model:?}")
+        }
+        (Some(provider), None) => format!("provider {provider:?}"),
+        (None, Some(model)) => format!("model {model:?}"),
+        (None, None) => "a configured model".to_owned(),
+    }
+}
+
 fn model_command(input: &str) -> Option<Option<String>> {
     let input = input.trim();
     if input == "/model" {
@@ -361,7 +450,7 @@ fn model_command(input: &str) -> Option<Option<String>> {
     }
 }
 
-fn handle_model_command(state: &mut AppState, setup: &mut ModelSetup, argument: Option<&str>) {
+fn handle_model_command(state: &mut AppState, setup: &mut AppSetup, argument: Option<&str>) {
     let Some(catalog) = setup.catalog.as_ref() else {
         state.add_system_message(
             "No configured models are available. Create ~/.ri/agent/models.json first.",
@@ -433,8 +522,134 @@ mod tests {
                 print_prompt: Some("hello".to_owned()),
                 provider: Some("custom".to_owned()),
                 model: Some("coding".to_owned()),
+                no_context: false,
                 show_help: false,
             }
+        );
+    }
+
+    #[test]
+    fn parses_no_context_before_print_prompt() {
+        let options = Options::parse([
+            "-p".to_owned(),
+            "--no-context".to_owned(),
+            "hello".to_owned(),
+        ])
+        .unwrap();
+
+        assert_eq!(options.print_prompt.as_deref(), Some("hello"));
+        assert!(options.no_context);
+    }
+
+    #[test]
+    fn settings_defaults_feed_model_catalog_and_cli_overrides_win() {
+        let settings = ResolvedSettings {
+            default_provider: Some("provider-a".to_owned()),
+            default_model: Some("model-a".to_owned()),
+            ..ResolvedSettings::default()
+        };
+        let options = Options::default();
+        let (provider, model) = model_selection(&options, &settings);
+        let catalog = ModelCatalog::from_json(
+            "models.json",
+            r#"{
+                "providers": {
+                    "provider-a": {
+                        "baseUrl": "https://example.test",
+                        "api": "openai-responses",
+                        "models": [{"id": "model-a"}]
+                    },
+                    "provider-b": {
+                        "baseUrl": "https://example.test",
+                        "api": "openai-responses",
+                        "models": [{"id": "model-b"}]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            catalog
+                .resolve(provider, model)
+                .unwrap()
+                .model_ref
+                .display_name(),
+            "provider-a/model-a"
+        );
+
+        let options = Options {
+            provider: Some("provider-b".to_owned()),
+            model: Some("model-b".to_owned()),
+            ..Options::default()
+        };
+        let (provider, model) = model_selection(&options, &settings);
+        assert_eq!(
+            catalog
+                .resolve(provider, model)
+                .unwrap()
+                .model_ref
+                .display_name(),
+            "provider-b/model-b"
+        );
+    }
+
+    #[test]
+    fn settings_provider_preserves_slash_containing_model_id() {
+        let settings = ResolvedSettings {
+            default_provider: Some("openrouter".to_owned()),
+            default_model: Some("anthropic/claude-sonnet-4".to_owned()),
+            ..ResolvedSettings::default()
+        };
+        let catalog = ModelCatalog::from_json(
+            "models.json",
+            r#"{
+                "providers": {
+                    "openrouter": {
+                        "baseUrl": "https://example.test",
+                        "api": "openai-responses",
+                        "models": [{"id": "anthropic/claude-sonnet-4"}]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let options = Options::default();
+        let (provider, model) = model_selection(&options, &settings);
+        let selected = catalog.resolve(provider, model).unwrap();
+
+        assert_eq!(selected.model_ref.provider, "openrouter");
+        assert_eq!(selected.model_ref.model, "anthropic/claude-sonnet-4");
+    }
+
+    #[test]
+    fn qualified_cli_model_can_override_a_settings_provider() {
+        let settings = ResolvedSettings {
+            default_provider: Some("provider-a".to_owned()),
+            ..ResolvedSettings::default()
+        };
+        let options = Options {
+            model: Some("provider-b/model-b".to_owned()),
+            ..Options::default()
+        };
+
+        assert_eq!(
+            model_selection(&options, &settings),
+            (None, Some("provider-b/model-b"))
+        );
+    }
+
+    #[test]
+    fn settings_selection_diagnostic_includes_requested_values() {
+        let settings = ResolvedSettings {
+            default_provider: Some("foo".to_owned()),
+            default_model: Some("coding".to_owned()),
+            ..ResolvedSettings::default()
+        };
+
+        assert_eq!(
+            settings_selection_description(&settings),
+            "provider \"foo\" and model \"coding\""
         );
     }
 

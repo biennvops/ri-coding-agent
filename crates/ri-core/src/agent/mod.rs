@@ -109,6 +109,21 @@ pub enum AgentEvent {
     Error(AgentError),
 }
 
+#[derive(Clone, Debug)]
+pub struct AgentRuntimeConfig {
+    pub tool_context: ToolContext,
+    pub base_messages: Vec<ModelMessage>,
+}
+
+impl AgentRuntimeConfig {
+    pub fn new(tool_context: ToolContext) -> Self {
+        Self {
+            tool_context,
+            base_messages: Vec::new(),
+        }
+    }
+}
+
 struct ActiveTurn {
     cancel: CancellationToken,
     task: JoinHandle<TurnOutcome>,
@@ -123,6 +138,7 @@ pub struct AgentRuntime<P> {
     provider: Arc<P>,
     registry: Arc<ToolRegistry>,
     context: ToolContext,
+    base_messages: Vec<ModelMessage>,
     history: Vec<ModelMessage>,
 }
 
@@ -138,10 +154,15 @@ where
     }
 
     pub fn with_context(provider: P, context: ToolContext) -> Self {
+        Self::with_config(provider, AgentRuntimeConfig::new(context))
+    }
+
+    pub fn with_config(provider: P, config: AgentRuntimeConfig) -> Self {
         Self {
             provider: Arc::new(provider),
             registry: Arc::new(ToolRegistry::new()),
-            context,
+            context: config.tool_context,
+            base_messages: config.base_messages,
             history: Vec::new(),
         }
     }
@@ -228,7 +249,10 @@ where
                         let cancel = CancellationToken::new();
                         let provider = Arc::clone(&self.provider);
                         let registry = Arc::clone(&self.registry);
-                        let context = self.context.clone();
+                        let turn_config = AgentRuntimeConfig {
+                            tool_context: self.context.clone(),
+                            base_messages: self.base_messages.clone(),
+                        };
                         let history = self.history.clone();
                         let turn_events = events.clone();
                         let turn_cancel = cancel.clone();
@@ -236,7 +260,7 @@ where
                             run_turn(
                                 provider,
                                 registry,
-                                context,
+                                turn_config,
                                 history,
                                 text,
                                 turn_events,
@@ -261,7 +285,7 @@ where
 async fn run_turn<P>(
     provider: Arc<P>,
     registry: Arc<ToolRegistry>,
-    context: ToolContext,
+    config: AgentRuntimeConfig,
     mut history: Vec<ModelMessage>,
     text: String,
     events: mpsc::Sender<AgentEvent>,
@@ -288,8 +312,14 @@ where
         {
             return turn_outcome(history, StopReason::Error);
         }
+        let messages = config
+            .base_messages
+            .iter()
+            .cloned()
+            .chain(history.iter().cloned())
+            .collect();
         let request = ModelRequest {
-            messages: history.clone(),
+            messages,
             tools: registry.definitions(),
             max_tokens: None,
             reasoning_effort: None,
@@ -383,7 +413,7 @@ where
 
             let result = execute_tool_call(
                 Arc::clone(&registry),
-                context.clone(),
+                config.tool_context.clone(),
                 call,
                 &events,
                 cancel.clone(),
@@ -1230,6 +1260,91 @@ mod tests {
                 ModelMessage::user("what did I say?"),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn base_messages_are_replayed_once_for_tool_continuations_and_later_turns() {
+        let root = unique_test_dir("agent-base-context");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("note.txt"), "context").unwrap();
+        let call = tool_call("read-call", "read", r#"{"path":"note.txt"}"#);
+        let provider = ScriptedProvider::new(vec![
+            ScriptedStep {
+                events: Vec::new(),
+                response: ModelResponse {
+                    items: vec![ModelAssistantItem::ToolCall(call.clone())],
+                    stop_reason: StopReason::ToolCalls,
+                    usage: None,
+                },
+            },
+            final_step("read complete"),
+            final_step("remembered"),
+        ]);
+        let requests = Arc::clone(&provider.requests);
+        let base = ModelMessage::System {
+            content: "base instructions".to_owned(),
+        };
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let runtime = AgentRuntime::with_config(
+            provider,
+            AgentRuntimeConfig {
+                tool_context: ToolContext::new(&root).unwrap(),
+                base_messages: vec![base.clone()],
+            },
+        );
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "inspect note".to_owned(),
+            })
+            .await
+            .unwrap();
+        let _ = collect_turn(&mut event_rx).await;
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "what happened?".to_owned(),
+            })
+            .await
+            .unwrap();
+        let _ = collect_turn(&mut event_rx).await;
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].messages[0], base);
+        assert_eq!(requests[0].messages[1], ModelMessage::user("inspect note"));
+        assert_eq!(requests[1].messages[0], base);
+        assert!(matches!(
+            &requests[1].messages[1],
+            ModelMessage::User { content } if content == "inspect note"
+        ));
+        assert!(matches!(
+            &requests[1].messages[2],
+            ModelMessage::Assistant { items } if items == &vec![ModelAssistantItem::ToolCall(call)]
+        ));
+        assert!(matches!(
+            &requests[1].messages[3],
+            ModelMessage::ToolResult { tool_call_id, .. } if tool_call_id == "read-call"
+        ));
+        assert_eq!(requests[2].messages[0], base);
+        assert_eq!(
+            requests[2].messages.last(),
+            Some(&ModelMessage::user("what happened?"))
+        );
+        for request in requests.iter() {
+            assert_eq!(
+                request
+                    .messages
+                    .iter()
+                    .filter(|message| matches!(message, ModelMessage::System { .. }))
+                    .count(),
+                1
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[derive(Clone)]
