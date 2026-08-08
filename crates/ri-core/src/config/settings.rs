@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use super::ConfigWarning;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResolvedSettings {
     pub default_provider: Option<String>,
     pub default_model: Option<String>,
@@ -18,16 +18,6 @@ pub struct ResolvedSettings {
 }
 
 pub type Settings = ResolvedSettings;
-
-impl Default for ResolvedSettings {
-    fn default() -> Self {
-        Self {
-            default_provider: None,
-            default_model: None,
-            context: ContextSettings::default(),
-        }
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextSettings {

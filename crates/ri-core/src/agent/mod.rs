@@ -249,8 +249,10 @@ where
                         let cancel = CancellationToken::new();
                         let provider = Arc::clone(&self.provider);
                         let registry = Arc::clone(&self.registry);
-                        let context = self.context.clone();
-                        let base_messages = self.base_messages.clone();
+                        let turn_config = AgentRuntimeConfig {
+                            tool_context: self.context.clone(),
+                            base_messages: self.base_messages.clone(),
+                        };
                         let history = self.history.clone();
                         let turn_events = events.clone();
                         let turn_cancel = cancel.clone();
@@ -258,8 +260,7 @@ where
                             run_turn(
                                 provider,
                                 registry,
-                                context,
-                                base_messages,
+                                turn_config,
                                 history,
                                 text,
                                 turn_events,
@@ -284,8 +285,7 @@ where
 async fn run_turn<P>(
     provider: Arc<P>,
     registry: Arc<ToolRegistry>,
-    context: ToolContext,
-    base_messages: Vec<ModelMessage>,
+    config: AgentRuntimeConfig,
     mut history: Vec<ModelMessage>,
     text: String,
     events: mpsc::Sender<AgentEvent>,
@@ -312,7 +312,8 @@ where
         {
             return turn_outcome(history, StopReason::Error);
         }
-        let messages = base_messages
+        let messages = config
+            .base_messages
             .iter()
             .cloned()
             .chain(history.iter().cloned())
@@ -412,7 +413,7 @@ where
 
             let result = execute_tool_call(
                 Arc::clone(&registry),
-                context.clone(),
+                config.tool_context.clone(),
                 call,
                 &events,
                 cancel.clone(),
