@@ -11,7 +11,7 @@ pub(crate) fn resolve_existing(
     let canonical = fs::canonicalize(&candidate).map_err(|error| {
         ToolError::Failed(format!("could not resolve path {requested:?}: {error}"))
     })?;
-    ensure_inside(context, &canonical, requested)?;
+    ensure_canonical_inside(context, &canonical, requested)?;
     Ok(canonical)
 }
 
@@ -22,17 +22,19 @@ pub(crate) fn resolve_for_write(
     let candidate = candidate_path(context, requested)?;
     let lexical = normalize_lexical(&candidate)
         .ok_or_else(|| ToolError::Failed(format!("path {requested:?} escapes the workspace")))?;
-    ensure_inside(context, &lexical, requested)?;
+    if !Path::new(requested).is_absolute() {
+        ensure_lexically_inside(context, &lexical, requested)?;
+    }
 
-    match fs::symlink_metadata(&candidate) {
+    match fs::symlink_metadata(&lexical) {
         Ok(_) => {
-            let canonical = fs::canonicalize(&candidate).map_err(|error| {
+            let canonical = fs::canonicalize(&lexical).map_err(|error| {
                 ToolError::Failed(format!("could not resolve path {requested:?}: {error}"))
             })?;
-            ensure_inside(context, &canonical, requested)?;
+            ensure_canonical_inside(context, &canonical, requested)?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let parent = nearest_existing_parent(&candidate).ok_or_else(|| {
+            let parent = nearest_existing_parent(&lexical).ok_or_else(|| {
                 ToolError::Failed(format!(
                     "could not resolve parent directory for {requested:?}"
                 ))
@@ -42,7 +44,7 @@ pub(crate) fn resolve_for_write(
                     "could not resolve parent directory for {requested:?}: {error}"
                 ))
             })?;
-            ensure_inside(context, &canonical_parent, requested)?;
+            ensure_canonical_inside(context, &canonical_parent, requested)?;
         }
         Err(error) => {
             return Err(ToolError::Failed(format!(
@@ -51,7 +53,7 @@ pub(crate) fn resolve_for_write(
         }
     }
 
-    Ok(candidate)
+    Ok(lexical)
 }
 
 fn candidate_path(context: &ToolContext, requested: &str) -> Result<PathBuf, ToolError> {
@@ -97,8 +99,26 @@ fn nearest_existing_parent(path: &Path) -> Option<&Path> {
     }
 }
 
-fn ensure_inside(context: &ToolContext, path: &Path, requested: &str) -> Result<(), ToolError> {
-    if path_is_inside(&context.workspace_root, path) {
+fn ensure_lexically_inside(
+    context: &ToolContext,
+    path: &Path,
+    requested: &str,
+) -> Result<(), ToolError> {
+    if lexical_path_is_inside(&context.workspace_root, path) {
+        Ok(())
+    } else {
+        Err(ToolError::Failed(format!(
+            "path {requested:?} escapes the workspace"
+        )))
+    }
+}
+
+fn ensure_canonical_inside(
+    context: &ToolContext,
+    path: &Path,
+    requested: &str,
+) -> Result<(), ToolError> {
+    if path.starts_with(&context.workspace_root) {
         Ok(())
     } else {
         Err(ToolError::Failed(format!(
@@ -108,12 +128,12 @@ fn ensure_inside(context: &ToolContext, path: &Path, requested: &str) -> Result<
 }
 
 #[cfg(not(windows))]
-fn path_is_inside(root: &Path, path: &Path) -> bool {
+fn lexical_path_is_inside(root: &Path, path: &Path) -> bool {
     path.starts_with(root)
 }
 
 #[cfg(windows)]
-fn path_is_inside(root: &Path, path: &Path) -> bool {
+fn lexical_path_is_inside(root: &Path, path: &Path) -> bool {
     let mut root_components = root.components();
     let mut path_components = path.components();
     root_components.all(|root_component| {
@@ -229,6 +249,50 @@ mod tests {
         assert!(resolve_for_write(&context, r"Z:\outside.txt").is_err());
         assert!(resolve_for_write(&context, r"nested\..\..\outside.txt").is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_containment_does_not_fold_normal_components() {
+        let root = unique_test_dir("canonical-case");
+        fs::create_dir_all(&root).unwrap();
+        let context = ToolContext::new(&root).unwrap();
+        let name = context
+            .workspace_root
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
+        let differently_cased = name
+            .chars()
+            .map(|character| character.to_ascii_uppercase())
+            .collect::<String>();
+        assert_ne!(name, differently_cased);
+        let sibling = context
+            .workspace_root
+            .parent()
+            .unwrap()
+            .join(differently_cased)
+            .join("file.txt");
+
+        assert!(ensure_canonical_inside(&context, &sibling, "sibling").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn allows_alias_that_resolves_inside_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_test_dir("alias-inside");
+        let alias = root.with_file_name(format!("{}-alias", root.file_name().unwrap().display()));
+        fs::create_dir_all(&root).unwrap();
+        symlink(&root, &alias).unwrap();
+        let context = ToolContext::new(&root).unwrap();
+        let requested = alias.join("nested/file.txt");
+
+        assert!(resolve_for_write(&context, &requested.display().to_string()).is_ok());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_file(alias).unwrap();
     }
 
     #[cfg(unix)]
