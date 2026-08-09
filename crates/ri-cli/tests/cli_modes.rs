@@ -2,7 +2,9 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+#[cfg(unix)]
+use std::process::Stdio;
+use std::process::{Command, Output};
 use std::sync::{Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -453,6 +455,7 @@ fn structurally_corrupt_session_fails_with_a_path_and_status_two() {
         "projectRoot": std::env::current_dir().unwrap(),
     });
     fs::write(&session, format!("{}\nnot json\n", header)).unwrap();
+    let canonical_session = fs::canonicalize(&session).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_ri"))
         .args([
@@ -468,7 +471,7 @@ fn structurally_corrupt_session_fails_with_a_path_and_status_two() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
-    assert!(text(&output.stderr).contains(&session.display().to_string()));
+    assert!(text(&output.stderr).contains(&canonical_session.display().to_string()));
     assert!(output.stdout.is_empty());
     let _ = fs::remove_dir_all(home);
 }
