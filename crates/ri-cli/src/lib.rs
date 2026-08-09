@@ -8,4 +8,5 @@ pub mod picker;
 pub mod redraw;
 pub mod render;
 pub mod session_picker;
+mod signals;
 pub mod terminal;

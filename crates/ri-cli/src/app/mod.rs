@@ -21,6 +21,7 @@ use crate::json_output::{JsonEmitter, RunStartedData};
 use crate::model_selection::resolve_model;
 use crate::redraw::{RedrawScheduler, RedrawUrgency};
 use crate::render::TuiRenderer;
+use crate::signals::ShutdownSignals;
 use crate::terminal::TerminalGuard;
 
 const COMMAND_CHANNEL_CAPACITY: usize = 16;
@@ -409,6 +410,7 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
         setup.compaction_enabled,
     );
     let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+    let mut shutdown = ShutdownSignals::new();
 
     command_tx
         .send(AgentCommand::Submit { text: prompt })
@@ -423,51 +425,59 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
     let mut turn_reason = None;
     let mut output = io::stdout();
     let mut error_message = None;
+    let mut shutdown_requested = false;
 
-    while let Some(event) = event_rx.recv().await {
-        log_agent_event(&event);
-        match &event {
-            AgentEvent::AssistantTextDelta { text, .. } => {
-                print_and_flush(&mut output, text)?;
+    while turn_reason.is_none() {
+        tokio::select! {
+            signal = shutdown.recv(), if !shutdown_requested => {
+                if signal.is_some() {
+                    shutdown_requested = true;
+                    let _ = command_tx.send(AgentCommand::Shutdown).await;
+                }
             }
-            AgentEvent::AssistantRefusalDelta { text, .. } => {
-                print_and_flush(&mut output, text)?;
+            event = event_rx.recv() => {
+                let Some(event) = event else { break };
+                log_agent_event(&event);
+                match &event {
+                    AgentEvent::AssistantTextDelta { text, .. } => {
+                        print_and_flush(&mut output, text)?;
+                    }
+                    AgentEvent::AssistantRefusalDelta { text, .. } => {
+                        print_and_flush(&mut output, text)?;
+                    }
+                    AgentEvent::Error(error) => {
+                        error_message = Some(error.message.clone());
+                        eprintln!("ri: {}", error.message);
+                    }
+                    AgentEvent::TurnFinished { reason } => turn_reason = Some(reason.clone()),
+                    AgentEvent::CompactionFinished {
+                        before_tokens,
+                        after_tokens,
+                        ..
+                    } => eprintln!("ri: context compacted · ~{before_tokens} → ~{after_tokens} tokens"),
+                    AgentEvent::CompactionFailed { message } => eprintln!("ri: {message}"),
+                    AgentEvent::TurnStarted
+                    | AgentEvent::AssistantMessageStarted
+                    | AgentEvent::AssistantMessageFinished { .. }
+                    | AgentEvent::AssistantTextItem { .. }
+                    | AgentEvent::AssistantRefusalItem { .. }
+                    | AgentEvent::AssistantThinkingDelta { .. }
+                    | AgentEvent::AssistantThinkingContentDelta { .. }
+                    | AgentEvent::AssistantThinkingItem { .. }
+                    | AgentEvent::ToolCallDelta { .. }
+                    | AgentEvent::ToolExecutionStarted { .. }
+                    | AgentEvent::ToolExecutionOutput { .. }
+                    | AgentEvent::ToolExecutionFinished { .. }
+                    | AgentEvent::UsageUpdated(_)
+                    | AgentEvent::ContextUsageUpdated(_)
+                    | AgentEvent::ContextLimitsUpdated(_)
+                    | AgentEvent::CompactionStarted { .. }
+                    | AgentEvent::ModelChanged(_)
+                    | AgentEvent::SessionChanged { .. }
+                    | AgentEvent::SessionLoaded { .. } => {}
+                }
+                state.reduce(event);
             }
-            AgentEvent::Error(error) => {
-                error_message = Some(error.message.clone());
-                eprintln!("ri: {}", error.message);
-            }
-            AgentEvent::TurnFinished { reason } => turn_reason = Some(reason.clone()),
-            AgentEvent::CompactionFinished {
-                before_tokens,
-                after_tokens,
-                ..
-            } => eprintln!("ri: context compacted · ~{before_tokens} → ~{after_tokens} tokens"),
-            AgentEvent::CompactionFailed { message } => eprintln!("ri: {message}"),
-            AgentEvent::TurnStarted
-            | AgentEvent::AssistantMessageStarted
-            | AgentEvent::AssistantMessageFinished { .. }
-            | AgentEvent::AssistantTextItem { .. }
-            | AgentEvent::AssistantRefusalItem { .. }
-            | AgentEvent::AssistantThinkingDelta { .. }
-            | AgentEvent::AssistantThinkingContentDelta { .. }
-            | AgentEvent::AssistantThinkingItem { .. }
-            | AgentEvent::ToolCallDelta { .. }
-            | AgentEvent::ToolExecutionStarted { .. }
-            | AgentEvent::ToolExecutionOutput { .. }
-            | AgentEvent::ToolExecutionFinished { .. }
-            | AgentEvent::UsageUpdated(_)
-            | AgentEvent::ContextUsageUpdated(_)
-            | AgentEvent::ContextLimitsUpdated(_)
-            | AgentEvent::CompactionStarted { .. }
-            | AgentEvent::ModelChanged(_)
-            | AgentEvent::SessionChanged { .. }
-            | AgentEvent::SessionLoaded { .. } => {}
-        }
-        let finished = matches!(event, AgentEvent::TurnFinished { .. });
-        state.reduce(event);
-        if finished {
-            break;
         }
     }
 
@@ -478,10 +488,12 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
     }
 
     writeln!(output)?;
-    command_tx
-        .send(AgentCommand::Shutdown)
-        .await
-        .context("could not stop the agent")?;
+    if !shutdown_requested {
+        command_tx
+            .send(AgentCommand::Shutdown)
+            .await
+            .context("could not stop the agent")?;
+    }
     runtime_task
         .await
         .map_err(|error| anyhow!("agent task failed: {error}"))?;
@@ -514,6 +526,7 @@ async fn run_json(prompt: String, setup: AppSetup) -> Result<()> {
         setup.compaction_enabled,
     );
     let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+    let mut shutdown = ShutdownSignals::new();
     let mut output = JsonEmitter::new(io::stdout());
     output.emit(
         "run_started",
@@ -538,18 +551,26 @@ async fn run_json(prompt: String, setup: AppSetup) -> Result<()> {
 
     let mut turn_reason = None;
     let mut saw_error = false;
-    while let Some(event) = event_rx.recv().await {
-        log_agent_event(&event);
-        if matches!(&event, AgentEvent::Error(_)) {
-            saw_error = true;
-        }
-        let finished = matches!(&event, AgentEvent::TurnFinished { .. });
-        output.emit_agent_event(&event)?;
-        if let AgentEvent::TurnFinished { reason } = event {
-            turn_reason = Some(reason);
-        }
-        if finished {
-            break;
+    let mut shutdown_requested = false;
+    while turn_reason.is_none() {
+        tokio::select! {
+            signal = shutdown.recv(), if !shutdown_requested => {
+                if signal.is_some() {
+                    shutdown_requested = true;
+                    let _ = command_tx.send(AgentCommand::Shutdown).await;
+                }
+            }
+            event = event_rx.recv() => {
+                let Some(event) = event else { break };
+                log_agent_event(&event);
+                if matches!(&event, AgentEvent::Error(_)) {
+                    saw_error = true;
+                }
+                output.emit_agent_event(&event)?;
+                if let AgentEvent::TurnFinished { reason } = event {
+                    turn_reason = Some(reason);
+                }
+            }
         }
     }
 
@@ -565,15 +586,17 @@ async fn run_json(prompt: String, setup: AppSetup) -> Result<()> {
         bail!(message);
     };
 
-    if let Err(error) = command_tx.send(AgentCommand::Shutdown).await {
-        let message = format!("could not stop the agent: {error}");
-        output.emit(
-            "error",
-            serde_json::json!({"message": message, "fatal": true}),
-        )?;
-        let _ = runtime_task.await;
-        output.emit("run_finished", serde_json::json!({"success": false}))?;
-        bail!(message);
+    if !shutdown_requested {
+        if let Err(error) = command_tx.send(AgentCommand::Shutdown).await {
+            let message = format!("could not stop the agent: {error}");
+            output.emit(
+                "error",
+                serde_json::json!({"message": message, "fatal": true}),
+            )?;
+            let _ = runtime_task.await;
+            output.emit("run_finished", serde_json::json!({"success": false}))?;
+            bail!(message);
+        }
     }
     if let Err(error) = runtime_task
         .await
@@ -611,6 +634,7 @@ async fn run_json(prompt: String, setup: AppSetup) -> Result<()> {
 
 async fn run_tui(mut setup: AppSetup) -> Result<()> {
     tracing::info!(target: "ri", mode = "tui", "run started");
+    let mut terminal = TerminalGuard::new().context("could not initialize terminal")?;
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (event_tx, mut event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let runtime = AgentRuntime::with_config_and_compaction(
@@ -620,7 +644,6 @@ async fn run_tui(mut setup: AppSetup) -> Result<()> {
     );
     let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
 
-    let mut terminal = TerminalGuard::new().context("could not initialize terminal")?;
     let mut state = AppState::new();
     state.replace_history(&setup.initial_transcript);
     state.add_system_message(setup.context.diagnostic());
@@ -631,6 +654,7 @@ async fn run_tui(mut setup: AppSetup) -> Result<()> {
     state.reduce(AgentEvent::ModelChanged(setup.model_ref()));
     state.reduce(AgentEvent::ContextLimitsUpdated(setup.provider.limits()));
     let mut renderer = TuiRenderer::new();
+    let mut shutdown = ShutdownSignals::new();
     let tui_result = run_tui_loop(
         &mut terminal,
         &mut state,
@@ -638,16 +662,22 @@ async fn run_tui(mut setup: AppSetup) -> Result<()> {
         &command_tx,
         &mut event_rx,
         &mut setup,
+        &mut shutdown,
     )
     .await;
-    drop(terminal);
+    let restore_result = terminal
+        .restore()
+        .map_err(|error| anyhow!("could not restore terminal: {error}"));
 
+    // Restore the user's terminal before waiting for a provider or tool to
+    // acknowledge shutdown, so external termination never leaves raw mode on.
     let shutdown_result = command_tx.send(AgentCommand::Shutdown).await;
     let runtime_result = runtime_task
         .await
         .map_err(|error| anyhow!("agent task failed: {error}"));
 
     tui_result?;
+    restore_result?;
     shutdown_result.context("could not stop the agent")?;
     runtime_result?;
     Ok(())
@@ -660,6 +690,7 @@ async fn run_tui_loop(
     command_tx: &mpsc::Sender<AgentCommand>,
     event_rx: &mut mpsc::Receiver<AgentEvent>,
     setup: &mut AppSetup,
+    shutdown: &mut ShutdownSignals,
 ) -> Result<()> {
     let mut redraw = RedrawScheduler::new(Duration::from_millis(12));
     redraw.request(RedrawUrgency::Immediate, Instant::now());
@@ -694,6 +725,11 @@ async fn run_tui_loop(
         let redraw_deadline = redraw.deadline();
         tokio::select! {
             biased;
+            signal = shutdown.recv() => {
+                if signal.is_some() {
+                    exit = true;
+                }
+            }
             _ = wait_for_redraw(redraw_deadline) => {}
             terminal_event = terminal_events.next() => {
                 let terminal_event = terminal_event
