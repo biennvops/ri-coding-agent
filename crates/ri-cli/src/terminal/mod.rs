@@ -213,10 +213,7 @@ mod tests {
         fn call(&mut self, operation: &'static str) -> io::Result<()> {
             self.calls.push(operation);
             if self.failures.contains(operation) {
-                Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("fake {operation} failure"),
-                ))
+                Err(io::Error::other(format!("fake {operation} failure")))
             } else {
                 Ok(())
             }
