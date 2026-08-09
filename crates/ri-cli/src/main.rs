@@ -1,6 +1,7 @@
 mod app;
 mod input;
 mod json_output;
+mod logging;
 mod model_picker;
 mod model_selection;
 mod picker;
@@ -24,6 +25,18 @@ async fn run_main() -> i32 {
     if options.show_help {
         app::Options::print_help();
         return 0;
+    }
+
+    let log_path = match logging::init() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("ri: error: {error}");
+            return 2;
+        }
+    };
+    if let Some(path) = log_path {
+        eprintln!("ri: logging to {}", path.display());
+        tracing::info!(target: "ri", log_path = %path.display(), "diagnostic logging enabled");
     }
 
     match app::run(options).await {

@@ -1137,7 +1137,10 @@ dependencies = [
  "futures-util",
  "ratatui",
  "ri-core",
+ "serde",
+ "serde_json",
  "tokio",
+ "tracing",
  "unicode-segmentation",
  "unicode-width",
 ]

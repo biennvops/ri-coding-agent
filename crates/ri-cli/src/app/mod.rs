@@ -114,7 +114,12 @@ impl Options {
     pub fn print_help() {
         println!(
             "ri — a small Rust coding agent\n\n\
-             Usage:\n  ri                              start the interactive TUI\n  ri -p <prompt>                  run one prompt without the TUI\n  ri --provider <id> --model <id> select a configured model\n  ri -c                            continue the newest saved session\n  ri -r                            choose a saved session interactively\n  ri --session <id-or-path>        resume one saved session\n  ri --no-session                  disable session persistence\n  ri --no-context                 disable AGENTS context loading\n  ri --help                       show this help"
+             Usage:\n  ri                              start the interactive TUI\n  ri -p, --print <prompt>         run one prompt without the TUI\n  ri --json -p <prompt>           emit versioned NDJSON events\n\n\
+             Model:\n  --provider <id>                 select a configured provider\n  --model <id>                   select a configured model\n\n\
+             Sessions:\n  -c, --continue                 continue the newest saved session\n  -r, --resume                   choose a saved session interactively\n  --session <id-or-path>         resume one saved session\n  --no-session                   disable session persistence\n\n\
+             Context and help:\n  --no-context                   disable AGENTS context loading\n  -h, --help                    show this help\n\n\
+             Interactive commands:\n  /model                         open the model picker\n  /model <provider/model>        select a model directly\n  /new                           create a new session\n  /resume                        choose a saved session\n  /name [name]                   show or set the session name\n  /session                       show session details\n  /compact                       compact the current context\n  /quit                          exit the TUI\n\n\
+             Environment:\n  RI_LOG=error|warn|info|debug|trace  write private diagnostic logs"
         );
     }
 }
@@ -228,8 +233,16 @@ impl AppSetup {
         for warning in &selection.warnings {
             eprintln!("ri: warning: {warning}");
         }
-        let _selection_source = selection.source;
+        let selection_source = selection.source;
         let selected = selection.model;
+        tracing::info!(
+            target: "ri",
+            provider = %selected.model_ref.provider,
+            model = %selected.model_ref.model,
+            source = ?selection_source,
+            workspace = %workspace_id,
+            "selected model"
+        );
         let provider = ConfiguredProvider::openai(selected.clone())
             .map_err(|error| anyhow!(error.to_string()))?;
         if let Some(path) = state_path.as_ref() {
@@ -245,6 +258,9 @@ impl AppSetup {
         } else {
             ContextBundle::disabled(project.launch_cwd.clone(), project.project_root.clone())
         };
+        for file in &context.files {
+            tracing::debug!(target: "ri", context_path = %file.path.display(), "loaded context file");
+        }
         let system_prompt = build_system_prompt(&context);
         let tool_context =
             ToolContext::new(&project.launch_cwd).map_err(|error| anyhow!(error.to_string()))?;
@@ -376,6 +392,7 @@ impl AppSetup {
 }
 
 async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
+    tracing::info!(target: "ri", mode = "print", prompt_bytes = prompt.len(), "run started");
     eprintln!("{}", setup.context.diagnostic());
     if let Some(info) = setup.session_info()? {
         eprintln!("session: {} ({})", info.display_name(), info.id);
@@ -406,6 +423,7 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
     let mut error_message = None;
 
     while let Some(event) = event_rx.recv().await {
+        log_agent_event(&event);
         match &event {
             AgentEvent::AssistantTextDelta { text, .. } => {
                 print_and_flush(&mut output, text)?;
@@ -477,6 +495,7 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
 }
 
 async fn run_json(prompt: String, setup: AppSetup) -> Result<()> {
+    tracing::info!(target: "ri", mode = "json", prompt_bytes = prompt.len(), "run started");
     eprintln!("{}", setup.context.diagnostic());
     let session = setup.session_info()?;
     if let Some(info) = session.as_ref() {
@@ -518,6 +537,7 @@ async fn run_json(prompt: String, setup: AppSetup) -> Result<()> {
     let mut turn_reason = None;
     let mut saw_error = false;
     while let Some(event) = event_rx.recv().await {
+        log_agent_event(&event);
         if matches!(&event, AgentEvent::Error(_)) {
             saw_error = true;
         }
@@ -588,6 +608,7 @@ async fn run_json(prompt: String, setup: AppSetup) -> Result<()> {
 }
 
 async fn run_tui(mut setup: AppSetup) -> Result<()> {
+    tracing::info!(target: "ri", mode = "tui", "run started");
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (event_tx, mut event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let runtime = AgentRuntime::with_config_and_compaction(
@@ -601,6 +622,9 @@ async fn run_tui(mut setup: AppSetup) -> Result<()> {
     let mut state = AppState::new();
     state.replace_history(&setup.initial_transcript);
     state.add_system_message(setup.context.diagnostic());
+    if let Some(path) = crate::logging::path() {
+        state.add_system_message(format!("logging: {}", path.display()));
+    }
     state.set_session_info(setup.session_info()?);
     state.reduce(AgentEvent::ModelChanged(setup.model_ref()));
     state.reduce(AgentEvent::ContextLimitsUpdated(setup.provider.limits()));
@@ -754,6 +778,7 @@ async fn run_tui_loop(
                 if matches!(event, AgentEvent::TurnFinished { .. }) {
                     scroll_from_bottom = 0;
                 }
+                log_agent_event(&event);
                 let session_loaded = matches!(event, AgentEvent::SessionLoaded { .. });
                 state.reduce(event);
                 if session_loaded {
@@ -1047,6 +1072,119 @@ fn print_and_flush(output: &mut impl Write, text: &str) -> Result<()> {
     write!(output, "{text}")?;
     output.flush()?;
     Ok(())
+}
+
+fn log_agent_event(event: &AgentEvent) {
+    match event {
+        AgentEvent::TurnStarted => tracing::info!(target: "ri", "turn started"),
+        AgentEvent::AssistantMessageStarted => {
+            tracing::debug!(target: "ri", "assistant message started")
+        }
+        AgentEvent::ToolExecutionStarted {
+            call_id,
+            name,
+            arguments,
+        } => tracing::debug!(
+            target: "ri",
+            call_id = %call_id,
+            tool = %name,
+            arguments_bytes = arguments.len(),
+            "tool started"
+        ),
+        AgentEvent::ToolExecutionOutput {
+            call_id,
+            stream,
+            chunk,
+        } => tracing::trace!(
+            target: "ri",
+            call_id = %call_id,
+            stream = ?stream,
+            chunk_bytes = chunk.len(),
+            "tool output"
+        ),
+        AgentEvent::ToolExecutionFinished {
+            call_id,
+            name,
+            result,
+        } => tracing::debug!(
+            target: "ri",
+            call_id = %call_id,
+            tool = %name,
+            success = result.metadata.success,
+            exit_code = ?result.metadata.exit_code,
+            timed_out = result.metadata.timed_out,
+            cancelled = result.metadata.cancelled,
+            truncated = result.metadata.truncated,
+            duration_ms = result.metadata.duration.as_millis() as u64,
+            "tool finished"
+        ),
+        AgentEvent::UsageUpdated(usage) => tracing::debug!(
+            target: "ri",
+            input_tokens = ?usage.input_tokens,
+            output_tokens = ?usage.output_tokens,
+            total_tokens = ?usage.total_tokens,
+            "provider usage"
+        ),
+        AgentEvent::ContextUsageUpdated(usage) => tracing::debug!(
+            target: "ri",
+            input_tokens = usage.current_tokens(),
+            estimated = matches!(usage.source, ri_core::UsageSource::Estimated),
+            context_window = ?usage.context_window,
+            "context usage"
+        ),
+        AgentEvent::CompactionStarted { automatic } => {
+            tracing::info!(target: "ri", automatic, "compaction started")
+        }
+        AgentEvent::CompactionFinished {
+            automatic,
+            before_tokens,
+            after_tokens,
+        } => tracing::info!(
+            target: "ri",
+            automatic,
+            before_tokens,
+            after_tokens,
+            "compaction finished"
+        ),
+        AgentEvent::CompactionFailed { message } => tracing::warn!(
+            target: "ri",
+            message_bytes = message.len(),
+            "compaction failed"
+        ),
+        AgentEvent::ModelChanged(model) => tracing::info!(
+            target: "ri",
+            provider = %model.provider,
+            model = %model.model,
+            "model changed"
+        ),
+        AgentEvent::SessionChanged { info } => tracing::debug!(
+            target: "ri",
+            session_id = %info.id,
+            message_count = info.message_count,
+            "session changed"
+        ),
+        AgentEvent::TurnFinished { reason } => tracing::info!(
+            target: "ri",
+            reason = crate::json_output::stop_reason_name(reason),
+            "turn finished"
+        ),
+        AgentEvent::Error(error) => tracing::error!(
+            target: "ri",
+            message_bytes = error.message.len(),
+            "agent error"
+        ),
+        AgentEvent::AssistantTextDelta { .. }
+        | AgentEvent::AssistantTextItem { .. }
+        | AgentEvent::AssistantRefusalDelta { .. }
+        | AgentEvent::AssistantRefusalItem { .. }
+        | AgentEvent::AssistantThinkingDelta { .. }
+        | AgentEvent::AssistantThinkingContentDelta { .. }
+        | AgentEvent::AssistantThinkingItem { .. }
+        | AgentEvent::ToolCallDelta { .. }
+        | AgentEvent::AssistantMessageFinished { .. }
+        | AgentEvent::ContextLimitsUpdated(_)
+        | AgentEvent::SessionLoaded { .. } => {}
+    }
 }
 
 #[cfg(test)]
