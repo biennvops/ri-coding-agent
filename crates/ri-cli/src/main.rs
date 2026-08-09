@@ -6,6 +6,7 @@ async fn main() {
 }
 
 async fn run_main() -> i32 {
+    let _logging_guard = logging::FlushGuard;
     let options = match app::Options::parse(std::env::args().skip(1)) {
         Ok(options) => options,
         Err(error) => {

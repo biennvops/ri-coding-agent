@@ -158,6 +158,7 @@ fn emergency_restore() {
     let _ = execute!(stdout, LeaveAlternateScreen);
     let _ = disable_raw_mode();
     let _ = stdout.flush();
+    crate::logging::flush_best_effort();
 }
 
 impl TerminalGuard {
