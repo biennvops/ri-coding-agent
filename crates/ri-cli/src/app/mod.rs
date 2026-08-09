@@ -461,19 +461,21 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
                 log_agent_event(&event);
                 match &event {
                     AgentEvent::AssistantTextDelta { text, .. } => {
-                        if let Err(error) = print_and_flush(&mut output, text) {
-                            loop_error = Some(error);
-                            shutdown_requested = true;
-                            let _ = command_tx.send(AgentCommand::Shutdown).await;
-                            break;
+                        if loop_error.is_none() {
+                            if let Err(error) = print_and_flush(&mut output, text) {
+                                loop_error = Some(error);
+                                shutdown_requested = true;
+                                let _ = command_tx.send(AgentCommand::Shutdown).await;
+                            }
                         }
                     }
                     AgentEvent::AssistantRefusalDelta { text, .. } => {
-                        if let Err(error) = print_and_flush(&mut output, text) {
-                            loop_error = Some(error);
-                            shutdown_requested = true;
-                            let _ = command_tx.send(AgentCommand::Shutdown).await;
-                            break;
+                        if loop_error.is_none() {
+                            if let Err(error) = print_and_flush(&mut output, text) {
+                                loop_error = Some(error);
+                                shutdown_requested = true;
+                                let _ = command_tx.send(AgentCommand::Shutdown).await;
+                            }
                         }
                     }
                     AgentEvent::Error(error) => {
