@@ -131,14 +131,46 @@ fn components_equal_ignore_case(
     use std::path::Component;
 
     match (left, right) {
-        (Component::Prefix(left), Component::Prefix(right)) => left
-            .as_os_str()
-            .to_string_lossy()
-            .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy()),
+        (Component::Prefix(left), Component::Prefix(right)) => {
+            prefixes_equal_ignore_case(left.kind(), right.kind())
+        }
         (Component::RootDir, Component::RootDir) => true,
         (Component::CurDir, Component::CurDir) => true,
         (Component::ParentDir, Component::ParentDir) => true,
         (Component::Normal(left), Component::Normal(right)) => left
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy()),
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
+fn prefixes_equal_ignore_case(left: std::path::Prefix<'_>, right: std::path::Prefix<'_>) -> bool {
+    use std::path::Prefix;
+
+    match (left, right) {
+        (Prefix::Disk(left), Prefix::Disk(right))
+        | (Prefix::Disk(left), Prefix::VerbatimDisk(right))
+        | (Prefix::VerbatimDisk(left), Prefix::Disk(right))
+        | (Prefix::VerbatimDisk(left), Prefix::VerbatimDisk(right)) => {
+            left.eq_ignore_ascii_case(&right)
+        }
+        (Prefix::UNC(left_server, left_share), Prefix::UNC(right_server, right_share))
+        | (Prefix::UNC(left_server, left_share), Prefix::VerbatimUNC(right_server, right_share))
+        | (Prefix::VerbatimUNC(left_server, left_share), Prefix::UNC(right_server, right_share))
+        | (
+            Prefix::VerbatimUNC(left_server, left_share),
+            Prefix::VerbatimUNC(right_server, right_share),
+        ) => {
+            left_server
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&right_server.to_string_lossy())
+                && left_share
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&right_share.to_string_lossy())
+        }
+        (Prefix::Verbatim(left), Prefix::Verbatim(right))
+        | (Prefix::DeviceNS(left), Prefix::DeviceNS(right)) => left
             .to_string_lossy()
             .eq_ignore_ascii_case(&right.to_string_lossy()),
         _ => false,
