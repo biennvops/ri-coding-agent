@@ -62,6 +62,84 @@ fn json_mode_emits_only_versioned_ndjson_events() {
 }
 
 #[test]
+fn json_responses_emits_final_item_content_without_text_delta() {
+    let _lock = cli_test_lock();
+    let fixture = Fixture::responses(responses_final_item_body());
+    let output = fixture.run(&["--json", "-p", "hello", "--no-session", "--no-context"]);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        text(&output.stdout),
+        text(&output.stderr)
+    );
+    let records = parse_records(&output.stdout);
+    assert!(!records
+        .iter()
+        .any(|record| record["type"] == "assistant_text_delta"));
+    let finished = records
+        .iter()
+        .find(|record| record["type"] == "assistant_message_finished")
+        .expect("assistant_message_finished event should be present");
+    assert_eq!(finished["data"]["itemCount"], 1);
+    assert_eq!(finished["data"]["items"][0]["type"], "text");
+    assert_eq!(finished["data"]["items"][0]["content"], "authoritative");
+    fixture.finish();
+}
+
+#[test]
+fn malformed_recent_state_is_recovered_and_restored_on_the_next_launch() {
+    let _lock = cli_test_lock();
+    let fixture = Fixture::with_models(&["model", "second"], success_body());
+    let state_path = fixture.home.join(".ri/agent/state.json");
+    fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+    fs::write(&state_path, "not json").unwrap();
+
+    let first_output = fixture.run(&[
+        "--json",
+        "-p",
+        "hello",
+        "--provider",
+        "test",
+        "--model",
+        "second",
+        "--no-session",
+        "--no-context",
+    ]);
+    assert!(
+        first_output.status.success(),
+        "stdout: {}\nstderr: {}",
+        text(&first_output.stdout),
+        text(&first_output.stderr)
+    );
+    let home = fixture.keep_home();
+
+    let state: Value =
+        serde_json::from_str(&fs::read_to_string(home.join(".ri/agent/state.json")).unwrap())
+            .unwrap();
+    assert_eq!(state["version"], 1);
+    assert_eq!(state["lastModel"]["provider"], "test");
+    assert_eq!(state["lastModel"]["model"], "second");
+    assert_eq!(
+        fs::read_to_string(home.join(".ri/agent/state.json.corrupt")).unwrap(),
+        "not json"
+    );
+
+    let second = Fixture::in_home_with_models(home, &["model", "second"], success_body());
+    let second_output = second.run(&["--json", "-p", "again", "--no-session", "--no-context"]);
+    assert!(
+        second_output.status.success(),
+        "stdout: {}\nstderr: {}",
+        text(&second_output.stdout),
+        text(&second_output.stderr)
+    );
+    let second_records = parse_records(&second_output.stdout);
+    assert_eq!(second_records[0]["data"]["model"]["provider"], "test");
+    assert_eq!(second_records[0]["data"]["model"]["model"], "second");
+    second.finish();
+}
+
+#[test]
 fn json_continue_reuses_the_persistent_session() {
     let _lock = cli_test_lock();
     let first = Fixture::new(success_body());
@@ -274,6 +352,15 @@ fn success_body() -> &'static str {
     )
 }
 
+fn responses_final_item_body() -> &'static str {
+    concat!(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"authoritative\"}]}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+        "data: [DONE]\n\n"
+    )
+}
+
 struct Fixture {
     home: PathBuf,
     models: PathBuf,
@@ -310,26 +397,73 @@ impl Fixture {
         Self::in_home_with_responses(home, vec![(status, body)], api_key)
     }
 
+    fn responses(body: &'static str) -> Self {
+        Self::in_home_with_responses_and_models(
+            unique_dir("cli-responses-fixture"),
+            vec![("200 OK", body)],
+            None,
+            "openai-responses",
+            &["model"],
+        )
+    }
+
+    fn with_models(model_ids: &[&str], body: &'static str) -> Self {
+        Self::in_home_with_models(unique_dir("cli-state-fixture"), model_ids, body)
+    }
+
+    fn in_home_with_models(home: PathBuf, model_ids: &[&str], body: &'static str) -> Self {
+        Self::in_home_with_responses_and_models(
+            home,
+            vec![("200 OK", body)],
+            None,
+            "openai-completions",
+            model_ids,
+        )
+    }
+
     fn in_home_with_responses(
         home: PathBuf,
         responses: Vec<(&'static str, &'static str)>,
         api_key: Option<&str>,
     ) -> Self {
+        Self::in_home_with_responses_and_models(
+            home,
+            responses,
+            api_key,
+            "openai-completions",
+            &["model"],
+        )
+    }
+
+    fn in_home_with_responses_and_models(
+        home: PathBuf,
+        responses: Vec<(&'static str, &'static str)>,
+        api_key: Option<&str>,
+        api: &'static str,
+        model_ids: &[&str],
+    ) -> Self {
         fs::create_dir_all(&home).unwrap();
-        let models = home.join("models.json");
+        let models_path = home.join("models.json");
         let server = spawn_servers(responses);
         let api_key = api_key
             .map(|value| format!(",\"apiKey\":{value:?}"))
             .unwrap_or_default();
+        let model_entries = model_ids
+            .iter()
+            .map(|id| format!(r#"{{"id":"{id}","contextWindow":200000}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
         let source = format!(
-            r#"{{"providers":{{"test":{{"baseUrl":"{}","api":"openai-completions"{} ,"models":[{{"id":"model","contextWindow":200000}}]}}}}}}"#,
+            r#"{{"providers":{{"test":{{"baseUrl":"{}","api":"{}"{} ,"models":[{}]}}}}}}"#,
             server.url.as_str(),
-            api_key
+            api,
+            api_key,
+            model_entries
         );
-        fs::write(&models, source).unwrap();
+        fs::write(&models_path, source).unwrap();
         Self {
             home,
-            models,
+            models: models_path,
             server,
         }
     }

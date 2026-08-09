@@ -124,7 +124,14 @@ pub fn persist_recent_model(
     })?;
 
     let mut state = if path.exists() {
-        read_state(&path)?
+        match read_state(&path) {
+            Ok(state) => state,
+            Err(StateError::Json { .. }) => {
+                preserve_corrupt_state(&path)?;
+                RecentModelState::default()
+            }
+            Err(error) => return Err(error),
+        }
     } else {
         RecentModelState::default()
     };
@@ -158,6 +165,24 @@ fn read_state(path: &Path) -> Result<RecentModelState, StateError> {
         });
     }
     Ok(state)
+}
+
+fn preserve_corrupt_state(path: &Path) -> Result<(), StateError> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state.json");
+    let mut backup_path = path.with_file_name(format!("{file_name}.corrupt"));
+    let mut suffix = 1;
+    while backup_path.exists() {
+        backup_path = path.with_file_name(format!("{file_name}.corrupt.{suffix}"));
+        suffix += 1;
+    }
+    fs::rename(path, &backup_path).map_err(|source| StateError::Io {
+        path: backup_path,
+        operation: "preserving corrupt state",
+        source,
+    })
 }
 
 fn write_state_atomically(path: &Path, state: &RecentModelState) -> Result<(), StateError> {
@@ -331,11 +356,32 @@ mod tests {
         fs::write(&path, "not json").unwrap();
         assert!(matches!(load_state(&path), Err(StateError::Json { .. })));
 
-        fs::write(&path, r#"{"version":99,"lastModel":null,"workspaces":{}}"#).unwrap();
+        let model = ModelRef::new("provider", "model");
+        persist_recent_model(&path, "workspace", &model)
+            .expect("malformed state should be recovered during persistence");
+        let recovered = load_state(&path)
+            .expect("recovered state should load")
+            .expect("recovered state should exist");
+        assert_eq!(recovered.version, STATE_VERSION);
+        assert_eq!(recovered.last_model, Some(RecentModel::from(&model)));
+        assert_eq!(
+            fs::read_to_string(root.join("state.json.corrupt")).unwrap(),
+            "not json"
+        );
+
+        let unsupported = r#"{"version":99,"lastModel":null,"workspaces":{}}"#;
+        fs::write(&path, unsupported).unwrap();
         assert!(matches!(
             load_state(&path),
             Err(StateError::UnsupportedVersion { version: 99 })
         ));
+        let error = persist_recent_model(&path, "workspace", &model)
+            .expect_err("future state versions must not be overwritten");
+        assert!(matches!(
+            error,
+            StateError::UnsupportedVersion { version: 99 }
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), unsupported);
         remove_test_dir(root);
     }
 

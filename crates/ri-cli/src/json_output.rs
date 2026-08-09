@@ -2,7 +2,8 @@ use std::io::Write;
 
 use anyhow::Result;
 use ri_core::{
-    AgentEvent, ContextUsage, ModelRef, SessionInfo, StopReason, ToolOutputStream, Usage,
+    AgentEvent, ContextUsage, ModelAssistantItem, ModelRef, SessionInfo, StopReason,
+    ToolOutputStream, Usage,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -57,11 +58,19 @@ impl<W: Write> JsonEmitter<W> {
             AgentEvent::AssistantRefusalDelta { text, .. } => {
                 self.emit("assistant_refusal_delta", TextData { text })
             }
-            AgentEvent::AssistantThinkingDelta { item_id, text }
-            | AgentEvent::AssistantThinkingContentDelta { item_id, text } => self.emit(
+            AgentEvent::AssistantThinkingDelta { item_id, text } => self.emit(
                 "assistant_reasoning_delta",
                 ReasoningData {
                     item_id: item_id.as_deref(),
+                    kind: "summary",
+                    text,
+                },
+            ),
+            AgentEvent::AssistantThinkingContentDelta { item_id, text } => self.emit(
+                "assistant_reasoning_delta",
+                ReasoningData {
+                    item_id: item_id.as_deref(),
+                    kind: "content",
                     text,
                 },
             ),
@@ -69,6 +78,7 @@ impl<W: Write> JsonEmitter<W> {
                 "assistant_message_finished",
                 MessageFinishedData {
                     item_count: items.len(),
+                    items: items.iter().map(AssistantItemData::from).collect(),
                 },
             ),
             AgentEvent::ToolExecutionStarted {
@@ -236,13 +246,65 @@ struct TextData<'a> {
 struct ReasoningData<'a> {
     #[serde(rename = "itemId")]
     item_id: Option<&'a str>,
+    kind: &'static str,
     text: &'a str,
 }
 
 #[derive(Serialize)]
-struct MessageFinishedData {
+struct MessageFinishedData<'a> {
     #[serde(rename = "itemCount")]
     item_count: usize,
+    items: Vec<AssistantItemData<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type")]
+enum AssistantItemData<'a> {
+    #[serde(rename = "text")]
+    Text { content: &'a str },
+    #[serde(rename = "refusal")]
+    Refusal { content: &'a str },
+    #[serde(rename = "reasoning")]
+    Reasoning {
+        #[serde(rename = "itemId")]
+        item_id: Option<&'a str>,
+        summary: &'a str,
+        content: &'a str,
+        #[serde(rename = "encryptedContent")]
+        encrypted_content: Option<&'a str>,
+    },
+    #[serde(rename = "tool_call")]
+    ToolCall {
+        index: usize,
+        #[serde(rename = "callId")]
+        call_id: Option<&'a str>,
+        #[serde(rename = "itemId")]
+        item_id: Option<&'a str>,
+        name: Option<&'a str>,
+        arguments: &'a str,
+    },
+}
+
+impl<'a> From<&'a ModelAssistantItem> for AssistantItemData<'a> {
+    fn from(item: &'a ModelAssistantItem) -> Self {
+        match item {
+            ModelAssistantItem::Text { content } => Self::Text { content },
+            ModelAssistantItem::Refusal { content } => Self::Refusal { content },
+            ModelAssistantItem::Reasoning(thinking) => Self::Reasoning {
+                item_id: thinking.item_id.as_deref(),
+                summary: &thinking.summary,
+                content: &thinking.content,
+                encrypted_content: thinking.encrypted_content.as_deref(),
+            },
+            ModelAssistantItem::ToolCall(call) => Self::ToolCall {
+                index: call.index,
+                call_id: call.call_id.as_deref(),
+                item_id: call.item_id.as_deref(),
+                name: call.name.as_deref(),
+                arguments: &call.arguments,
+            },
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -397,7 +459,9 @@ pub(crate) fn stop_reason_name(reason: &StopReason) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ri_core::{ModelLimits, ToolExecutionMetadata, ToolExecutionResult};
+    use ri_core::{
+        ModelLimits, ModelThinking, ModelToolCall, ToolExecutionMetadata, ToolExecutionResult,
+    };
     use serde_json::Value;
     use std::time::Duration;
 
@@ -527,6 +591,101 @@ mod tests {
                 "turn_finished",
                 "error",
             ]
+        );
+    }
+
+    #[test]
+    fn reasoning_delta_wire_kinds_preserve_summary_and_content() {
+        let mut output = Vec::new();
+        let mut emitter = JsonEmitter::new(&mut output);
+        emitter
+            .emit_agent_event(&AgentEvent::AssistantThinkingDelta {
+                item_id: Some("reasoning".to_owned()),
+                text: "summary".to_owned(),
+            })
+            .expect("summary delta should serialize");
+        emitter
+            .emit_agent_event(&AgentEvent::AssistantThinkingContentDelta {
+                item_id: Some("reasoning".to_owned()),
+                text: "content".to_owned(),
+            })
+            .expect("content delta should serialize");
+
+        let records: Vec<Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records[0]["type"], "assistant_reasoning_delta");
+        assert_eq!(records[0]["data"]["itemId"], "reasoning");
+        assert_eq!(records[0]["data"]["kind"], "summary");
+        assert_eq!(records[0]["data"]["text"], "summary");
+        assert_eq!(records[1]["data"]["kind"], "content");
+        assert_eq!(records[1]["data"]["text"], "content");
+    }
+
+    #[test]
+    fn assistant_message_finished_contains_normalized_items() {
+        let mut output = Vec::new();
+        let mut emitter = JsonEmitter::new(&mut output);
+        emitter
+            .emit_agent_event(&AgentEvent::AssistantMessageFinished {
+                items: vec![
+                    ri_core::ModelAssistantItem::Text {
+                        content: "hello".to_owned(),
+                    },
+                    ri_core::ModelAssistantItem::Refusal {
+                        content: "no".to_owned(),
+                    },
+                    ri_core::ModelAssistantItem::Reasoning(ModelThinking {
+                        item_id: Some("reasoning".to_owned()),
+                        summary: "summary".to_owned(),
+                        content: "content".to_owned(),
+                        encrypted_content: Some("encrypted".to_owned()),
+                    }),
+                    ri_core::ModelAssistantItem::ToolCall(ModelToolCall {
+                        index: 3,
+                        call_id: Some("call".to_owned()),
+                        item_id: Some("item".to_owned()),
+                        name: Some("read".to_owned()),
+                        arguments: "{}".to_owned(),
+                    }),
+                ],
+            })
+            .expect("finished message should serialize");
+
+        let record: Value = serde_json::from_str(String::from_utf8(output).unwrap().trim())
+            .expect("event should be valid JSON");
+        assert_eq!(record["type"], "assistant_message_finished");
+        assert_eq!(record["data"]["itemCount"], 4);
+        assert_eq!(
+            record["data"]["items"][0],
+            json!({"type": "text", "content": "hello"})
+        );
+        assert_eq!(
+            record["data"]["items"][1],
+            json!({"type": "refusal", "content": "no"})
+        );
+        assert_eq!(
+            record["data"]["items"][2],
+            json!({
+                "type": "reasoning",
+                "itemId": "reasoning",
+                "summary": "summary",
+                "content": "content",
+                "encryptedContent": "encrypted"
+            })
+        );
+        assert_eq!(
+            record["data"]["items"][3],
+            json!({
+                "type": "tool_call",
+                "index": 3,
+                "callId": "call",
+                "itemId": "item",
+                "name": "read",
+                "arguments": "{}"
+            })
         );
     }
 
