@@ -872,7 +872,10 @@ fn append_content_section(
         .copied()
         .unwrap_or_default()
         .min(content.len());
-    let keep = old_rows.len().saturating_sub(1);
+    let keep = old_starts
+        .iter()
+        .position(|&offset| offset >= start)
+        .unwrap_or(old_rows.len());
     old_rows.truncate(keep);
     old_starts.truncate(keep);
     let first_line_prefix = start == 0 || content.as_bytes().get(start - 1) == Some(&b'\n');
@@ -1187,6 +1190,46 @@ mod tests {
             .draw(&mut terminal, &state, 0)
             .expect("edited editor draw should succeed");
         assert_eq!(renderer.stats().editor_cache_misses, 1);
+    }
+
+    #[test]
+    fn incremental_streaming_rows_match_cold_layout_across_chunkings_and_widths() {
+        let text = "ab😀e\u{301}\n世界xyz";
+        for width in [1, 2, 3, 4, 8, 18] {
+            let mut state = AppState::new();
+            state.reduce(AgentEvent::AssistantMessageStarted);
+            let mut renderer = TuiRenderer::new();
+            let mut terminal =
+                Terminal::new(TestBackend::new(width + 2, 10)).expect("test terminal");
+            for character in text.chars() {
+                append_streaming_delta(&mut state, &character.to_string());
+                renderer
+                    .draw(&mut terminal, &state, 0)
+                    .expect("stream draw should succeed");
+                let streaming = state
+                    .streaming_assistant_state()
+                    .expect("stream should remain active");
+                let cached = renderer
+                    .transcript
+                    .streaming_layout
+                    .as_ref()
+                    .expect("stream layout should be cached");
+                let (expected_rows, expected_starts) =
+                    layout_content_section(&streaming.content, Style::default(), width as usize);
+                assert_eq!(
+                    cached
+                        .content_rows
+                        .iter()
+                        .map(|row| row.text.as_str())
+                        .collect::<Vec<_>>(),
+                    expected_rows
+                        .iter()
+                        .map(|row| row.text.as_str())
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(cached.content_starts, expected_starts);
+            }
+        }
     }
 
     #[test]
