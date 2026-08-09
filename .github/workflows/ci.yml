@@ -36,8 +36,18 @@ jobs:
       - run: cargo test --workspace --locked --no-fail-fast
       - run: cargo build --release --locked -p ri
       - name: Install and smoke test
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           cargo install --path crates/ri-cli --locked --root "$RUNNER_TEMP/ri-install"
           "$RUNNER_TEMP/ri-install/bin/ri" --help
           "$RUNNER_TEMP/ri-install/bin/ri" --version
+      - name: Install and smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "ri-install"
+          cargo install --path crates/ri-cli --locked --root $root
+          $binary = Join-Path $root "bin/ri.exe"
+          & $binary --help
+          & $binary --version
