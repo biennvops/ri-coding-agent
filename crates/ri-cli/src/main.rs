@@ -1,5 +1,6 @@
 mod app;
 mod input;
+mod json_output;
 mod model_picker;
 mod model_selection;
 mod picker;

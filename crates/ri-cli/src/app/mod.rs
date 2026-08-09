@@ -17,6 +17,7 @@ use ri_core::{
 use tokio::sync::mpsc;
 
 use crate::input::{self, Action, VisualLayout};
+use crate::json_output::{JsonEmitter, RunStartedData};
 use crate::model_selection::resolve_model;
 use crate::render;
 use crate::terminal::TerminalGuard;
@@ -27,6 +28,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Options {
     pub print_prompt: Option<String>,
+    pub json: bool,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub no_context: bool,
@@ -61,6 +63,7 @@ impl Options {
                         options.print_prompt = Some(prompt);
                     }
                 }
+                "--json" => options.json = true,
                 "--provider" => {
                     options.provider = Some(
                         args.next()
@@ -86,6 +89,10 @@ impl Options {
                 "-h" | "--help" => options.show_help = true,
                 unknown => bail!("unknown argument: {unknown}"),
             }
+        }
+
+        if options.json && options.print_prompt.is_none() && !options.show_help {
+            bail!("--json requires --print <prompt>");
         }
 
         let selection_count = options.continue_session as u8
@@ -124,7 +131,11 @@ pub async fn run(options: Options) -> Result<()> {
         setup.apply_opened(opened);
     }
     if let Some(prompt) = options.print_prompt {
-        run_print(prompt, setup).await
+        if options.json {
+            run_json(prompt, setup).await
+        } else {
+            run_print(prompt, setup).await
+        }
     } else {
         run_tui(setup).await
     }
@@ -360,7 +371,7 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
     command_tx
         .send(AgentCommand::Submit { text: prompt })
         .await
-        .context("could not start the mock agent")?;
+        .context("could not start the agent")?;
 
     let mut state = AppState::new();
     state.replace_history(&setup.initial_transcript);
@@ -427,7 +438,7 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
     command_tx
         .send(AgentCommand::Shutdown)
         .await
-        .context("could not stop the mock agent")?;
+        .context("could not stop the agent")?;
     runtime_task
         .await
         .map_err(|error| anyhow!("agent task failed: {error}"))?;
@@ -440,6 +451,117 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn run_json(prompt: String, setup: AppSetup) -> Result<()> {
+    eprintln!("{}", setup.context.diagnostic());
+    let session = setup.session_info()?;
+    if let Some(info) = session.as_ref() {
+        eprintln!("session: {} ({})", info.display_name(), info.id);
+    } else {
+        eprintln!("session: ephemeral");
+    }
+
+    let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
+    let (event_tx, mut event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+    let runtime = AgentRuntime::with_config_and_compaction(
+        setup.provider.clone(),
+        setup.runtime_config(),
+        setup.compaction_enabled,
+    );
+    let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+    let mut output = JsonEmitter::new(io::stdout());
+    output.emit(
+        "run_started",
+        RunStartedData::new(
+            &setup.model_ref(),
+            setup.tool_context.workspace_root.display().to_string(),
+            session.as_ref(),
+        ),
+    )?;
+
+    if let Err(error) = command_tx.send(AgentCommand::Submit { text: prompt }).await {
+        let message = format!("could not start the agent: {error}");
+        output.emit(
+            "error",
+            serde_json::json!({"message": message, "fatal": true}),
+        )?;
+        output.emit("run_finished", serde_json::json!({"success": false}))?;
+        let _ = command_tx.send(AgentCommand::Shutdown).await;
+        let _ = runtime_task.await;
+        bail!(message);
+    }
+
+    let mut turn_reason = None;
+    let mut saw_error = false;
+    while let Some(event) = event_rx.recv().await {
+        if matches!(&event, AgentEvent::Error(_)) {
+            saw_error = true;
+        }
+        let finished = matches!(&event, AgentEvent::TurnFinished { .. });
+        output.emit_agent_event(&event)?;
+        if let AgentEvent::TurnFinished { reason } = event {
+            turn_reason = Some(reason);
+        }
+        if finished {
+            break;
+        }
+    }
+
+    let Some(reason) = turn_reason else {
+        let message = "agent stopped before finishing the turn";
+        output.emit(
+            "error",
+            serde_json::json!({"message": message, "fatal": true}),
+        )?;
+        let _ = command_tx.send(AgentCommand::Shutdown).await;
+        let _ = runtime_task.await;
+        output.emit("run_finished", serde_json::json!({"success": false}))?;
+        bail!(message);
+    };
+
+    if let Err(error) = command_tx.send(AgentCommand::Shutdown).await {
+        let message = format!("could not stop the agent: {error}");
+        output.emit(
+            "error",
+            serde_json::json!({"message": message, "fatal": true}),
+        )?;
+        let _ = runtime_task.await;
+        output.emit("run_finished", serde_json::json!({"success": false}))?;
+        bail!(message);
+    }
+    if let Err(error) = runtime_task
+        .await
+        .map_err(|error| anyhow!("agent task failed: {error}"))
+    {
+        let message = error.to_string();
+        output.emit(
+            "error",
+            serde_json::json!({"message": message, "fatal": true}),
+        )?;
+        output.emit("run_finished", serde_json::json!({"success": false}))?;
+        return Err(error);
+    }
+
+    let success = !saw_error && !matches!(&reason, StopReason::Error | StopReason::Cancelled);
+    if !success && !saw_error {
+        let message = format!(
+            "agent turn finished with {}",
+            crate::json_output::stop_reason_name(&reason)
+        );
+        output.emit(
+            "error",
+            serde_json::json!({"message": message, "fatal": true}),
+        )?;
+    }
+    output.emit("run_finished", serde_json::json!({"success": success}))?;
+    if success {
+        Ok(())
+    } else if matches!(&reason, StopReason::Cancelled) {
+        bail!("agent turn cancelled")
+    } else {
+        bail!("agent turn failed")
+    }
 }
 
 async fn run_tui(mut setup: AppSetup) -> Result<()> {
@@ -922,6 +1044,7 @@ mod tests {
             .unwrap(),
             Options {
                 print_prompt: Some("hello".to_owned()),
+                json: false,
                 provider: Some("custom".to_owned()),
                 model: Some("coding".to_owned()),
                 no_context: false,
@@ -949,6 +1072,15 @@ mod tests {
             let arguments = arguments.into_iter().map(str::to_owned).collect::<Vec<_>>();
             assert!(Options::parse(arguments).is_err());
         }
+    }
+
+    #[test]
+    fn parses_json_prompt_and_rejects_interactive_json() {
+        let options = Options::parse(["--json".to_owned(), "-p".to_owned(), "hello".to_owned()])
+            .expect("json print mode should parse");
+        assert!(options.json);
+        assert_eq!(options.print_prompt.as_deref(), Some("hello"));
+        assert!(Options::parse(["--json".to_owned()]).is_err());
     }
 
     #[test]
