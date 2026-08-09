@@ -1142,6 +1142,34 @@ mod tests {
     }
 
     #[test]
+    fn resize_during_streaming_cold_reflows_once_then_returns_to_incremental() {
+        let mut state = synthetic_transcript(1_000, 100);
+        state.reduce(AgentEvent::AssistantMessageStarted);
+        append_streaming_delta(&mut state, &"x".repeat(500));
+        let mut renderer = TuiRenderer::new();
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).expect("test terminal");
+        renderer
+            .draw(&mut terminal, &state, 0)
+            .expect("initial draw should succeed");
+        let static_entries = renderer.cached_transcript_entries().saturating_sub(1);
+        state.acknowledge_transcript_changes();
+
+        terminal.backend_mut().resize(120, 10);
+        renderer
+            .draw(&mut terminal, &state, 0)
+            .expect("resize draw should succeed");
+        assert_eq!(renderer.stats().entries_reflowed, static_entries + 1);
+        state.acknowledge_transcript_changes();
+
+        append_streaming_delta(&mut state, " + delta");
+        renderer
+            .draw(&mut terminal, &state, 0)
+            .expect("post-resize stream draw should succeed");
+        assert_eq!(renderer.stats().entries_reflowed, 1);
+        assert!(renderer.stats().bytes_reflowed < 500);
+    }
+
+    #[test]
     fn session_replacement_discards_old_cached_rows() {
         let mut state = synthetic_transcript(10_000, 1_000);
         let mut renderer = TuiRenderer::new();
