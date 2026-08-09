@@ -289,6 +289,26 @@ mod tests {
         remove_test_dir(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn private_state_writes_restore_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_test_dir("state-private-permissions");
+        let path = root.join("state.json");
+        let model = ModelRef::new("provider", "model");
+
+        persist_recent_model(&path, "workspace", &model).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        persist_recent_model(&path, "workspace", &model).unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        remove_test_dir(root);
+    }
+
     #[test]
     fn missing_state_is_normal() {
         let root = unique_test_dir("state-missing");

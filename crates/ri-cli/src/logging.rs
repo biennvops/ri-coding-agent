@@ -321,20 +321,20 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
-fn set_private_directory_permissions(path: &Path) -> Result<()> {
+fn set_private_directory_permissions(_path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(_path, fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
 }
 
-fn set_private_file_permissions(file: &File, _path: &Path) -> Result<()> {
+fn set_private_file_permissions(_file: &File, _path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        _file.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
 }

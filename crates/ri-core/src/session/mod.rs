@@ -709,18 +709,17 @@ impl SessionWriter {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let file = options
+        let mut file = options
             .open(&path)
             .map_err(|source| io_error(&path, source))?;
         lock_exclusive(&file)?;
-        let snapshot = read_session(&path)?;
+        let snapshot = read_session_from_file(&path, &mut file, true)?;
         if snapshot.info.workspace_root != current_workspace {
             return Err(SessionError::WorkspaceMismatch {
                 session_workspace: snapshot.info.workspace_root,
                 current_workspace: current_workspace.to_path_buf(),
             });
         }
-        let mut file = file;
         if let Some(offset) = snapshot.truncate_at {
             file.set_len(offset)
                 .map_err(|source| io_error(&path, source))?;
@@ -1124,7 +1123,17 @@ fn read_session_summary(path: &Path) -> Result<SessionSnapshot, SessionError> {
 }
 
 fn read_session_inner(path: &Path, include_history: bool) -> Result<SessionSnapshot, SessionError> {
-    let file = File::open(path).map_err(|source| io_error(path, source))?;
+    let mut file = File::open(path).map_err(|source| io_error(path, source))?;
+    read_session_from_file(path, &mut file, include_history)
+}
+
+fn read_session_from_file(
+    path: &Path,
+    file: &mut File,
+    include_history: bool,
+) -> Result<SessionSnapshot, SessionError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| io_error(path, source))?;
     let mut reader = BufReader::new(file);
     let mut line_bytes = Vec::new();
     let mut offset = 0u64;
@@ -1519,8 +1528,8 @@ fn unresolved_tool_calls(history: &[ModelMessage]) -> Vec<ModelToolCall> {
     pending
 }
 
-fn read_bounded_line(
-    reader: &mut BufReader<File>,
+fn read_bounded_line<R: Read>(
+    reader: &mut BufReader<R>,
     buffer: &mut Vec<u8>,
     limit: usize,
 ) -> io::Result<Option<bool>> {
@@ -2040,6 +2049,34 @@ mod tests {
         ));
         drop(first);
         assert!(repository.open_path(&path).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn opening_and_resuming_session_reads_through_the_locked_handle() {
+        let root = test_dir("windows-resume-lock");
+        fs::create_dir_all(&root).unwrap();
+        let repository = SessionRepository::new(root.join("sessions"), &root, &root).unwrap();
+        let handle = repository.create().unwrap();
+        handle
+            .append_message(&ModelMessage::user("before resume"))
+            .unwrap();
+        let path = handle.info().unwrap().path;
+        drop(handle);
+
+        let opened = repository.open_path(&path).unwrap();
+        opened
+            .handle
+            .append_message(&ModelMessage::user("after resume"))
+            .unwrap();
+
+        let transcript = opened.handle.transcript_history().unwrap();
+        assert_eq!(transcript.len(), 2);
+        assert_eq!(transcript[1], ModelMessage::user("after resume"));
+        drop(opened);
+        let snapshot = read_session(&path).unwrap();
+        assert_eq!(snapshot.transcript.len(), 2);
         fs::remove_dir_all(root).unwrap();
     }
 

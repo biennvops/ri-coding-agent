@@ -45,13 +45,13 @@ pub(crate) fn atomic_write(
             .write(true)
             .create_new(true)
             .open(&temporary_path)?;
+        if let Some(permissions) = existing_permissions {
+            temporary.set_permissions(permissions)?;
+        }
         if options.private {
             set_private_file_permissions(&temporary)?;
         }
         temporary.write_all(bytes)?;
-        if let Some(permissions) = existing_permissions {
-            temporary.set_permissions(permissions)?;
-        }
         temporary.sync_all()?;
         drop(temporary);
 
@@ -84,8 +84,6 @@ fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
 
 #[cfg(windows)]
 fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
     const ERROR_FILE_NOT_FOUND: i32 = 2;
     const REPLACEFILE_WRITE_THROUGH: u32 = 1;
     const MOVEFILE_REPLACE_EXISTING: u32 = 1;
@@ -167,11 +165,11 @@ fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn set_private_file_permissions(file: &File) -> io::Result<()> {
+fn set_private_file_permissions(_file: &File) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        _file.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
 }

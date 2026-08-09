@@ -15,6 +15,89 @@ fn cli_test_lock() -> MutexGuard<'static, ()> {
     CLI_TEST_LOCK.lock().unwrap()
 }
 
+#[cfg(unix)]
+#[test]
+fn tui_restores_the_pty_after_early_termination_signals() {
+    let _lock = cli_test_lock();
+    for signal in ["TERM", "HUP"] {
+        run_tui_signal_torture(signal);
+    }
+}
+
+#[cfg(unix)]
+fn run_tui_signal_torture(signal: &str) {
+    if Command::new("expect").arg("-v").output().is_err() {
+        return;
+    }
+
+    let root = unique_dir("tui-signal");
+    fs::create_dir_all(&root).unwrap();
+    let models = root.join("models.json");
+    let pid_path = root.join("ri.pid");
+    let tty_state_path = root.join("tty-state");
+    let expect_script = root.join("tui.exp");
+    fs::write(
+        &models,
+        r#"{"providers":{"test":{"baseUrl":"http://127.0.0.1:1","api":"openai-completions","models":[{"id":"model"}]}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        &expect_script,
+        r#"
+            set timeout 5
+            spawn $env(RI_TEST_BIN) --no-session --no-context
+            set pid [exp_pid]
+            set slave $spawn_out(slave,name)
+            set pid_file [open $env(RI_TEST_PID) w]
+            puts $pid_file $pid
+            close $pid_file
+            expect {
+                -re {\x1b\[\?1049h} {
+                    send "\033\[1;1R"
+                    exec kill [format "-%s" $env(RI_TEST_SIGNAL)] $pid
+                }
+                timeout { exit 10 }
+                eof { exit 11 }
+            }
+            after 100
+            set state [exec stty -a < $slave]
+            expect {
+                eof {}
+                timeout { exit 12 }
+            }
+            set state_file [open $env(RI_TEST_TTY) w]
+            puts $state_file $state
+            close $state_file
+            exit 0
+        "#,
+    )
+    .unwrap();
+
+    let output = Command::new("expect")
+        .arg(&expect_script)
+        .env("HOME", &root)
+        .env("RI_MODELS_FILE", &models)
+        .env("RI_TEST_BIN", env!("CARGO_BIN_EXE_ri"))
+        .env("RI_TEST_PID", &pid_path)
+        .env("RI_TEST_TTY", &tty_state_path)
+        .env("RI_TEST_SIGNAL", signal)
+        .output()
+        .expect("expect should launch a PTY");
+    assert!(
+        output.status.success(),
+        "expect failed for SIG{signal}: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let tty_state = fs::read_to_string(&tty_state_path).unwrap_or_default();
+    assert!(
+        !tty_state.contains("-icanon"),
+        "SIG{signal} left the PTY in raw mode: {tty_state}"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn print_mode_keeps_stdout_plain_text() {
     let _lock = cli_test_lock();

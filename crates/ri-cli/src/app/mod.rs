@@ -429,7 +429,8 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
         setup.compaction_enabled,
     );
     let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
-    let mut shutdown = ShutdownSignals::new();
+    let mut shutdown =
+        ShutdownSignals::new().context("could not install shutdown signal handlers")?;
 
     if let Err(error) = command_tx.send(AgentCommand::Submit { text: prompt }).await {
         let _ = command_tx.send(AgentCommand::Shutdown).await;
@@ -585,7 +586,8 @@ async fn run_json(prompt: String, setup: AppSetup) -> Result<()> {
         setup.compaction_enabled,
     );
     let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
-    let mut shutdown = ShutdownSignals::new();
+    let mut shutdown =
+        ShutdownSignals::new().context("could not install shutdown signal handlers")?;
 
     if let Err(error) = command_tx.send(AgentCommand::Submit { text: prompt }).await {
         let message = format!("could not start the agent: {error}");
@@ -716,6 +718,8 @@ async fn run_json(prompt: String, setup: AppSetup) -> Result<()> {
 async fn run_tui(mut setup: AppSetup) -> Result<()> {
     tracing::info!(target: "ri", mode = "tui", "run started");
     let session_info = setup.session_info()?;
+    let mut shutdown =
+        ShutdownSignals::new().context("could not install shutdown signal handlers")?;
     let mut terminal = TerminalGuard::new().context("could not initialize terminal")?;
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (event_tx, mut event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
@@ -736,7 +740,6 @@ async fn run_tui(mut setup: AppSetup) -> Result<()> {
     state.reduce(AgentEvent::ModelChanged(setup.model_ref()));
     state.reduce(AgentEvent::ContextLimitsUpdated(setup.provider.limits()));
     let mut renderer = TuiRenderer::new();
-    let mut shutdown = ShutdownSignals::new();
     let tui_result = run_tui_loop(
         &mut terminal,
         &mut state,

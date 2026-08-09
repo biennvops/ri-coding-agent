@@ -1,10 +1,14 @@
+use std::io;
+
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ShutdownSignal {
     Interrupt,
+    #[cfg(unix)]
     Terminate,
+    #[cfg(unix)]
     Hangup,
 }
 
@@ -15,15 +19,33 @@ pub(crate) struct ShutdownSignals {
 }
 
 impl ShutdownSignals {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new() -> io::Result<Self> {
         let (sender, receiver) = mpsc::channel(1);
         let (stop, stop_receiver) = oneshot::channel();
+        #[cfg(unix)]
+        let task = {
+            use tokio::signal::unix::{signal, SignalKind};
+
+            // Register the process signal handlers before returning so callers
+            // can establish them before mutating terminal state.
+            let interrupt = signal(SignalKind::interrupt())?;
+            let terminate = signal(SignalKind::terminate())?;
+            let hangup = signal(SignalKind::hangup())?;
+            tokio::spawn(listen_for_shutdown(
+                sender,
+                stop_receiver,
+                interrupt,
+                terminate,
+                hangup,
+            ))
+        };
+        #[cfg(not(unix))]
         let task = tokio::spawn(listen_for_shutdown(sender, stop_receiver));
-        Self {
+        Ok(Self {
             receiver,
             stop: Some(stop),
             task: Some(task),
-        }
+        })
     }
 
     pub(crate) async fn recv(&mut self) -> Option<ShutdownSignal> {
@@ -53,52 +75,44 @@ impl Drop for ShutdownSignals {
     }
 }
 
+#[cfg(unix)]
+async fn listen_for_shutdown(
+    sender: mpsc::Sender<ShutdownSignal>,
+    mut stop: oneshot::Receiver<()>,
+    mut interrupt: tokio::signal::unix::Signal,
+    mut terminate: tokio::signal::unix::Signal,
+    mut hangup: tokio::signal::unix::Signal,
+) {
+    tokio::select! {
+        _ = &mut stop => {}
+        signal = interrupt.recv() => {
+            if signal.is_some() {
+                let _ = sender.send(ShutdownSignal::Interrupt).await;
+            }
+        }
+        signal = terminate.recv() => {
+            if signal.is_some() {
+                let _ = sender.send(ShutdownSignal::Terminate).await;
+            }
+        }
+        signal = hangup.recv() => {
+            if signal.is_some() {
+                let _ = sender.send(ShutdownSignal::Hangup).await;
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
 async fn listen_for_shutdown(
     sender: mpsc::Sender<ShutdownSignal>,
     mut stop: oneshot::Receiver<()>,
 ) {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-
-        let Ok(mut interrupt) = signal(SignalKind::interrupt()) else {
-            return;
-        };
-        let Ok(mut terminate) = signal(SignalKind::terminate()) else {
-            return;
-        };
-        let Ok(mut hangup) = signal(SignalKind::hangup()) else {
-            return;
-        };
-
-        tokio::select! {
-            _ = &mut stop => {}
-            signal = interrupt.recv() => {
-                if signal.is_some() {
-                    let _ = sender.send(ShutdownSignal::Interrupt).await;
-                }
-            }
-            signal = terminate.recv() => {
-                if signal.is_some() {
-                    let _ = sender.send(ShutdownSignal::Terminate).await;
-                }
-            }
-            signal = hangup.recv() => {
-                if signal.is_some() {
-                    let _ = sender.send(ShutdownSignal::Hangup).await;
-                }
-            }
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        tokio::select! {
-            _ = &mut stop => {}
-            result = tokio::signal::ctrl_c() => {
-                if result.is_ok() {
-                    let _ = sender.send(ShutdownSignal::Interrupt).await;
-                }
+    tokio::select! {
+        _ = &mut stop => {}
+        result = tokio::signal::ctrl_c() => {
+            if result.is_ok() {
+                let _ = sender.send(ShutdownSignal::Interrupt).await;
             }
         }
     }
@@ -111,8 +125,8 @@ mod tests {
     #[tokio::test]
     async fn injected_shutdown_signals_are_independently_testable() {
         let (sender, mut signals) = ShutdownSignals::channel();
-        sender.send(ShutdownSignal::Terminate).await.unwrap();
-        assert_eq!(signals.recv().await, Some(ShutdownSignal::Terminate));
+        sender.send(ShutdownSignal::Interrupt).await.unwrap();
+        assert_eq!(signals.recv().await, Some(ShutdownSignal::Interrupt));
     }
 
     #[tokio::test]

@@ -23,6 +23,7 @@ use super::{
 pub const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const TERMINATION_GRACE: Duration = Duration::from_millis(75);
+const READER_DRAIN_GRACE: Duration = Duration::from_millis(100);
 const STREAM_OUTPUT_LIMIT: usize = MAX_TOOL_OUTPUT_BYTES / 2;
 const BASH_CHUNK_BYTES: usize = 8 * 1024;
 
@@ -104,7 +105,9 @@ impl Tool for BashTool {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // This only covers the shell itself. ProcessTreeGuard below is
-            // still required because descendants need group/Job cleanup.
+            // still required for best-effort cleanup of descendants that stay
+            // in the owned group or Job; Unix process groups are not complete
+            // ownership of descendants that detach with setsid.
             .kill_on_drop(true);
         configure_process_group(&mut command);
 
@@ -147,8 +150,10 @@ impl Tool for BashTool {
         let mut process_error = None;
         let mut tree_cleanup_started = false;
         let mut timeout_sleep = Box::pin(tokio::time::sleep(timeout));
+        let mut reader_drain_sleep = Box::pin(tokio::time::sleep(READER_DRAIN_GRACE));
 
         while status.is_none() || active_readers > 0 {
+            let was_running = status.is_none();
             if status.is_some() && !tree_cleanup_started {
                 process_tree.kill_best_effort();
                 tree_cleanup_started = true;
@@ -191,6 +196,10 @@ impl Tool for BashTool {
                         None => active_readers = 0,
                     }
                 }
+                _ = &mut reader_drain_sleep, if status.is_some() && active_readers > 0 => {
+                    reader_tasks.abort();
+                    active_readers = 0;
+                }
                 _ = cancel.cancelled(), if status.is_none() && !cancelled => {
                     cancelled = true;
                     terminate_child(&mut child, &process_tree).await?;
@@ -216,6 +225,11 @@ impl Tool for BashTool {
                     }
                 }
                 else => break,
+            }
+            if was_running && status.is_some() {
+                reader_drain_sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + READER_DRAIN_GRACE);
             }
         }
 
@@ -366,6 +380,12 @@ impl ReaderTasks {
         }
     }
 
+    fn abort(&self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+
     async fn join(mut self) {
         for handle in self.handles.drain(..) {
             let _ = handle.await;
@@ -375,9 +395,7 @@ impl ReaderTasks {
 
 impl Drop for ReaderTasks {
     fn drop(&mut self) {
-        for handle in &self.handles {
-            handle.abort();
-        }
+        self.abort();
     }
 }
 
@@ -433,6 +451,8 @@ impl Utf8Decoder {
     }
 }
 
+// On Unix this is a process-group ownership boundary, not a complete
+// representation of every descendant process.
 struct ProcessTree {
     #[cfg(unix)]
     process_group: Option<i32>,
@@ -1053,13 +1073,54 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn escaped_descendant_cannot_block_reader_drain_forever() {
+        let root = unique_test_dir("bash-escaped-descendant");
+        fs::create_dir_all(&root).unwrap();
+        let pid_path = root.join("escaped.pid");
+        let context = ToolContext::new(&root).unwrap();
+        let command = format!(
+            "setsid sh -c 'sleep 30' & echo $! > \"{}\"; exit 0",
+            pid_path.display()
+        );
+
+        let execution = tokio::time::timeout(
+            Duration::from_secs(1),
+            BashTool.execute(
+                json!({"command": command}),
+                &context,
+                mpsc::channel(8).0,
+                CancellationToken::new(),
+            ),
+        )
+        .await;
+
+        if let Some(pid) = fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok())
+        {
+            // The escaped command creates its own process group, so clean up
+            // the deliberately long-lived fixture after the assertion.
+            unsafe {
+                let _ = kill(-pid, SIGKILL);
+            }
+        }
+        let result = execution
+            .expect("escaped descendants must not block command completion")
+            .unwrap();
+        assert!(result.metadata.success);
+        remove_test_dir(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn normal_completion_kills_a_background_descendant_that_keeps_pipes_open() {
         let root = unique_test_dir("bash-normal-tree");
         fs::create_dir_all(&root).unwrap();
         let marker = root.join("marker");
         let context = ToolContext::new(&root).unwrap();
         let command = format!(
-            "(while :; do printf x >> \"{}\"; sleep 0.02; done) & exit 0",
+            "printf x >> \"{}\"; (while :; do printf x >> \"{}\"; sleep 0.02; done) & exit 0",
+            marker.display(),
             marker.display()
         );
 
