@@ -78,16 +78,20 @@ mod tests {
     fn coalesced_requests_share_one_bounded_deadline() {
         let now = Instant::now();
         let mut scheduler = RedrawScheduler::new(Duration::from_millis(12));
+        let mut frames = 0;
         for offset in 0..1_000 {
-            scheduler.request(
-                RedrawUrgency::Coalesced,
-                now + Duration::from_micros(offset),
-            );
+            let request_time = now + Duration::from_micros(offset);
+            scheduler.request(RedrawUrgency::Coalesced, request_time);
+            if scheduler.take_ready(request_time) {
+                frames += 1;
+            }
         }
         let deadline = scheduler.deadline().expect("burst should arm a deadline");
         assert_eq!(deadline, now + Duration::from_millis(12));
         assert!(!scheduler.take_ready(now + Duration::from_millis(11)));
         assert!(scheduler.take_ready(deadline));
+        frames += 1;
+        assert!(frames < 10);
         assert_eq!(scheduler.deadline(), None);
     }
 
