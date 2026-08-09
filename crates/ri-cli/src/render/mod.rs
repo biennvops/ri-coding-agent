@@ -978,6 +978,13 @@ mod tests {
         assert_eq!(renderer.stats().cache_misses, 0);
         assert!(renderer.stats().rows_visited < total_rows);
         assert_eq!(renderer.stats().rows_visited, renderer.stats().visible_rows);
+
+        renderer
+            .draw(&mut terminal, &state, total_rows)
+            .expect("scroll draw should succeed");
+        assert_eq!(renderer.stats().entries_reflowed, 0);
+        assert_eq!(renderer.stats().cache_misses, 0);
+        assert_eq!(renderer.stats().rows_visited, renderer.stats().visible_rows);
     }
 
     #[test]
