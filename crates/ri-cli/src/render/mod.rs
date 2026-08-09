@@ -797,8 +797,9 @@ fn append_tool_entry(lines: &mut Vec<CachedRow>, tool: &ToolTranscriptEntry, wid
 }
 
 fn append_layout_content(lines: &mut Vec<CachedRow>, content: &str, style: Style, width: usize) {
-    let (rows, _) = layout_content_section(content, style, width);
-    lines.extend(rows);
+    for line in content.split('\n') {
+        lines.extend(layout_styled_lines(&format!("  {line}"), style, width));
+    }
 }
 
 fn layout_content_section(
