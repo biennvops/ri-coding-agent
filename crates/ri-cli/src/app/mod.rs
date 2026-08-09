@@ -447,13 +447,17 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
     let mut error_message = None;
     let mut loop_error = None;
     let mut shutdown_requested = false;
+    let mut shutdown_source_closed = false;
 
     while turn_reason.is_none() {
         tokio::select! {
-            signal = shutdown.recv(), if !shutdown_requested => {
-                if signal.is_some() {
-                    shutdown_requested = true;
-                    let _ = command_tx.send(AgentCommand::Shutdown).await;
+            signal = shutdown.recv(), if !shutdown_requested && !shutdown_source_closed => {
+                match signal {
+                    Some(_) => {
+                        shutdown_requested = true;
+                        let _ = command_tx.send(AgentCommand::Shutdown).await;
+                    }
+                    None => shutdown_source_closed = true,
                 }
             }
             event = event_rx.recv() => {
@@ -599,12 +603,16 @@ async fn run_json(prompt: String, setup: AppSetup) -> Result<()> {
     let mut saw_error = false;
     let mut loop_error = None;
     let mut shutdown_requested = false;
+    let mut shutdown_source_closed = false;
     while turn_reason.is_none() {
         tokio::select! {
-            signal = shutdown.recv(), if !shutdown_requested => {
-                if signal.is_some() {
-                    shutdown_requested = true;
-                    let _ = command_tx.send(AgentCommand::Shutdown).await;
+            signal = shutdown.recv(), if !shutdown_requested && !shutdown_source_closed => {
+                match signal {
+                    Some(_) => {
+                        shutdown_requested = true;
+                        let _ = command_tx.send(AgentCommand::Shutdown).await;
+                    }
+                    None => shutdown_source_closed = true,
                 }
             }
             event = event_rx.recv() => {
@@ -779,6 +787,7 @@ async fn run_tui_loop(
     let mut preferred_column = None;
     let mut terminal_events = EventStream::new();
     let mut exit = false;
+    let mut shutdown_source_closed = false;
 
     while !exit {
         if redraw.take_ready(Instant::now()) {
@@ -799,9 +808,10 @@ async fn run_tui_loop(
         let redraw_deadline = redraw.deadline();
         tokio::select! {
             biased;
-            signal = shutdown.recv() => {
-                if signal.is_some() {
-                    exit = true;
+            signal = shutdown.recv(), if !shutdown_source_closed => {
+                match signal {
+                    Some(_) => exit = true,
+                    None => shutdown_source_closed = true,
                 }
             }
             _ = wait_for_redraw(redraw_deadline) => {}
