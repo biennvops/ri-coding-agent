@@ -147,18 +147,22 @@ fn install_panic_hook() {
 }
 
 fn emergency_restore() {
+    let mut ops = CrosstermModeOps;
+    emergency_restore_with(&mut ops);
+    crate::logging::flush_best_effort();
+}
+
+fn emergency_restore_with<O: TerminalModeOps>(ops: &mut O) {
     if !TERMINAL_MODE_ACTIVE.swap(false, Ordering::AcqRel) {
         return;
     }
 
     // Each operation is independent so one failed terminal transition cannot
     // prevent the remaining emergency cleanup or the original panic report.
-    let mut stdout = io::stdout();
-    let _ = execute!(stdout, Show);
-    let _ = execute!(stdout, LeaveAlternateScreen);
-    let _ = disable_raw_mode();
-    let _ = stdout.flush();
-    crate::logging::flush_best_effort();
+    let _ = ops.show_cursor();
+    let _ = ops.leave_alternate();
+    let _ = ops.disable_raw();
+    let _ = ops.flush();
 }
 
 impl TerminalGuard {
@@ -196,8 +200,15 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::sync::{Mutex, MutexGuard};
 
     use super::*;
+
+    static TERMINAL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn terminal_test_lock() -> MutexGuard<'static, ()> {
+        TERMINAL_TEST_LOCK.lock().unwrap()
+    }
 
     #[derive(Default)]
     struct FakeModeOps {
@@ -256,6 +267,7 @@ mod tests {
 
     #[test]
     fn restore_is_ordered_and_drop_is_safe() {
+        let _lock = terminal_test_lock();
         let mut guard = active_mode();
         guard.restore().unwrap();
         assert_eq!(
@@ -274,6 +286,7 @@ mod tests {
 
     #[test]
     fn restore_then_drop_does_not_repeat_transitions() {
+        let _lock = terminal_test_lock();
         let mut guard = active_mode();
         guard.restore().unwrap();
         let calls = guard.ops.calls.len();
@@ -283,6 +296,7 @@ mod tests {
 
     #[test]
     fn restoration_attempts_remaining_steps_after_an_error() {
+        let _lock = terminal_test_lock();
         let mut guard = TerminalModeGuard::new(FakeModeOps::default().fail_on("leave_alternate"));
         guard.enable_raw().unwrap();
         guard.enter_alternate().unwrap();
@@ -303,6 +317,7 @@ mod tests {
 
     #[test]
     fn failed_raw_enable_does_not_claim_terminal_ownership() {
+        let _lock = terminal_test_lock();
         let mut guard = TerminalModeGuard::new(FakeModeOps::default().fail_on("enable_raw"));
         assert!(guard.enable_raw().is_err());
         assert!(guard.restore().is_ok());
@@ -311,6 +326,7 @@ mod tests {
 
     #[test]
     fn failed_alternate_entry_restores_raw_mode() {
+        let _lock = terminal_test_lock();
         let mut guard = TerminalModeGuard::new(FakeModeOps::default().fail_on("enter_alternate"));
         guard.enable_raw().unwrap();
         assert!(guard.enter_alternate().is_err());
@@ -328,7 +344,21 @@ mod tests {
     }
 
     #[test]
+    fn panic_restore_attempts_all_steps_even_after_an_error() {
+        let _lock = terminal_test_lock();
+        TERMINAL_MODE_ACTIVE.store(true, Ordering::Release);
+        let mut ops = FakeModeOps::default().fail_on("leave_alternate");
+        emergency_restore_with(&mut ops);
+        assert_eq!(
+            ops.calls,
+            vec!["show_cursor", "leave_alternate", "disable_raw", "flush"]
+        );
+        assert!(!TERMINAL_MODE_ACTIVE.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn inactive_panic_restore_is_a_no_op() {
+        let _lock = terminal_test_lock();
         TERMINAL_MODE_ACTIVE.store(false, Ordering::Release);
         emergency_restore();
         assert!(!TERMINAL_MODE_ACTIVE.load(Ordering::Acquire));
