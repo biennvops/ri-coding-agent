@@ -78,6 +78,15 @@ impl ModelProvider for OpenAiProvider {
         }
 
         let model = self.current_model();
+        tracing::debug!(
+            target: "ri_core::model",
+            provider = %model.model_ref.provider,
+            model = %model.model_ref.model,
+            api = %model.api,
+            message_count = request.messages.len(),
+            tool_count = request.tools.len(),
+            "provider request started"
+        );
         let (endpoint, body) = request_for(&model, &request)?;
         let mut builder = self
             .client
@@ -109,6 +118,13 @@ impl ModelProvider for OpenAiProvider {
             })?,
         };
 
+        tracing::debug!(
+            target: "ri_core::model",
+            provider = %model.model_ref.provider,
+            model = %model.model_ref.model,
+            status = response.status().as_u16(),
+            "provider response received"
+        );
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let message = read_error_body(response, cancel.clone()).await?;
@@ -143,7 +159,34 @@ impl ModelProvider for OpenAiProvider {
             process_payloads(parser.finish()?, api, &events, &cancel, &mut collector).await?;
         }
 
-        collector.finish()
+        let result = collector.finish();
+        match &result {
+            Ok(response) => tracing::debug!(
+                target: "ri_core::model",
+                provider = %model.model_ref.provider,
+                model = %model.model_ref.model,
+                stop_reason = ?response.stop_reason,
+                "provider request finished"
+            ),
+            Err(error) => tracing::warn!(
+                target: "ri_core::model",
+                provider = %model.model_ref.provider,
+                model = %model.model_ref.model,
+                error_kind = provider_error_kind(error),
+                "provider request failed"
+            ),
+        }
+        result
+    }
+}
+
+fn provider_error_kind(error: &ProviderError) -> &'static str {
+    match error {
+        ProviderError::Cancelled => "cancelled",
+        ProviderError::Failed { .. } => "failed",
+        ProviderError::ContextOverflow { .. } => "context_overflow",
+        ProviderError::Http { .. } => "http",
+        ProviderError::Malformed { .. } => "malformed",
     }
 }
 
