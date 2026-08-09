@@ -551,6 +551,18 @@ async fn terminate_child(
     child: &mut Child,
     process_tree: &ProcessTreeGuard,
 ) -> Result<(), ToolError> {
+    // Cleanup races with natural exit. In that case the later status poll will
+    // still trigger best-effort descendant cleanup, but termination itself is
+    // not an infrastructure failure.
+    if child
+        .try_wait()
+        .map_err(|error| {
+            ToolError::Failed(format!("could not inspect command during cleanup: {error}"))
+        })?
+        .is_some()
+    {
+        return Ok(());
+    }
     process_tree.terminate(child)?;
     tokio::time::sleep(TERMINATION_GRACE).await;
     process_tree.kill_best_effort();
