@@ -244,8 +244,8 @@ impl AppState {
     pub fn replace_history(&mut self, history: &[ModelMessage]) {
         self.transcript_epoch = self.transcript_epoch.wrapping_add(1);
         self.pending_transcript_changes.clear();
-        self.message_entry_indices.clear();
-        self.entries.clear();
+        self.message_entry_indices = Vec::new();
+        self.entries = Vec::new();
         self.streaming_assistant = None;
         self.input.clear();
         self.cursor = 0;
