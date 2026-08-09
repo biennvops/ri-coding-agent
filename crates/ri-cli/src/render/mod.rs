@@ -1072,7 +1072,7 @@ mod tests {
     #[test]
     fn transcripts_beyond_u16_rows_scroll_to_distinct_viewports() {
         let mut state = AppState::new();
-        for index in 0..24_000 {
+        for index in 0..34_000 {
             state.add_system_message(format!("marker-{index:05}"));
         }
         let mut renderer = TuiRenderer::new();
@@ -1092,7 +1092,7 @@ mod tests {
         renderer
             .draw(&mut terminal, &state, 0)
             .expect("bottom draw should succeed");
-        assert!(buffer_contains(terminal.backend().buffer(), "marker-23999"));
+        assert!(buffer_contains(terminal.backend().buffer(), "marker-33999"));
 
         let middle_scroll = maximum_scroll / 2;
         renderer
