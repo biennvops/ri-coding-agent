@@ -1,8 +1,13 @@
+mod fixtures;
+
+pub use fixtures::{append_streaming_delta, synthetic_transcript};
+
+use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::Frame;
+use ratatui::{Frame, Terminal};
 use ri_core::{AppState, MessageRole, ModelRef, ToolStatus, TranscriptEntry};
 
 use crate::input::VisualLayout;
@@ -13,7 +18,15 @@ pub fn draw(
     state: &AppState,
     scroll_from_bottom: usize,
 ) -> std::io::Result<()> {
-    terminal.terminal_mut().draw(|frame| {
+    draw_terminal(terminal.terminal_mut(), state, scroll_from_bottom)
+}
+
+pub fn draw_terminal<B: Backend>(
+    terminal: &mut Terminal<B>,
+    state: &AppState,
+    scroll_from_bottom: usize,
+) -> Result<(), B::Error> {
+    terminal.draw(|frame| {
         render_frame(frame, state, scroll_from_bottom);
     })?;
     Ok(())

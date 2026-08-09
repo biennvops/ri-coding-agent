@@ -8,6 +8,10 @@ license.workspace = true
 name = "ri"
 path = "src/main.rs"
 
+[[bench]]
+name = "tui_render"
+harness = false
+
 [dependencies]
 anyhow = "1"
 crossterm = { version = "0.29", features = ["event-stream"] }
