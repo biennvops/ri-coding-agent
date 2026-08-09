@@ -121,6 +121,7 @@ pub struct AppState {
     pending_transcript_changes: Vec<TranscriptEntryId>,
     input: String,
     cursor: usize,
+    input_revision: u64,
     turn_active: bool,
     compaction_active: bool,
     last_error: Option<String>,
@@ -179,6 +180,10 @@ impl AppState {
 
     pub fn cursor(&self) -> usize {
         self.cursor
+    }
+
+    pub fn input_revision(&self) -> u64 {
+        self.input_revision
     }
 
     pub fn set_cursor(&mut self, cursor: usize) {
@@ -244,6 +249,7 @@ impl AppState {
         self.streaming_assistant = None;
         self.input.clear();
         self.cursor = 0;
+        self.input_revision = self.input_revision.wrapping_add(1);
         self.turn_active = false;
         self.compaction_active = false;
         self.last_error = None;
@@ -268,6 +274,7 @@ impl AppState {
         }
         self.input.insert_str(self.cursor, text);
         self.cursor += text.len();
+        self.input_revision = self.input_revision.wrapping_add(1);
     }
 
     pub fn insert_newline(&mut self) {
@@ -281,6 +288,7 @@ impl AppState {
         let previous = previous_grapheme_boundary(&self.input, self.cursor);
         self.input.drain(previous..self.cursor);
         self.cursor = previous;
+        self.input_revision = self.input_revision.wrapping_add(1);
     }
 
     pub fn delete(&mut self) {
@@ -289,6 +297,7 @@ impl AppState {
         }
         let next = next_grapheme_boundary(&self.input, self.cursor);
         self.input.drain(self.cursor..next);
+        self.input_revision = self.input_revision.wrapping_add(1);
     }
 
     pub fn move_left(&mut self) {
@@ -321,6 +330,7 @@ impl AppState {
         }
         let text = std::mem::take(&mut self.input);
         self.cursor = 0;
+        self.input_revision = self.input_revision.wrapping_add(1);
         Some(text)
     }
 
@@ -1203,6 +1213,19 @@ mod tests {
             .messages()
             .iter()
             .any(|message| { message.content.contains("context compacted") }));
+    }
+
+    #[test]
+    fn editor_revision_changes_for_text_edits_but_not_cursor_motion() {
+        let mut state = AppState::new();
+        let initial = state.input_revision();
+        state.insert_text("text");
+        let after_insert = state.input_revision();
+        assert!(after_insert > initial);
+        state.move_left();
+        assert_eq!(state.input_revision(), after_insert);
+        state.backspace();
+        assert!(state.input_revision() > after_insert);
     }
 
     #[test]
