@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -1256,6 +1256,7 @@ fn read_session_inner(path: &Path, include_history: bool) -> Result<SessionSnaps
                 if include_history {
                     messages.push(StoredMessage {
                         id: id.clone(),
+                        parent_id: parent_id.clone(),
                         message: message.clone(),
                         sequence: line_number,
                     });
@@ -1298,6 +1299,8 @@ fn read_session_inner(path: &Path, include_history: bool) -> Result<SessionSnaps
                 last_message_id = Some(id.clone());
                 if include_history {
                     compactions.push(StoredCompaction {
+                        id: id.clone(),
+                        parent_id: parent_id.clone(),
                         summary: summary.clone(),
                         retained_message_ids: retained_message_ids.clone(),
                         sequence: line_number,
@@ -1349,7 +1352,7 @@ fn read_session_inner(path: &Path, include_history: bool) -> Result<SessionSnaps
         });
     };
     let (history, transcript, active_summary, active_message_ids) = if include_history {
-        active_projection(&messages, &compactions)
+        active_projection(&messages, &compactions, last_message_id.as_ref())
     } else {
         (Vec::new(), Vec::new(), None, Vec::new())
     };
@@ -1381,12 +1384,15 @@ fn read_session_inner(path: &Path, include_history: bool) -> Result<SessionSnaps
 #[derive(Clone)]
 struct StoredMessage {
     id: MessageId,
+    parent_id: Option<MessageId>,
     message: SessionMessage,
     sequence: usize,
 }
 
 #[derive(Clone)]
 struct StoredCompaction {
+    id: MessageId,
+    parent_id: Option<MessageId>,
     summary: String,
     retained_message_ids: Vec<MessageId>,
     sequence: usize,
@@ -1424,6 +1430,7 @@ fn validate_parent(
 fn active_projection(
     messages: &[StoredMessage],
     compactions: &[StoredCompaction],
+    latest_id: Option<&MessageId>,
 ) -> (
     Vec<ModelMessage>,
     Vec<ModelMessage>,
@@ -1434,15 +1441,47 @@ fn active_projection(
         .iter()
         .map(|message| message.message.clone().into_model())
         .collect();
-    let Some(compaction) = compactions.last() else {
-        let ids = messages.iter().map(|message| message.id.clone()).collect();
-        return (transcript.clone(), transcript, None, ids);
+    let mut parents = HashMap::with_capacity(messages.len() + compactions.len());
+    for message in messages {
+        parents.insert(message.id.clone(), message.parent_id.clone());
+    }
+    for compaction in compactions {
+        parents.insert(compaction.id.clone(), compaction.parent_id.clone());
+    }
+
+    let mut active_chain = HashSet::new();
+    let mut next = latest_id.cloned();
+    while let Some(id) = next {
+        if !active_chain.insert(id.clone()) {
+            break;
+        }
+        next = parents.get(&id).cloned().flatten();
+    }
+
+    let active_compaction = compactions
+        .iter()
+        .rfind(|compaction| active_chain.contains(&compaction.id));
+    let Some(compaction) = active_compaction else {
+        let active_messages: Vec<(MessageId, ModelMessage)> = messages
+            .iter()
+            .filter(|message| active_chain.contains(&message.id))
+            .map(|message| (message.id.clone(), message.message.clone().into_model()))
+            .collect();
+        let active_ids = active_messages.iter().map(|(id, _)| id.clone()).collect();
+        let history = active_messages
+            .into_iter()
+            .map(|(_, message)| message)
+            .collect();
+        return (history, transcript, None, active_ids);
     };
 
     let retained: HashSet<&MessageId> = compaction.retained_message_ids.iter().collect();
     let mut active_messages = Vec::new();
     let mut active_ids = Vec::new();
     for message in messages {
+        if !active_chain.contains(&message.id) {
+            continue;
+        }
         if (message.sequence < compaction.sequence && retained.contains(&message.id))
             || message.sequence > compaction.sequence
         {
@@ -1823,6 +1862,61 @@ mod tests {
         assert_eq!(lines[1]["parentId"], serde_json::Value::Null);
         assert_eq!(lines[2]["parentId"], lines[1]["id"]);
         fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn active_projection_follows_latest_parent_chain_but_keeps_full_transcript() {
+        let root = test_dir("branch");
+        fs::create_dir_all(&root).unwrap();
+        let repository = SessionRepository::new(root.join("sessions"), &root, &root).unwrap();
+        let handle = repository.create().unwrap();
+        handle
+            .append_message(&ModelMessage::user("root request"))
+            .unwrap();
+        handle
+            .append_message(&ModelMessage::Assistant {
+                items: vec![ModelAssistantItem::Text {
+                    content: "abandoned answer".to_owned(),
+                }],
+            })
+            .unwrap();
+        let path = handle.info().unwrap().path;
+        drop(handle);
+
+        let records: Vec<SessionRecord> = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let root_id = match &records[1] {
+            SessionRecord::Message { id, .. } => id.clone(),
+            record => panic!("expected root message, got {record:?}"),
+        };
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        append_record(
+            &mut file,
+            &SessionRecord::Message {
+                id: MessageId::from("active-branch"),
+                parent_id: Some(root_id),
+                timestamp: now_timestamp(),
+                message: SessionMessage::User {
+                    content: "active branch request".to_owned(),
+                },
+            },
+            &path,
+        )
+        .unwrap();
+
+        let snapshot = read_session(&path).unwrap();
+        assert_eq!(snapshot.transcript.len(), 3);
+        assert_eq!(
+            snapshot.history,
+            vec![
+                ModelMessage::user("root request"),
+                ModelMessage::user("active branch request"),
+            ]
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

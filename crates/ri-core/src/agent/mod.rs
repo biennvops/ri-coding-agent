@@ -1040,7 +1040,9 @@ fn select_compaction_prefix(
         .filter_map(|(index, segment)| segment.has_user_message.then_some(index))
         .collect();
     let current_segment = user_segments.last().copied().unwrap_or(segments.len() - 1);
-    let eligible_end = if user_segments.len() > 2 {
+    let eligible_end = if force {
+        current_segment
+    } else if user_segments.len() > 2 {
         user_segments[user_segments.len() - 2].min(current_segment)
     } else {
         0
@@ -2735,6 +2737,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn emergency_compaction_recovers_after_a_large_current_turn_tool_result() {
+        let initial_history = vec![
+            ModelMessage::user("previous request ".repeat(100)),
+            ModelMessage::Assistant {
+                items: vec![ModelAssistantItem::Text {
+                    content: "previous answer ".repeat(100),
+                }],
+            },
+        ];
+        let provider = ScriptedProvider::new(vec![
+            ScriptedStep {
+                events: Vec::new(),
+                response: ModelResponse {
+                    items: vec![ModelAssistantItem::ToolCall(tool_call(
+                        "large",
+                        "bash",
+                        r#"{"command":"printf '%*s' 20000 '' | tr ' ' x"}"#,
+                    ))],
+                    stop_reason: StopReason::ToolCalls,
+                    usage: None,
+                },
+            },
+            final_step("emergency summary"),
+            final_step("done after recovery"),
+        ])
+        .with_limits(ModelLimits {
+            context_window: Some(1_000),
+            max_output_tokens: Some(100),
+        })
+        .with_overflow_after_tool_result_once();
+        let requests = Arc::clone(&provider.requests);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let runtime = AgentRuntime::with_config(
+            provider,
+            AgentRuntimeConfig {
+                tool_context: ToolContext::from_current_dir().unwrap(),
+                base_messages: Vec::new(),
+                initial_history,
+                session: SessionMode::Disabled,
+            },
+        );
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "inspect a large result".to_owned(),
+            })
+            .await
+            .unwrap();
+        let events = collect_turn(&mut event_rx).await;
+        assert!(events
+            .iter()
+            .any(|event| { matches!(event, AgentEvent::CompactionStarted { automatic: true }) }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::TurnFinished {
+                    reason: StopReason::Stop
+                }
+            )
+        }));
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[1].messages.iter().any(|message| {
+            matches!(message, ModelMessage::ToolResult { content, .. } if content.len() > 1_000)
+        }));
+        assert!(matches!(
+            requests[2].messages.first(),
+            Some(ModelMessage::System { content }) if content.contains("Return only the continuation summary")
+        ));
+        assert!(matches!(
+            requests[3].messages.first(),
+            Some(ModelMessage::Developer { content }) if content.contains("emergency summary")
+        ));
+    }
+
+    #[tokio::test]
     async fn context_overflow_is_retried_once_after_emergency_compaction() {
         let initial_history = vec![
             ModelMessage::user("old one ".repeat(20)),
@@ -2805,6 +2887,7 @@ mod tests {
         requests: Arc<Mutex<Vec<ModelRequest>>>,
         limits: ModelLimits,
         overflow_once: Arc<Mutex<bool>>,
+        overflow_after_tool_result_once: Arc<Mutex<bool>>,
     }
 
     struct ScriptedStep {
@@ -2819,6 +2902,7 @@ mod tests {
                 requests: Arc::new(Mutex::new(Vec::new())),
                 limits: ModelLimits::default(),
                 overflow_once: Arc::new(Mutex::new(false)),
+                overflow_after_tool_result_once: Arc::new(Mutex::new(false)),
             }
         }
 
@@ -2829,6 +2913,11 @@ mod tests {
 
         fn with_overflow_once(self) -> Self {
             *self.overflow_once.lock().unwrap() = true;
+            self
+        }
+
+        fn with_overflow_after_tool_result_once(self) -> Self {
+            *self.overflow_after_tool_result_once.lock().unwrap() = true;
             self
         }
     }
@@ -2846,9 +2935,20 @@ mod tests {
             cancel: CancellationToken,
         ) -> Result<ModelResponse, ProviderError> {
             let has_tools = !request.tools.is_empty();
+            let has_tool_result = request
+                .messages
+                .iter()
+                .any(|message| matches!(message, ModelMessage::ToolResult { .. }));
             self.requests.lock().unwrap().push(request);
-            if has_tools && *self.overflow_once.lock().unwrap() {
-                *self.overflow_once.lock().unwrap() = false;
+            let overflow = (has_tools && *self.overflow_once.lock().unwrap())
+                || (has_tool_result && *self.overflow_after_tool_result_once.lock().unwrap());
+            if overflow {
+                if has_tools && *self.overflow_once.lock().unwrap() {
+                    *self.overflow_once.lock().unwrap() = false;
+                }
+                if has_tool_result && *self.overflow_after_tool_result_once.lock().unwrap() {
+                    *self.overflow_after_tool_result_once.lock().unwrap() = false;
+                }
                 return Err(ProviderError::ContextOverflow {
                     message: "scripted context overflow".to_owned(),
                 });
