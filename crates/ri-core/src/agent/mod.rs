@@ -1650,6 +1650,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_task_panic_becomes_a_recoverable_runtime_error() {
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let runtime = AgentRuntime::new(PanickingProvider);
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "panic".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let events = collect_turn(&mut event_rx).await;
+        assert!(events.iter().any(|event| {
+            matches!(event, AgentEvent::Error(error) if error.message.contains("provider task failed"))
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::TurnFinished {
+                    reason: StopReason::Error
+                }
+            )
+        }));
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn shutdown_during_provider_request_cancels_and_joins_without_a_second_request() {
         let provider = BlockingProvider::default();
         let calls = Arc::clone(&provider.calls);
@@ -3035,6 +3064,20 @@ mod tests {
         command_tx.send(AgentCommand::Shutdown).await.unwrap();
         runtime_task.await.unwrap();
         assert_eq!(requests.lock().unwrap().len(), 3);
+    }
+
+    struct PanickingProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for PanickingProvider {
+        async fn stream(
+            &self,
+            _request: ModelRequest,
+            _events: mpsc::Sender<ModelEvent>,
+            _cancel: CancellationToken,
+        ) -> Result<ModelResponse, ProviderError> {
+            panic!("intentional provider task panic");
+        }
     }
 
     #[derive(Clone, Default)]
