@@ -93,6 +93,45 @@ fn json_continue_reuses_the_persistent_session() {
 }
 
 #[test]
+fn json_mode_emits_tool_lifecycle_events_from_the_shared_runtime() {
+    let fixture = Fixture::in_home_with_responses(
+        unique_dir("cli-tool-fixture"),
+        vec![("200 OK", tool_call_body()), ("200 OK", success_body())],
+        None,
+    );
+    let output = fixture.run(&[
+        "--json",
+        "-p",
+        "run the tool",
+        "--no-session",
+        "--no-context",
+    ]);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        text(&output.stdout),
+        text(&output.stderr)
+    );
+    let records = parse_records(&output.stdout);
+    let tool_started = records
+        .iter()
+        .find(|record| record["type"] == "tool_started")
+        .expect("tool_started event should be present");
+    assert_eq!(tool_started["data"]["name"], "bash");
+    assert_eq!(tool_started["data"]["callId"], "call-1");
+    assert!(records.iter().any(|record| {
+        record["type"] == "tool_output" && record["data"]["chunk"] == "tool-output"
+    }));
+    let tool_finished = records
+        .iter()
+        .find(|record| record["type"] == "tool_finished")
+        .expect("tool_finished event should be present");
+    assert_eq!(tool_finished["data"]["success"], true);
+    fixture.finish();
+}
+
+#[test]
 fn json_provider_failure_emits_terminal_error_events_and_status_one() {
     let _lock = cli_test_lock();
     let fixture = Fixture::with_response("500 Internal Server Error", "provider exploded");
@@ -200,6 +239,13 @@ fn text(value: &[u8]) -> String {
     String::from_utf8_lossy(value).into_owned()
 }
 
+fn tool_call_body() -> &'static str {
+    concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"printf tool-output\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    )
+}
+
 fn success_body() -> &'static str {
     concat!(
         "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"},\"finish_reason\":null}]}\n\n",
@@ -241,9 +287,17 @@ impl Fixture {
         body: &'static str,
         api_key: Option<&str>,
     ) -> Self {
+        Self::in_home_with_responses(home, vec![(status, body)], api_key)
+    }
+
+    fn in_home_with_responses(
+        home: PathBuf,
+        responses: Vec<(&'static str, &'static str)>,
+        api_key: Option<&str>,
+    ) -> Self {
         fs::create_dir_all(&home).unwrap();
         let models = home.join("models.json");
-        let server = spawn_server(status, body);
+        let server = spawn_servers(responses);
         let api_key = api_key
             .map(|value| format!(",\"apiKey\":{value:?}"))
             .unwrap_or_default();
@@ -304,17 +358,19 @@ impl TestServer {
     }
 }
 
-fn spawn_server(status: &'static str, body: &'static str) -> TestServer {
+fn spawn_servers(responses: Vec<(&'static str, &'static str)>) -> TestServer {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
-    let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
     let join = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let _ = read_request(&mut stream);
-        stream.write_all(response.as_bytes()).unwrap();
+        for (status, body) in responses {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
     });
     TestServer {
         url: format!("http://{address}"),
