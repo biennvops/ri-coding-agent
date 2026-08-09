@@ -41,23 +41,17 @@ async fn run_main() -> i32 {
 
     match app::run(options).await {
         Ok(()) => 0,
-        Err(app::RunError::Setup(error)) => {
+        Err(error) => {
             eprintln!("ri: error: {error}");
-            2
-        }
-        Err(app::RunError::Runtime(error)) => {
-            eprintln!("ri: error: {error}");
-            1
+            run_error_exit_code(&error)
         }
     }
 }
 
-#[cfg(test)]
-fn run_main_exit_code_for_test(error: Option<app::RunError>) -> i32 {
+fn run_error_exit_code(error: &app::RunError) -> i32 {
     match error {
-        None => 0,
-        Some(app::RunError::Setup(_)) => 2,
-        Some(app::RunError::Runtime(_)) => 1,
+        app::RunError::Setup(_) => 2,
+        app::RunError::Runtime(_) => 1,
     }
 }
 
@@ -65,17 +59,12 @@ fn run_main_exit_code_for_test(error: Option<app::RunError>) -> i32 {
 mod tests {
     #[test]
     fn exit_codes_are_stable() {
-        assert_eq!(super::run_main_exit_code_for_test(None), 0);
         assert_eq!(
-            super::run_main_exit_code_for_test(Some(crate::app::RunError::Setup(anyhow::anyhow!(
-                "setup"
-            ),))),
+            super::run_error_exit_code(&crate::app::RunError::Setup(anyhow::anyhow!("setup"))),
             2
         );
         assert_eq!(
-            super::run_main_exit_code_for_test(Some(crate::app::RunError::Runtime(
-                anyhow::anyhow!("runtime"),
-            ))),
+            super::run_error_exit_code(&crate::app::RunError::Runtime(anyhow::anyhow!("runtime"))),
             1
         );
     }
