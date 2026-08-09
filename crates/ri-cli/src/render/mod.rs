@@ -17,7 +17,6 @@ use ri_core::{
 };
 
 use crate::input::VisualLayout;
-use crate::terminal::TerminalGuard;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RenderStats {
@@ -189,24 +188,6 @@ impl TuiRenderer {
             frame.set_cursor_position((x.min(max_x), y.min(max_y)));
         }
     }
-}
-
-pub fn draw(
-    terminal: &mut TerminalGuard,
-    state: &AppState,
-    scroll_from_bottom: usize,
-) -> std::io::Result<()> {
-    let mut renderer = TuiRenderer::new();
-    renderer.draw(terminal.terminal_mut(), state, scroll_from_bottom)
-}
-
-pub fn draw_terminal<B: Backend>(
-    terminal: &mut Terminal<B>,
-    state: &AppState,
-    scroll_from_bottom: usize,
-) -> Result<(), B::Error> {
-    let mut renderer = TuiRenderer::new();
-    renderer.draw(terminal, state, scroll_from_bottom)
 }
 
 #[derive(Clone, Debug)]
