@@ -12,7 +12,9 @@ pub use agent::{
     MAX_TOOL_ROUNDS_PER_TURN,
 };
 pub use app::{
-    AppState, MessageRole, ToolStatus, ToolTranscriptEntry, TranscriptEntry, TranscriptMessage,
+    AppState, MessageRole, StreamingAssistantState, ToolStatus, ToolTranscriptEntry,
+    TranscriptEntry, TranscriptEntryId, TranscriptEntryState, TranscriptMessage,
+    TranscriptMessages,
 };
 pub use config::{
     default_state_path, load_state, persist_recent_model, ApiKind, CompactionSettings,

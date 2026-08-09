@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use crossterm::event::{Event, EventStream, KeyEventKind};
@@ -15,14 +16,16 @@ use ri_core::{
 };
 use tokio::sync::mpsc;
 
-use crate::input::{self, Action, VisualLayout};
+use crate::input::{self, Action};
 use crate::json_output::{JsonEmitter, RunStartedData};
 use crate::model_selection::resolve_model;
-use crate::render;
+use crate::redraw::{RedrawScheduler, RedrawUrgency};
+use crate::render::TuiRenderer;
 use crate::terminal::TerminalGuard;
 
 const COMMAND_CHANNEL_CAPACITY: usize = 16;
 const EVENT_CHANNEL_CAPACITY: usize = 256;
+const MAX_AGENT_EVENTS_PER_FRAME: usize = 64;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Options {
@@ -627,9 +630,11 @@ async fn run_tui(mut setup: AppSetup) -> Result<()> {
     state.set_session_info(setup.session_info()?);
     state.reduce(AgentEvent::ModelChanged(setup.model_ref()));
     state.reduce(AgentEvent::ContextLimitsUpdated(setup.provider.limits()));
+    let mut renderer = TuiRenderer::new();
     let tui_result = run_tui_loop(
         &mut terminal,
         &mut state,
+        &mut renderer,
         &command_tx,
         &mut event_rx,
         &mut setup,
@@ -651,11 +656,13 @@ async fn run_tui(mut setup: AppSetup) -> Result<()> {
 async fn run_tui_loop(
     terminal: &mut TerminalGuard,
     state: &mut AppState,
+    renderer: &mut TuiRenderer,
     command_tx: &mpsc::Sender<AgentCommand>,
     event_rx: &mut mpsc::Receiver<AgentEvent>,
     setup: &mut AppSetup,
 ) -> Result<()> {
-    let mut dirty = true;
+    let mut redraw = RedrawScheduler::new(Duration::from_millis(12));
+    redraw.request(RedrawUrgency::Immediate, Instant::now());
     let mut scroll_from_bottom = 0usize;
     let mut editor_width = terminal
         .terminal_mut()
@@ -669,13 +676,25 @@ async fn run_tui_loop(
     let mut exit = false;
 
     while !exit {
-        if dirty {
-            render::draw(terminal, state, scroll_from_bottom)
+        if redraw.take_ready(Instant::now()) {
+            drain_ready_agent_events(
+                state,
+                event_rx,
+                &setup.context,
+                &mut scroll_from_bottom,
+                &mut redraw,
+            )?;
+            redraw.mark_drawn();
+            renderer
+                .draw(terminal.terminal_mut(), state, scroll_from_bottom)
                 .context("could not render terminal")?;
-            dirty = false;
+            state.acknowledge_transcript_changes();
         }
 
+        let redraw_deadline = redraw.deadline();
         tokio::select! {
+            biased;
+            _ = wait_for_redraw(redraw_deadline) => {}
             terminal_event = terminal_events.next() => {
                 let terminal_event = terminal_event
                     .ok_or_else(|| anyhow!("terminal event stream disconnected"))?
@@ -683,7 +702,7 @@ async fn run_tui_loop(
                 match terminal_event {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         if let Some(action) = input::action_for(key) {
-                            dirty = true;
+                            redraw.request(RedrawUrgency::Immediate, Instant::now());
                             if !matches!(action, Action::Up | Action::Down) {
                                 preferred_column = None;
                             }
@@ -742,8 +761,9 @@ async fn run_tui_loop(
                                 Action::Right => state.move_right(),
                                 Action::Up | Action::Down => {
                                     let direction = if matches!(action, Action::Up) { -1 } else { 1 };
-                                    let layout = VisualLayout::new(state.input(), editor_width);
-                                    if let Some((cursor, desired_column)) = layout.move_vertical(
+                                    if let Some((cursor, desired_column)) = renderer.move_editor_vertical(
+                                        state,
+                                        editor_width,
                                         state.cursor(),
                                         direction,
                                         preferred_column,
@@ -766,7 +786,7 @@ async fn run_tui_loop(
                     Event::Resize(width, _) => {
                         editor_width = width.saturating_sub(2).max(1) as usize;
                         preferred_column = None;
-                        dirty = true;
+                        redraw.request(RedrawUrgency::Immediate, Instant::now());
                     }
                     _ => {}
                 }
@@ -774,21 +794,84 @@ async fn run_tui_loop(
             agent_event = event_rx.recv() => {
                 let event = agent_event
                     .ok_or_else(|| anyhow!("agent event stream disconnected"))?;
-                if matches!(event, AgentEvent::TurnFinished { .. }) {
-                    scroll_from_bottom = 0;
-                }
-                log_agent_event(&event);
-                let session_loaded = matches!(event, AgentEvent::SessionLoaded { .. });
-                state.reduce(event);
-                if session_loaded {
-                    state.add_system_message(setup.context.diagnostic());
-                }
-                dirty = true;
+                let urgency = apply_agent_event(
+                    event,
+                    state,
+                    &setup.context,
+                    &mut scroll_from_bottom,
+                );
+                redraw.request(urgency, Instant::now());
             }
         }
     }
 
     Ok(())
+}
+
+fn apply_agent_event(
+    event: AgentEvent,
+    state: &mut AppState,
+    context: &ContextBundle,
+    scroll_from_bottom: &mut usize,
+) -> RedrawUrgency {
+    if matches!(event, AgentEvent::TurnFinished { .. }) {
+        *scroll_from_bottom = 0;
+    }
+    let urgency = redraw_urgency(&event);
+    log_agent_event(&event);
+    let session_loaded = matches!(event, AgentEvent::SessionLoaded { .. });
+    state.reduce(event);
+    if session_loaded {
+        state.add_system_message(context.diagnostic());
+    }
+    urgency
+}
+
+fn drain_ready_agent_events(
+    state: &mut AppState,
+    event_rx: &mut mpsc::Receiver<AgentEvent>,
+    context: &ContextBundle,
+    scroll_from_bottom: &mut usize,
+    redraw: &mut RedrawScheduler,
+) -> Result<()> {
+    for _ in 0..MAX_AGENT_EVENTS_PER_FRAME {
+        match event_rx.try_recv() {
+            Ok(event) => {
+                let urgency = apply_agent_event(event, state, context, scroll_from_bottom);
+                redraw.request(urgency, Instant::now());
+            }
+            Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                bail!("agent event stream disconnected")
+            }
+        }
+    }
+    Ok(())
+}
+
+fn redraw_urgency(event: &AgentEvent) -> RedrawUrgency {
+    match event {
+        AgentEvent::AssistantTextDelta { .. }
+        | AgentEvent::AssistantThinkingDelta { .. }
+        | AgentEvent::AssistantThinkingContentDelta { .. }
+        | AgentEvent::AssistantRefusalDelta { .. }
+        | AgentEvent::AssistantTextItem { .. }
+        | AgentEvent::AssistantRefusalItem { .. }
+        | AgentEvent::AssistantThinkingItem { .. }
+        | AgentEvent::ToolCallDelta { .. }
+        | AgentEvent::ToolExecutionOutput { .. }
+        | AgentEvent::UsageUpdated(_)
+        | AgentEvent::ContextUsageUpdated(_) => RedrawUrgency::Coalesced,
+        _ => RedrawUrgency::Immediate,
+    }
+}
+
+async fn wait_for_redraw(deadline: Option<Instant>) {
+    if let Some(deadline) = deadline {
+        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+    } else {
+        std::future::pending::<()>().await;
+    }
 }
 
 #[cfg(test)]
@@ -1192,6 +1275,10 @@ fn log_agent_event(event: &AgentEvent) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
     use super::*;
     use ri_core::ResolvedSettings;
 
@@ -1406,5 +1493,62 @@ mod tests {
         assert_eq!(model_command("/modelish"), None);
         assert!(is_slash_input(" /compcat"));
         assert_eq!(unknown_command_name(" /compcat extra"), "/compcat");
+    }
+
+    #[test]
+    fn bounded_agent_event_drain_returns_while_sender_refills_channel() {
+        fn text_delta() -> AgentEvent {
+            AgentEvent::AssistantTextDelta {
+                index: None,
+                text: "x".to_owned(),
+            }
+        }
+
+        let capacity = MAX_AGENT_EVENTS_PER_FRAME + 1;
+        let (event_tx, mut event_rx) = mpsc::channel(capacity);
+        for _ in 0..capacity {
+            event_tx
+                .try_send(text_delta())
+                .expect("initial event queue should have room");
+        }
+
+        let producer_started = Arc::new(Barrier::new(2));
+        let producer_barrier = Arc::clone(&producer_started);
+        let producer = thread::spawn(move || {
+            producer_barrier.wait();
+            for _ in 0..MAX_AGENT_EVENTS_PER_FRAME {
+                event_tx
+                    .blocking_send(text_delta())
+                    .expect("event receiver should remain connected");
+            }
+        });
+        producer_started.wait();
+
+        let mut state = AppState::new();
+        let context = ContextBundle::disabled(PathBuf::new(), PathBuf::new());
+        let mut scroll_from_bottom = 0;
+        let mut redraw = RedrawScheduler::new(Duration::from_millis(12));
+        drain_ready_agent_events(
+            &mut state,
+            &mut event_rx,
+            &context,
+            &mut scroll_from_bottom,
+            &mut redraw,
+        )
+        .expect("draining ready agent events should succeed");
+
+        assert_eq!(
+            state
+                .streaming_assistant()
+                .expect("text deltas should create a streaming assistant")
+                .0
+                .len(),
+            MAX_AGENT_EVENTS_PER_FRAME
+        );
+        assert!(
+            event_rx.try_recv().is_ok(),
+            "a bounded drain should leave ready events for the next loop turn"
+        );
+        producer.join().expect("event producer should finish");
     }
 }

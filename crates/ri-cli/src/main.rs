@@ -1,13 +1,4 @@
-mod app;
-mod input;
-mod json_output;
-mod logging;
-mod model_picker;
-mod model_selection;
-mod picker;
-mod render;
-mod session_picker;
-mod terminal;
+use ri::{app, logging};
 
 #[tokio::main]
 async fn main() {
@@ -60,11 +51,11 @@ mod tests {
     #[test]
     fn exit_codes_are_stable() {
         assert_eq!(
-            super::run_error_exit_code(&crate::app::RunError::Setup(anyhow::anyhow!("setup"))),
+            super::run_error_exit_code(&ri::app::RunError::Setup(anyhow::anyhow!("setup"))),
             2
         );
         assert_eq!(
-            super::run_error_exit_code(&crate::app::RunError::Runtime(anyhow::anyhow!("runtime"))),
+            super::run_error_exit_code(&ri::app::RunError::Runtime(anyhow::anyhow!("runtime"))),
             1
         );
     }
