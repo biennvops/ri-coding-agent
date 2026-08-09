@@ -3,13 +3,21 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::{Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
+static CLI_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn cli_test_lock() -> MutexGuard<'static, ()> {
+    CLI_TEST_LOCK.lock().unwrap()
+}
+
 #[test]
 fn print_mode_keeps_stdout_plain_text() {
+    let _lock = cli_test_lock();
     let fixture = Fixture::new(success_body());
     let output = fixture.run(&["-p", "hello", "--no-session", "--no-context"]);
 
@@ -22,6 +30,7 @@ fn print_mode_keeps_stdout_plain_text() {
 
 #[test]
 fn json_mode_emits_only_versioned_ndjson_events() {
+    let _lock = cli_test_lock();
     let fixture = Fixture::new(success_body());
     let output = fixture.run(&["--json", "-p", "hello", "--no-session", "--no-context"]);
 
@@ -53,7 +62,39 @@ fn json_mode_emits_only_versioned_ndjson_events() {
 }
 
 #[test]
+fn json_continue_reuses_the_persistent_session() {
+    let _lock = cli_test_lock();
+    let first = Fixture::new(success_body());
+    let first_output = first.run(&["--json", "-p", "hello", "--no-context"]);
+    assert!(
+        first_output.status.success(),
+        "stdout: {}\nstderr: {}",
+        text(&first_output.stdout),
+        text(&first_output.stderr)
+    );
+    let first_records = parse_records(&first_output.stdout);
+    let session_id = first_records[0]["data"]["session"]["id"]
+        .as_str()
+        .expect("persistent run should have a session id")
+        .to_owned();
+    let home = first.keep_home();
+
+    let second = Fixture::in_home(home.clone(), "200 OK", success_body(), None);
+    let second_output = second.run(&["--json", "-p", "continue", "-c", "--no-context"]);
+    assert!(
+        second_output.status.success(),
+        "stdout: {}\nstderr: {}",
+        text(&second_output.stdout),
+        text(&second_output.stderr)
+    );
+    let second_records = parse_records(&second_output.stdout);
+    assert_eq!(second_records[0]["data"]["session"]["id"], session_id);
+    second.finish();
+}
+
+#[test]
 fn json_provider_failure_emits_terminal_error_events_and_status_one() {
+    let _lock = cli_test_lock();
     let fixture = Fixture::with_response("500 Internal Server Error", "provider exploded");
     let output = fixture.run(&["--json", "-p", "hello", "--no-session", "--no-context"]);
 
@@ -80,6 +121,7 @@ fn json_provider_failure_emits_terminal_error_events_and_status_one() {
 
 #[test]
 fn json_logging_keeps_stdout_parseable_and_redacts_configured_secrets() {
+    let _lock = cli_test_lock();
     let secret = "super-secret-api-key-123";
     let fixture = Fixture::new_with_api_key(success_body(), secret);
     let output = fixture.run_with_log(
@@ -104,6 +146,7 @@ fn json_logging_keeps_stdout_parseable_and_redacts_configured_secrets() {
 
 #[test]
 fn setup_and_cli_errors_use_status_two() {
+    let _lock = cli_test_lock();
     let home = unique_dir("cli-status");
     fs::create_dir_all(&home).unwrap();
     let missing_models = home.join("missing-models.json");
@@ -189,7 +232,15 @@ impl Fixture {
         body: &'static str,
         api_key: Option<&str>,
     ) -> Self {
-        let home = unique_dir("cli-fixture");
+        Self::in_home(unique_dir("cli-fixture"), status, body, api_key)
+    }
+
+    fn in_home(
+        home: PathBuf,
+        status: &'static str,
+        body: &'static str,
+        api_key: Option<&str>,
+    ) -> Self {
         fs::create_dir_all(&home).unwrap();
         let models = home.join("models.json");
         let server = spawn_server(status, body);
@@ -232,8 +283,13 @@ impl Fixture {
     }
 
     fn finish(self) {
+        let home = self.keep_home();
+        let _ = fs::remove_dir_all(home);
+    }
+
+    fn keep_home(self) -> PathBuf {
         self.server.join();
-        let _ = fs::remove_dir_all(self.home);
+        self.home
     }
 }
 
