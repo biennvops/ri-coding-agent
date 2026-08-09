@@ -19,10 +19,13 @@ pub(crate) fn resolve_for_write(
     context: &ToolContext,
     requested: &str,
 ) -> Result<PathBuf, ToolError> {
+    let requested_is_absolute = Path::new(requested).is_absolute();
     let candidate = candidate_path(context, requested)?;
     let lexical = normalize_lexical(&candidate)
         .ok_or_else(|| ToolError::Failed(format!("path {requested:?} escapes the workspace")))?;
-    ensure_inside(context, &lexical, requested)?;
+    if !requested_is_absolute {
+        ensure_inside(context, &lexical, requested)?;
+    }
 
     match fs::symlink_metadata(&candidate) {
         Ok(_) => {
@@ -98,12 +101,50 @@ fn nearest_existing_parent(path: &Path) -> Option<&Path> {
 }
 
 fn ensure_inside(context: &ToolContext, path: &Path, requested: &str) -> Result<(), ToolError> {
-    if path.starts_with(&context.workspace_root) {
+    if path_is_inside(&context.workspace_root, path) {
         Ok(())
     } else {
         Err(ToolError::Failed(format!(
             "path {requested:?} escapes the workspace"
         )))
+    }
+}
+
+#[cfg(not(windows))]
+fn path_is_inside(root: &Path, path: &Path) -> bool {
+    path.starts_with(root)
+}
+
+#[cfg(windows)]
+fn path_is_inside(root: &Path, path: &Path) -> bool {
+    let mut root_components = root.components();
+    let mut path_components = path.components();
+    root_components.all(|root_component| {
+        path_components.next().is_some_and(|path_component| {
+            components_equal_ignore_case(root_component, path_component)
+        })
+    })
+}
+
+#[cfg(windows)]
+fn components_equal_ignore_case(
+    left: std::path::Component<'_>,
+    right: std::path::Component<'_>,
+) -> bool {
+    use std::path::Component;
+
+    match (left, right) {
+        (Component::Prefix(left), Component::Prefix(right)) => left
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy()),
+        (Component::RootDir, Component::RootDir) => true,
+        (Component::CurDir, Component::CurDir) => true,
+        (Component::ParentDir, Component::ParentDir) => true,
+        (Component::Normal(left), Component::Normal(right)) => left
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy()),
+        _ => false,
     }
 }
 
@@ -122,7 +163,36 @@ mod tests {
         assert!(resolve_for_write(&context, "../outside.txt").is_err());
         assert!(resolve_for_write(&context, "missing/../../outside.txt").is_err());
         assert!(resolve_for_write(&context, "nested/file.txt").is_ok());
+        assert!(
+            resolve_for_write(&context, &root.join("absolute.txt").display().to_string()).is_ok()
+        );
+        assert!(resolve_for_write(
+            &context,
+            &root
+                .parent()
+                .unwrap()
+                .join("outside.txt")
+                .display()
+                .to_string()
+        )
+        .is_err());
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_use_case_insensitive_component_containment() {
+        let root = unique_test_dir("windows-paths");
+        fs::create_dir_all(&root).unwrap();
+        let context = ToolContext::new(&root).unwrap();
+        let differently_cased = root.to_string_lossy().to_uppercase();
+
+        assert!(
+            resolve_for_write(&context, &format!(r"{differently_cased}\nested\file.txt")).is_ok()
+        );
+        assert!(resolve_for_write(&context, r"Z:\outside.txt").is_err());
+        assert!(resolve_for_write(&context, r"nested\..\..\outside.txt").is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
