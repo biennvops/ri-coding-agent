@@ -415,7 +415,8 @@ impl AppSetup {
 async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
     tracing::info!(target: "ri", mode = "print", prompt_bytes = prompt.len(), "run started");
     eprintln!("{}", setup.context.diagnostic());
-    if let Some(info) = setup.session_info()? {
+    let session_info = setup.session_info()?;
+    if let Some(info) = session_info.as_ref() {
         eprintln!("session: {} ({})", info.display_name(), info.id);
     } else {
         eprintln!("session: ephemeral");
@@ -430,19 +431,21 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
     let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
     let mut shutdown = ShutdownSignals::new();
 
-    command_tx
-        .send(AgentCommand::Submit { text: prompt })
-        .await
-        .context("could not start the agent")?;
+    if let Err(error) = command_tx.send(AgentCommand::Submit { text: prompt }).await {
+        let _ = command_tx.send(AgentCommand::Shutdown).await;
+        let _ = runtime_task.await;
+        bail!("could not start the agent: {error}");
+    }
 
     let mut state = AppState::new();
     state.replace_history(&setup.initial_transcript);
-    state.set_session_info(setup.session_info()?);
+    state.set_session_info(session_info);
     state.reduce(AgentEvent::ModelChanged(setup.model_ref()));
     state.reduce(AgentEvent::ContextLimitsUpdated(setup.provider.limits()));
     let mut turn_reason = None;
     let mut output = io::stdout();
     let mut error_message = None;
+    let mut loop_error = None;
     let mut shutdown_requested = false;
 
     while turn_reason.is_none() {
@@ -458,10 +461,20 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
                 log_agent_event(&event);
                 match &event {
                     AgentEvent::AssistantTextDelta { text, .. } => {
-                        print_and_flush(&mut output, text)?;
+                        if let Err(error) = print_and_flush(&mut output, text) {
+                            loop_error = Some(error);
+                            shutdown_requested = true;
+                            let _ = command_tx.send(AgentCommand::Shutdown).await;
+                            break;
+                        }
                     }
                     AgentEvent::AssistantRefusalDelta { text, .. } => {
-                        print_and_flush(&mut output, text)?;
+                        if let Err(error) = print_and_flush(&mut output, text) {
+                            loop_error = Some(error);
+                            shutdown_requested = true;
+                            let _ = command_tx.send(AgentCommand::Shutdown).await;
+                            break;
+                        }
                     }
                     AgentEvent::Error(error) => {
                         error_message = Some(error.message.clone());
@@ -500,21 +513,34 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
     }
 
     if turn_reason.is_none() {
-        let _ = command_tx.send(AgentCommand::Shutdown).await;
+        if !shutdown_requested {
+            let _ = command_tx.send(AgentCommand::Shutdown).await;
+        }
         let _ = runtime_task.await;
+        if let Some(error) = loop_error {
+            return Err(error);
+        }
         bail!("agent stopped before finishing the turn");
     }
 
-    writeln!(output)?;
-    if !shutdown_requested {
-        command_tx
-            .send(AgentCommand::Shutdown)
-            .await
-            .context("could not stop the agent")?;
-    }
-    runtime_task
+    let output_result = writeln!(output).map_err(anyhow::Error::from);
+    let shutdown_result = if !shutdown_requested {
+        Some(command_tx.send(AgentCommand::Shutdown).await)
+    } else {
+        None
+    };
+    let runtime_result = runtime_task
         .await
-        .map_err(|error| anyhow!("agent task failed: {error}"))?;
+        .map_err(|error| anyhow!("agent task failed: {error}"));
+
+    if let Some(error) = loop_error {
+        return Err(error);
+    }
+    output_result?;
+    if let Some(result) = shutdown_result {
+        result.context("could not stop the agent")?;
+    }
+    runtime_result?;
 
     if let Some(error) = error_message {
         bail!(error);
@@ -536,15 +562,6 @@ async fn run_json(prompt: String, setup: AppSetup) -> Result<()> {
         eprintln!("session: ephemeral");
     }
 
-    let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
-    let (event_tx, mut event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-    let runtime = AgentRuntime::with_config_and_compaction(
-        setup.provider.clone(),
-        setup.runtime_config(),
-        setup.compaction_enabled,
-    );
-    let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
-    let mut shutdown = ShutdownSignals::new();
     let mut output = JsonEmitter::new(io::stdout());
     output.emit(
         "run_started",
@@ -554,14 +571,23 @@ async fn run_json(prompt: String, setup: AppSetup) -> Result<()> {
             session.as_ref(),
         ),
     )?;
+    let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
+    let (event_tx, mut event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+    let runtime = AgentRuntime::with_config_and_compaction(
+        setup.provider.clone(),
+        setup.runtime_config(),
+        setup.compaction_enabled,
+    );
+    let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+    let mut shutdown = ShutdownSignals::new();
 
     if let Err(error) = command_tx.send(AgentCommand::Submit { text: prompt }).await {
         let message = format!("could not start the agent: {error}");
-        output.emit(
+        let _ = output.emit(
             "error",
             serde_json::json!({"message": message, "fatal": true}),
-        )?;
-        output.emit("run_finished", serde_json::json!({"success": false}))?;
+        );
+        let _ = output.emit("run_finished", serde_json::json!({"success": false}));
         let _ = command_tx.send(AgentCommand::Shutdown).await;
         let _ = runtime_task.await;
         bail!(message);
@@ -569,6 +595,7 @@ async fn run_json(prompt: String, setup: AppSetup) -> Result<()> {
 
     let mut turn_reason = None;
     let mut saw_error = false;
+    let mut loop_error = None;
     let mut shutdown_requested = false;
     while turn_reason.is_none() {
         tokio::select! {
@@ -584,7 +611,13 @@ async fn run_json(prompt: String, setup: AppSetup) -> Result<()> {
                 if matches!(&event, AgentEvent::Error(_)) {
                     saw_error = true;
                 }
-                output.emit_agent_event(&event)?;
+                if loop_error.is_none() {
+                    if let Err(error) = output.emit_agent_event(&event) {
+                        loop_error = Some(error);
+                        shutdown_requested = true;
+                        let _ = command_tx.send(AgentCommand::Shutdown).await;
+                    }
+                }
                 if let AgentEvent::TurnFinished { reason } = event {
                     turn_reason = Some(reason);
                 }
@@ -594,38 +627,58 @@ async fn run_json(prompt: String, setup: AppSetup) -> Result<()> {
 
     let Some(reason) = turn_reason else {
         let message = "agent stopped before finishing the turn";
-        output.emit(
+        if !shutdown_requested {
+            let _ = command_tx.send(AgentCommand::Shutdown).await;
+        }
+        let runtime_result = runtime_task
+            .await
+            .map_err(|error| anyhow!("agent task failed: {error}"));
+        if let Some(error) = loop_error {
+            return Err(error);
+        }
+        if let Err(error) = runtime_result {
+            let _ = output.emit(
+                "error",
+                serde_json::json!({"message": error.to_string(), "fatal": true}),
+            );
+            let _ = output.emit("run_finished", serde_json::json!({"success": false}));
+            return Err(error);
+        }
+        let _ = output.emit(
             "error",
             serde_json::json!({"message": message, "fatal": true}),
-        )?;
-        let _ = command_tx.send(AgentCommand::Shutdown).await;
-        let _ = runtime_task.await;
-        output.emit("run_finished", serde_json::json!({"success": false}))?;
+        );
+        let _ = output.emit("run_finished", serde_json::json!({"success": false}));
         bail!(message);
     };
 
-    if !shutdown_requested {
-        if let Err(error) = command_tx.send(AgentCommand::Shutdown).await {
-            let message = format!("could not stop the agent: {error}");
-            output.emit(
-                "error",
-                serde_json::json!({"message": message, "fatal": true}),
-            )?;
-            let _ = runtime_task.await;
-            output.emit("run_finished", serde_json::json!({"success": false}))?;
-            bail!(message);
-        }
-    }
-    if let Err(error) = runtime_task
+    let shutdown_result = if !shutdown_requested {
+        Some(command_tx.send(AgentCommand::Shutdown).await)
+    } else {
+        None
+    };
+    let runtime_result = runtime_task
         .await
-        .map_err(|error| anyhow!("agent task failed: {error}"))
-    {
-        let message = error.to_string();
-        output.emit(
+        .map_err(|error| anyhow!("agent task failed: {error}"));
+    if let Some(error) = loop_error {
+        return Err(error);
+    }
+    if let Some(Err(error)) = shutdown_result {
+        let message = format!("could not stop the agent: {error}");
+        let _ = output.emit(
             "error",
             serde_json::json!({"message": message, "fatal": true}),
-        )?;
-        output.emit("run_finished", serde_json::json!({"success": false}))?;
+        );
+        let _ = output.emit("run_finished", serde_json::json!({"success": false}));
+        bail!(message);
+    }
+    if let Err(error) = runtime_result {
+        let message = error.to_string();
+        let _ = output.emit(
+            "error",
+            serde_json::json!({"message": message, "fatal": true}),
+        );
+        let _ = output.emit("run_finished", serde_json::json!({"success": false}));
         return Err(error);
     }
 
@@ -652,6 +705,7 @@ async fn run_json(prompt: String, setup: AppSetup) -> Result<()> {
 
 async fn run_tui(mut setup: AppSetup) -> Result<()> {
     tracing::info!(target: "ri", mode = "tui", "run started");
+    let session_info = setup.session_info()?;
     let mut terminal = TerminalGuard::new().context("could not initialize terminal")?;
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (event_tx, mut event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
@@ -668,7 +722,7 @@ async fn run_tui(mut setup: AppSetup) -> Result<()> {
     if let Some(path) = crate::logging::path() {
         state.add_system_message(format!("logging: {}", path.display()));
     }
-    state.set_session_info(setup.session_info()?);
+    state.set_session_info(session_info);
     state.reduce(AgentEvent::ModelChanged(setup.model_ref()));
     state.reduce(AgentEvent::ContextLimitsUpdated(setup.provider.limits()));
     let mut renderer = TuiRenderer::new();
