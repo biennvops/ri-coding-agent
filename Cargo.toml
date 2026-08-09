@@ -9,6 +9,8 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+description = "Standalone Rust coding agent for local repository work."
+repository = "https://github.com/biennvops/ri-coding-agent"
 
 [profile.release]
 codegen-units = 1
