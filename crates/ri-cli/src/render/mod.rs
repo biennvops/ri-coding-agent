@@ -355,9 +355,9 @@ impl TranscriptLayoutCache {
     fn reset(&mut self, epoch: u64, width: usize) {
         self.epoch = Some(epoch);
         self.width = width;
-        self.layouts.clear();
-        self.indices.clear();
-        self.positions.clear();
+        self.layouts = HashMap::new();
+        self.indices = Vec::new();
+        self.positions = HashMap::new();
         self.static_total_rows = 0;
         self.streaming_id = None;
         self.streaming_row_count = 0;
@@ -1161,6 +1161,7 @@ mod tests {
             .draw(&mut terminal, &state, 0)
             .expect("large draw should succeed");
         assert!(renderer.cached_transcript_entries() > 100);
+        let old_capacity = renderer.transcript.layouts.capacity();
 
         state.replace_history(&[ModelMessage::user("small replacement")]);
         renderer
@@ -1168,6 +1169,7 @@ mod tests {
             .expect("replacement draw should succeed");
         assert_eq!(renderer.cached_transcript_entries(), 1);
         assert!(renderer.cached_transcript_rows() < 10);
+        assert!(renderer.transcript.layouts.capacity() < old_capacity);
     }
 
     #[test]
