@@ -225,6 +225,22 @@ mod tests {
     }
 
     #[test]
+    fn replacement_failure_removes_the_temporary_file() {
+        let root = unique_test_dir("atomic-failure-cleanup");
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("destination");
+        fs::create_dir(&destination).unwrap();
+
+        assert!(atomic_write(&destination, b"current", AtomicWriteOptions::default()).is_err());
+        assert!(!fs::read_dir(&root).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".ri-temp-")));
+        remove_test_dir(root);
+    }
+
+    #[test]
     fn stale_temporary_names_do_not_block_a_new_write() {
         let root = unique_test_dir("atomic-stale-temp");
         fs::create_dir_all(&root).unwrap();
