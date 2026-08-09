@@ -210,6 +210,8 @@ fn open_lock(path: &Path, create_parent: bool) -> Result<File, StateError> {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         create_state_directory(parent, path)?;
     }
+    // The lock file is only a stable advisory-lock target. Its existence does
+    // not indicate that another process currently owns the lock.
     let lock_path = lock_path(path);
     OpenOptions::new()
         .create(true)
