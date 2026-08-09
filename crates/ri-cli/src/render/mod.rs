@@ -1195,6 +1195,38 @@ mod tests {
     }
 
     #[test]
+    fn live_tool_output_reflows_only_the_bounded_tool_entry() {
+        let mut state = synthetic_transcript(1_000, 100);
+        let mut renderer = TuiRenderer::new();
+        let mut terminal = terminal();
+        renderer
+            .draw(&mut terminal, &state, 0)
+            .expect("history draw should succeed");
+        state.acknowledge_transcript_changes();
+
+        state.reduce(AgentEvent::ToolExecutionStarted {
+            call_id: "live-tool".to_owned(),
+            name: "bash".to_owned(),
+            arguments: "{}".to_owned(),
+        });
+        renderer
+            .draw(&mut terminal, &state, 0)
+            .expect("tool start draw should succeed");
+        state.acknowledge_transcript_changes();
+
+        state.reduce(AgentEvent::ToolExecutionOutput {
+            call_id: "live-tool".to_owned(),
+            stream: ri_core::ToolOutputStream::Stdout,
+            chunk: "new tool output\n".to_owned(),
+        });
+        renderer
+            .draw(&mut terminal, &state, 0)
+            .expect("tool output draw should succeed");
+        assert_eq!(renderer.stats().entries_reflowed, 1);
+        assert!(renderer.stats().bytes_reflowed >= "new tool output\n".len());
+    }
+
+    #[test]
     fn incremental_streaming_rows_match_cold_layout_across_chunkings_and_widths() {
         let text = "ab😀e\u{301}\n世界xyz";
         for width in [1, 2, 3, 4, 8, 18] {
