@@ -446,6 +446,8 @@ impl ProcessTree {
         {
             let process_group = child.id().and_then(|pid| {
                 let pid = pid as i32;
+                // SAFETY: getpgrp has no pointers or borrowed state; it only
+                // reads the calling process's group for the ownership check.
                 let own_group = unsafe { getpgrp() };
                 (pid > 1 && pid != own_group).then_some(pid)
             });
@@ -494,10 +496,14 @@ impl ProcessTree {
     #[cfg(unix)]
     fn signal(&self, child: Option<&Child>, signal: i32) {
         if let Some(process_group) = self.process_group {
+            // SAFETY: process_group is the child PID after the child-side
+            // setpgid(0, 0) setup, and attach rejects ri's own process group.
             unsafe {
                 let _ = kill(-process_group, signal);
             }
         } else if let Some(pid) = child.and_then(Child::id) {
+            // SAFETY: this fallback targets only the spawned child PID when
+            // process-group discovery was unavailable.
             unsafe {
                 let _ = kill(pid as i32, signal);
             }
@@ -563,6 +569,8 @@ struct WindowsJob {
 #[cfg(windows)]
 impl WindowsJob {
     fn attach(child: &Child) -> Result<Self, ToolError> {
+        // SAFETY: null attributes and name request a private unnamed job;
+        // the returned handle is checked before it is stored or used.
         let handle = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
         if handle.is_null() {
             return Err(ToolError::Failed(format!(
@@ -572,6 +580,8 @@ impl WindowsJob {
         }
         let mut limits = JobObjectExtendedLimitInformation::default();
         limits.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: handle is a successfully created job and limits points to a
+        // live, correctly sized C-compatible structure for this call.
         let configured = unsafe {
             SetInformationJobObject(
                 handle,
@@ -581,6 +591,8 @@ impl WindowsJob {
             )
         } != 0;
         if !configured {
+            // SAFETY: handle was returned by CreateJobObjectW and has not been
+            // closed on this failure path.
             unsafe {
                 CloseHandle(handle);
             }
@@ -590,13 +602,17 @@ impl WindowsJob {
             )));
         }
         let process_handle = child.raw_handle().ok_or_else(|| {
+            // SAFETY: handle is still owned exclusively by this setup path.
             unsafe {
                 CloseHandle(handle);
             }
             ToolError::Failed("shell process exited before job assignment".to_owned())
         })?;
+        // SAFETY: both handles are valid for the duration of this call;
+        // process_handle is borrowed from Tokio's live child.
         if unsafe { AssignProcessToJobObject(handle, process_handle) } == 0 {
             let error = std::io::Error::last_os_error();
+            // SAFETY: handle remains exclusively owned on this failure path.
             unsafe {
                 CloseHandle(handle);
             }
@@ -610,6 +626,8 @@ impl WindowsJob {
     }
 
     fn terminate(&self) -> Result<(), ToolError> {
+        // SAFETY: self.handle is closed only by Drop and remains valid while
+        // this borrowed WindowsJob is used.
         if unsafe { TerminateJobObject(self.handle as *mut std::ffi::c_void, 1) } == 0 {
             return Err(ToolError::Failed(format!(
                 "could not terminate Windows process tree: {}",
@@ -623,6 +641,8 @@ impl WindowsJob {
 #[cfg(windows)]
 impl Drop for WindowsJob {
     fn drop(&mut self) {
+        // SAFETY: this handle is created and owned by WindowsJob; Drop is the
+        // single close path after all explicit setup failures have closed it.
         unsafe {
             let _ = CloseHandle(self.handle as *mut std::ffi::c_void);
         }
@@ -726,6 +746,8 @@ fn resume_suspended_process(child: &Child) -> Result<(), ToolError> {
     let process_id = child
         .id()
         .ok_or_else(|| ToolError::Failed("shell process exited before resume".to_owned()))?;
+    // SAFETY: the snapshot is created for thread enumeration and is checked
+    // before any enumeration or close operation.
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
     if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
         return Err(ToolError::Failed(format!(
@@ -739,14 +761,18 @@ fn resume_suspended_process(child: &Child) -> Result<(), ToolError> {
         ..ThreadEntry32::default()
     };
     let mut thread_id = None;
+    // SAFETY: snapshot is valid and entry points to the initialized structure
+    // owned by this function.
     let mut found = unsafe { Thread32First(snapshot, &mut entry) } != 0;
     while found {
         if entry.th32_owner_process_id == process_id {
             thread_id = Some(entry.th32_thread_id);
             break;
         }
+        // SAFETY: snapshot and entry remain valid for the enumeration.
         found = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
     }
+    // SAFETY: snapshot was successfully created and is closed exactly once.
     unsafe {
         CloseHandle(snapshot);
     }
@@ -754,6 +780,8 @@ fn resume_suspended_process(child: &Child) -> Result<(), ToolError> {
     let thread_id = thread_id.ok_or_else(|| {
         ToolError::Failed("could not find suspended shell primary thread".to_owned())
     })?;
+    // SAFETY: the thread ID came from the snapshot and the returned handle is
+    // checked before use.
     let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id) };
     if thread.is_null() {
         return Err(ToolError::Failed(format!(
@@ -761,7 +789,10 @@ fn resume_suspended_process(child: &Child) -> Result<(), ToolError> {
             std::io::Error::last_os_error()
         )));
     }
+    // SAFETY: thread is a valid handle returned by OpenThread and remains
+    // open for this resume call.
     let resumed = unsafe { ResumeThread(thread) };
+    // SAFETY: thread is owned by this function and is closed exactly once.
     unsafe {
         CloseHandle(thread);
     }
@@ -788,8 +819,11 @@ unsafe extern "C" {
 
 #[cfg(unix)]
 fn configure_process_group(command: &mut Command) {
+    // SAFETY: pre_exec runs after fork and before exec in the child. The call
+    // uses pid 0 and cannot change ri's parent process group.
     unsafe {
         command.pre_exec(|| {
+            // SAFETY: this is the child process calling setpgid on itself.
             if setpgid(0, 0) == 0 {
                 Ok(())
             } else {
