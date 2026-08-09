@@ -25,6 +25,7 @@ use crate::terminal::TerminalGuard;
 
 const COMMAND_CHANNEL_CAPACITY: usize = 16;
 const EVENT_CHANNEL_CAPACITY: usize = 256;
+const MAX_AGENT_EVENTS_PER_FRAME: usize = 64;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Options {
@@ -676,7 +677,13 @@ async fn run_tui_loop(
 
     while !exit {
         if redraw.take_ready(Instant::now()) {
-            drain_ready_agent_events(state, event_rx, setup, &mut scroll_from_bottom, &mut redraw)?;
+            drain_ready_agent_events(
+                state,
+                event_rx,
+                &setup.context,
+                &mut scroll_from_bottom,
+                &mut redraw,
+            )?;
             redraw.mark_drawn();
             renderer
                 .draw(terminal.terminal_mut(), state, scroll_from_bottom)
@@ -790,7 +797,7 @@ async fn run_tui_loop(
                 let urgency = apply_agent_event(
                     event,
                     state,
-                    setup,
+                    &setup.context,
                     &mut scroll_from_bottom,
                 );
                 redraw.request(urgency, Instant::now());
@@ -804,7 +811,7 @@ async fn run_tui_loop(
 fn apply_agent_event(
     event: AgentEvent,
     state: &mut AppState,
-    setup: &mut AppSetup,
+    context: &ContextBundle,
     scroll_from_bottom: &mut usize,
 ) -> RedrawUrgency {
     if matches!(event, AgentEvent::TurnFinished { .. }) {
@@ -815,7 +822,7 @@ fn apply_agent_event(
     let session_loaded = matches!(event, AgentEvent::SessionLoaded { .. });
     state.reduce(event);
     if session_loaded {
-        state.add_system_message(setup.context.diagnostic());
+        state.add_system_message(context.diagnostic());
     }
     urgency
 }
@@ -823,14 +830,14 @@ fn apply_agent_event(
 fn drain_ready_agent_events(
     state: &mut AppState,
     event_rx: &mut mpsc::Receiver<AgentEvent>,
-    setup: &mut AppSetup,
+    context: &ContextBundle,
     scroll_from_bottom: &mut usize,
     redraw: &mut RedrawScheduler,
 ) -> Result<()> {
-    loop {
+    for _ in 0..MAX_AGENT_EVENTS_PER_FRAME {
         match event_rx.try_recv() {
             Ok(event) => {
-                let urgency = apply_agent_event(event, state, setup, scroll_from_bottom);
+                let urgency = apply_agent_event(event, state, context, scroll_from_bottom);
                 redraw.request(urgency, Instant::now());
             }
             Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
@@ -839,6 +846,7 @@ fn drain_ready_agent_events(
             }
         }
     }
+    Ok(())
 }
 
 fn redraw_urgency(event: &AgentEvent) -> RedrawUrgency {
@@ -1267,6 +1275,10 @@ fn log_agent_event(event: &AgentEvent) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
     use super::*;
     use ri_core::ResolvedSettings;
 
@@ -1481,5 +1493,62 @@ mod tests {
         assert_eq!(model_command("/modelish"), None);
         assert!(is_slash_input(" /compcat"));
         assert_eq!(unknown_command_name(" /compcat extra"), "/compcat");
+    }
+
+    #[test]
+    fn bounded_agent_event_drain_returns_while_sender_refills_channel() {
+        fn text_delta() -> AgentEvent {
+            AgentEvent::AssistantTextDelta {
+                index: None,
+                text: "x".to_owned(),
+            }
+        }
+
+        let capacity = MAX_AGENT_EVENTS_PER_FRAME + 1;
+        let (event_tx, mut event_rx) = mpsc::channel(capacity);
+        for _ in 0..capacity {
+            event_tx
+                .try_send(text_delta())
+                .expect("initial event queue should have room");
+        }
+
+        let producer_started = Arc::new(Barrier::new(2));
+        let producer_barrier = Arc::clone(&producer_started);
+        let producer = thread::spawn(move || {
+            producer_barrier.wait();
+            for _ in 0..MAX_AGENT_EVENTS_PER_FRAME {
+                event_tx
+                    .blocking_send(text_delta())
+                    .expect("event receiver should remain connected");
+            }
+        });
+        producer_started.wait();
+
+        let mut state = AppState::new();
+        let context = ContextBundle::disabled(PathBuf::new(), PathBuf::new());
+        let mut scroll_from_bottom = 0;
+        let mut redraw = RedrawScheduler::new(Duration::from_millis(12));
+        drain_ready_agent_events(
+            &mut state,
+            &mut event_rx,
+            &context,
+            &mut scroll_from_bottom,
+            &mut redraw,
+        )
+        .expect("draining ready agent events should succeed");
+
+        assert_eq!(
+            state
+                .streaming_assistant()
+                .expect("text deltas should create a streaming assistant")
+                .0
+                .len(),
+            MAX_AGENT_EVENTS_PER_FRAME
+        );
+        assert!(
+            event_rx.try_recv().is_ok(),
+            "a bounded drain should leave ready events for the next loop turn"
+        );
+        producer.join().expect("event producer should finish");
     }
 }
