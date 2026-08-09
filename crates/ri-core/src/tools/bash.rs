@@ -1297,9 +1297,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         task.abort();
         let _ = task.await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!root.join("descendant.txt").exists());
-        fs::remove_dir_all(root).unwrap();
+        remove_test_dir(root).await;
     }
 
     #[cfg(unix)]
@@ -1336,6 +1335,26 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("marker was not created: {}", path.display());
+    }
+
+    #[cfg(windows)]
+    async fn remove_test_dir(path: PathBuf) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match fs::remove_dir_all(&path) {
+                Ok(()) => return,
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(5 | 32))
+                        && Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!(
+                    "could not remove test directory {}: {error}",
+                    path.display()
+                ),
+            }
+        }
     }
 
     #[cfg(unix)]
