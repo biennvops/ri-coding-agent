@@ -146,6 +146,18 @@ impl VisualLayout {
         self.rows.len()
     }
 
+    pub(crate) fn row_start_offsets(&self) -> Vec<usize> {
+        self.row_boundaries
+            .iter()
+            .map(|boundaries| {
+                boundaries
+                    .first()
+                    .map(|boundary| boundary.source)
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
     pub(crate) fn cursor_position(&self, cursor: usize) -> CursorPosition {
         self.positions
             .get(cursor.min(self.positions.len().saturating_sub(1)))

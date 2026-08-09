@@ -15,10 +15,10 @@ use ri_core::{
 };
 use tokio::sync::mpsc;
 
-use crate::input::{self, Action, VisualLayout};
+use crate::input::{self, Action};
 use crate::json_output::{JsonEmitter, RunStartedData};
 use crate::model_selection::resolve_model;
-use crate::render;
+use crate::render::TuiRenderer;
 use crate::terminal::TerminalGuard;
 
 const COMMAND_CHANNEL_CAPACITY: usize = 16;
@@ -627,9 +627,11 @@ async fn run_tui(mut setup: AppSetup) -> Result<()> {
     state.set_session_info(setup.session_info()?);
     state.reduce(AgentEvent::ModelChanged(setup.model_ref()));
     state.reduce(AgentEvent::ContextLimitsUpdated(setup.provider.limits()));
+    let mut renderer = TuiRenderer::new();
     let tui_result = run_tui_loop(
         &mut terminal,
         &mut state,
+        &mut renderer,
         &command_tx,
         &mut event_rx,
         &mut setup,
@@ -651,6 +653,7 @@ async fn run_tui(mut setup: AppSetup) -> Result<()> {
 async fn run_tui_loop(
     terminal: &mut TerminalGuard,
     state: &mut AppState,
+    renderer: &mut TuiRenderer,
     command_tx: &mpsc::Sender<AgentCommand>,
     event_rx: &mut mpsc::Receiver<AgentEvent>,
     setup: &mut AppSetup,
@@ -670,8 +673,10 @@ async fn run_tui_loop(
 
     while !exit {
         if dirty {
-            render::draw(terminal, state, scroll_from_bottom)
+            renderer
+                .draw(terminal.terminal_mut(), state, scroll_from_bottom)
                 .context("could not render terminal")?;
+            state.acknowledge_transcript_changes();
             dirty = false;
         }
 
@@ -742,8 +747,9 @@ async fn run_tui_loop(
                                 Action::Right => state.move_right(),
                                 Action::Up | Action::Down => {
                                     let direction = if matches!(action, Action::Up) { -1 } else { 1 };
-                                    let layout = VisualLayout::new(state.input(), editor_width);
-                                    if let Some((cursor, desired_column)) = layout.move_vertical(
+                                    if let Some((cursor, desired_column)) = renderer.move_editor_vertical(
+                                        state,
+                                        editor_width,
                                         state.cursor(),
                                         direction,
                                         preferred_column,
