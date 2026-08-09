@@ -700,7 +700,7 @@ impl SessionWriter {
         let lock = open_session_lock(&path)?;
         lock_exclusive(&lock)?;
         let mut options = OpenOptions::new();
-        options.read(true).write(true).append(true);
+        options.read(true).write(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -730,6 +730,8 @@ impl SessionWriter {
                 .and_then(|_| file.sync_data())
                 .map_err(|source| io_error(&path, source))?;
         }
+        file.seek(SeekFrom::End(0))
+            .map_err(|source| io_error(&path, source))?;
         let mut info = snapshot.info.clone();
         info.materialized = true;
         let active_messages = snapshot
@@ -880,7 +882,7 @@ impl SessionWriter {
         let lock = open_session_lock(&self.info.path)?;
         lock_exclusive(&lock)?;
         let mut options = OpenOptions::new();
-        options.create_new(true).read(true).write(true).append(true);
+        options.create_new(true).read(true).write(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
