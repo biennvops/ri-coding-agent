@@ -189,8 +189,8 @@ impl AppSetup {
     fn load(options: &Options) -> Result<Self> {
         let launch_cwd = std::env::current_dir().context("could not determine launch cwd")?;
         let project = discover_project(&launch_cwd).context("could not discover project root")?;
-        let settings =
-            load_default_settings(&project.project_root).context("could not load settings.json")?;
+        let settings = load_default_settings(&project.project_root)
+            .map_err(|error| anyhow!(error.to_string()))?;
         for warning in &settings.warnings {
             eprintln!("ri: warning: {}: {}", warning.path, warning.message);
         }
@@ -211,7 +211,7 @@ impl AppSetup {
         };
 
         let catalog = load_default_models()
-            .context("could not load models.json")?
+            .map_err(|error| anyhow!(error.to_string()))?
             .ok_or_else(|| {
                 anyhow!(
                     "no models.json found; create ~/.ri/agent/models.json or set RI_MODELS_FILE"
@@ -253,7 +253,7 @@ impl AppSetup {
 
         let context = if settings.settings.context.enabled && !options.no_context {
             load_context(&project.launch_cwd, &project.project_root)
-                .context("could not load AGENTS context")?
+                .map_err(|error| anyhow!(error.to_string()))?
         } else {
             ContextBundle::disabled(project.launch_cwd.clone(), project.project_root.clone())
         };
