@@ -640,7 +640,7 @@ struct SessionWriter {
     info: SessionInfo,
     header: SessionHeader,
     file: Option<File>,
-    _lock: Option<File>,
+    _lock: Option<SessionLockGuard>,
     head: Option<MessageId>,
     active_messages: Vec<(MessageId, ModelMessage)>,
     transcript: Vec<ModelMessage>,
@@ -697,8 +697,8 @@ impl SessionWriter {
         path: PathBuf,
         current_workspace: &Path,
     ) -> Result<(SessionHandle, SessionSnapshot), SessionError> {
-        let lock = open_session_lock(&path)?;
-        lock_exclusive(&lock)?;
+        let mut lock = open_session_lock(&path)?;
+        lock_exclusive(&mut lock)?;
         let mut options = OpenOptions::new();
         options.read(true).write(true);
         #[cfg(unix)]
@@ -879,8 +879,8 @@ impl SessionWriter {
             return Ok(());
         }
         ensure_private_directory(self.info.path.parent().unwrap_or_else(|| Path::new(".")))?;
-        let lock = open_session_lock(&self.info.path)?;
-        lock_exclusive(&lock)?;
+        let mut lock = open_session_lock(&self.info.path)?;
+        lock_exclusive(&mut lock)?;
         let mut options = OpenOptions::new();
         options.create_new(true).read(true).write(true);
         #[cfg(unix)]
@@ -1604,7 +1604,20 @@ fn ensure_private_directory(path: &Path) -> Result<(), SessionError> {
     Ok(())
 }
 
-fn open_session_lock(path: &Path) -> Result<File, SessionError> {
+struct SessionLockGuard {
+    file: File,
+    locked: bool,
+}
+
+impl Drop for SessionLockGuard {
+    fn drop(&mut self) {
+        if self.locked {
+            let _ = fs2::FileExt::unlock(&self.file);
+        }
+    }
+}
+
+fn open_session_lock(path: &Path) -> Result<SessionLockGuard, SessionError> {
     let lock_path = session_lock_path(path);
     let mut options = OpenOptions::new();
     options.create(true).read(true).write(true).truncate(false);
@@ -1613,9 +1626,13 @@ fn open_session_lock(path: &Path) -> Result<File, SessionError> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options
+    let file = options
         .open(&lock_path)
-        .map_err(|source| io_error(&lock_path, source))
+        .map_err(|source| io_error(&lock_path, source))?;
+    Ok(SessionLockGuard {
+        file,
+        locked: false,
+    })
 }
 
 fn session_lock_path(path: &Path) -> PathBuf {
@@ -1624,16 +1641,19 @@ fn session_lock_path(path: &Path) -> PathBuf {
     PathBuf::from(lock)
 }
 
-fn lock_exclusive(file: &File) -> Result<(), SessionError> {
+fn lock_exclusive(lock: &mut SessionLockGuard) -> Result<(), SessionError> {
     use fs2::FileExt;
 
-    file.try_lock_exclusive().map_err(|error| {
-        if error.kind() == fs2::lock_contended_error().kind() {
-            SessionError::AlreadyOpen
-        } else {
-            io_error("session lock", error)
-        }
-    })
+    lock.file
+        .try_lock_exclusive()
+        .map(|()| lock.locked = true)
+        .map_err(|error| {
+            if error.kind() == fs2::lock_contended_error().kind() {
+                SessionError::AlreadyOpen
+            } else {
+                io_error("session lock", error)
+            }
+        })
 }
 
 fn preview(content: &str) -> String {
