@@ -228,7 +228,7 @@ impl AppSetup {
             recent_state.as_ref(),
             &workspace_id,
         )
-        .context("could not select configured model")?;
+        .map_err(|error| anyhow!("could not select configured model: {error}"))?;
         for warning in &selection.warnings {
             eprintln!("ri: warning: {warning}");
         }
@@ -1043,6 +1043,12 @@ async fn handle_model_command(
             Ok(()) => {
                 let name = selected.model_ref.display_name();
                 let model_ref = selected.model_ref.clone();
+                tracing::info!(
+                    target: "ri",
+                    provider = %model_ref.provider,
+                    model = %model_ref.model,
+                    "model switched"
+                );
                 setup.selected = Some(selected);
                 if let Err(error) = setup.remember_model(&model_ref) {
                     eprintln!("ri: warning: could not persist recent model selection: {error}");
