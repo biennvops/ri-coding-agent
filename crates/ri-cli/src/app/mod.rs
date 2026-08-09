@@ -119,25 +119,48 @@ impl Options {
     }
 }
 
-pub async fn run(options: Options) -> Result<()> {
-    let mut setup = AppSetup::load(&options)?;
+#[derive(Debug)]
+pub enum RunError {
+    Setup(anyhow::Error),
+    Runtime(anyhow::Error),
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Setup(error) | Self::Runtime(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for RunError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Setup(error) | Self::Runtime(error) => error.source(),
+        }
+    }
+}
+
+pub async fn run(options: Options) -> Result<(), RunError> {
+    let mut setup = AppSetup::load(&options).map_err(RunError::Setup)?;
     if setup.resume_requested {
         let repository = setup
             .repository
             .as_ref()
-            .ok_or_else(|| anyhow!("sessions are disabled for this run"))?;
-        let opened = crate::session_picker::pick(repository)?
-            .ok_or_else(|| anyhow!("session picker cancelled"))?;
+            .ok_or_else(|| RunError::Setup(anyhow!("sessions are disabled for this run")))?;
+        let opened = crate::session_picker::pick(repository)
+            .map_err(RunError::Setup)?
+            .ok_or_else(|| RunError::Setup(anyhow!("session picker cancelled")))?;
         setup.apply_opened(opened);
     }
     if let Some(prompt) = options.print_prompt {
         if options.json {
-            run_json(prompt, setup).await
+            run_json(prompt, setup).await.map_err(RunError::Runtime)
         } else {
-            run_print(prompt, setup).await
+            run_print(prompt, setup).await.map_err(RunError::Runtime)
         }
     } else {
-        run_tui(setup).await
+        run_tui(setup).await.map_err(RunError::Runtime)
     }
 }
 
