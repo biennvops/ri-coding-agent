@@ -19,9 +19,19 @@ fn main() {
             .expect("test backend draw");
     });
 
-    for rows in [1_000, 10_000, 100_000] {
-        let state = render::synthetic_transcript(rows, (rows / 10).max(1));
-        measure(&format!("cold layout · {rows} rows"), 1, || {
+    for (rows, entries) in [
+        (1_000, 100),
+        (10_000, 1_000),
+        (100_000, 10_000),
+        (100_000, 100),
+    ] {
+        let state = render::synthetic_transcript(rows, entries);
+        let label = if entries == 100 {
+            format!("cold layout · {rows} rows · 100 entries")
+        } else {
+            format!("cold layout · {rows} rows")
+        };
+        measure(&label, 1, || {
             let mut terminal = test_terminal(WIDTH, HEIGHT);
             let mut renderer = TuiRenderer::new();
             renderer
