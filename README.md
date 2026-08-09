@@ -146,6 +146,19 @@ cargo bench -p ri --bench tui_render
 
 The benchmark is a manual performance check, not a timing-sensitive CI gate. CI validates formatting, compilation, tests, Clippy, release builds, and source-install smoke tests on Linux, macOS, and Windows. Provider tests use mocks or local scripted HTTP servers; CI does not require model credentials.
 
+## Dogfood smoke checklist
+
+Run these checks with a real configured provider after installation:
+
+- Fresh task: inspect a real repository, use `read`, `bash`, `edit`, and `write`, then run the relevant tests.
+- Cancel: start a deliberately long safe command, press `Esc` or `Ctrl+C`, verify the prompt remains usable, then quit and resume.
+- Resume: use `ri -c` and confirm the transcript, current context, and tools still work.
+- Model switch: use `/model`, switch models, and verify footer limits, compaction, and recent-model persistence.
+- Machine modes: pipe `ri -p`, `ri --json -p`, and their `-c` variants into another program; stdout must remain within its documented contract.
+- Forced failures: try a bad command, a missing file, and an intentionally invalid temporary credential; failures should be understandable and recoverable where applicable.
+
+A live provider smoke is deliberately manual. It is not part of CI and must be reported as skipped when no usable credentials or endpoint are configured.
+
 ## Current non-goals
 
 Plugins, web search, Codex integration, MCP, skills, themes, Markdown rendering, session branching, new provider protocols, OAuth, remote execution, sandboxing, permission prompts, and public release automation are outside this baseline.
