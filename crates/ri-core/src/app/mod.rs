@@ -1,3 +1,5 @@
+use std::ops::Index;
+
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::agent::{AgentError, AgentEvent};
@@ -25,6 +27,67 @@ pub struct TranscriptMessage {
     pub thinking: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TranscriptEntryId(u64);
+
+impl TranscriptEntryId {
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranscriptEntryState {
+    pub id: TranscriptEntryId,
+    pub revision: u64,
+    pub entry: TranscriptEntry,
+}
+
+pub struct TranscriptMessages<'a> {
+    entries: &'a [TranscriptEntryState],
+    indices: &'a [usize],
+}
+
+impl<'a> TranscriptMessages<'a> {
+    pub fn len(&self) -> usize {
+        self.indices.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+
+    pub fn iter(
+        &'a self,
+    ) -> impl DoubleEndedIterator<Item = &'a TranscriptMessage> + ExactSizeIterator + 'a {
+        self.indices
+            .iter()
+            .map(move |&index| match &self.entries[index].entry {
+                TranscriptEntry::Message(message) => message,
+                TranscriptEntry::Tool(_) => unreachable!("message index points to a tool entry"),
+            })
+    }
+}
+
+impl Index<usize> for TranscriptMessages<'_> {
+    type Output = TranscriptMessage;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        match &self.entries[self.indices[index]].entry {
+            TranscriptEntry::Message(message) => message,
+            TranscriptEntry::Tool(_) => unreachable!("message index points to a tool entry"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamingAssistantState {
+    pub id: TranscriptEntryId,
+    pub revision: u64,
+    pub content: String,
+    pub thinking: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolStatus {
     Running,
@@ -48,16 +111,14 @@ pub enum TranscriptEntry {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct StreamingAssistant {
-    content: String,
-    thinking: String,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AppState {
-    messages: Vec<TranscriptMessage>,
-    entries: Vec<TranscriptEntry>,
-    streaming_assistant: Option<StreamingAssistant>,
+    message_entry_indices: Vec<usize>,
+    entries: Vec<TranscriptEntryState>,
+    streaming_assistant: Option<StreamingAssistantState>,
+    next_transcript_entry_id: u64,
+    transcript_epoch: u64,
+    transcript_revision: u64,
+    pending_transcript_changes: Vec<TranscriptEntryId>,
     input: String,
     cursor: usize,
     turn_active: bool,
@@ -75,12 +136,35 @@ impl AppState {
         Self::default()
     }
 
-    pub fn messages(&self) -> &[TranscriptMessage] {
-        &self.messages
+    pub fn messages(&self) -> TranscriptMessages<'_> {
+        TranscriptMessages {
+            entries: &self.entries,
+            indices: &self.message_entry_indices,
+        }
     }
 
-    pub fn transcript_entries(&self) -> &[TranscriptEntry] {
+    pub fn transcript_entries(&self) -> &[TranscriptEntryState] {
         &self.entries
+    }
+
+    pub fn transcript_epoch(&self) -> u64 {
+        self.transcript_epoch
+    }
+
+    pub fn transcript_revision(&self) -> u64 {
+        self.transcript_revision
+    }
+
+    pub fn pending_transcript_changes(&self) -> &[TranscriptEntryId] {
+        &self.pending_transcript_changes
+    }
+
+    pub fn acknowledge_transcript_changes(&mut self) {
+        self.pending_transcript_changes.clear();
+    }
+
+    pub fn streaming_assistant_state(&self) -> Option<&StreamingAssistantState> {
+        self.streaming_assistant.as_ref()
     }
 
     pub fn streaming_assistant(&self) -> Option<(&str, &str)> {
@@ -153,7 +237,9 @@ impl AppState {
     }
 
     pub fn replace_history(&mut self, history: &[ModelMessage]) {
-        self.messages.clear();
+        self.transcript_epoch = self.transcript_epoch.wrapping_add(1);
+        self.pending_transcript_changes.clear();
+        self.message_entry_indices.clear();
         self.entries.clear();
         self.streaming_assistant = None;
         self.input.clear();
@@ -169,6 +255,7 @@ impl AppState {
         for message in history {
             self.append_semantic_message(message);
         }
+        self.pending_transcript_changes.clear();
     }
 
     pub fn set_session_info(&mut self, info: Option<SessionInfo>) {
@@ -268,64 +355,75 @@ impl AppState {
             }
             AgentEvent::AssistantMessageStarted => {
                 self.finalize_streaming_assistant();
-                self.streaming_assistant = Some(StreamingAssistant::default());
+                self.start_streaming_assistant();
             }
             AgentEvent::AssistantTextDelta { text, .. } => {
-                self.streaming_assistant
-                    .get_or_insert_with(StreamingAssistant::default)
-                    .content
-                    .push_str(&text);
+                self.append_streaming_content(&text);
             }
             AgentEvent::AssistantThinkingDelta { text, .. } => {
-                self.streaming_assistant
-                    .get_or_insert_with(StreamingAssistant::default)
-                    .thinking
-                    .push_str(&text);
+                self.append_streaming_thinking(&text);
             }
             AgentEvent::AssistantRefusalDelta { text, .. } => {
-                self.streaming_assistant
-                    .get_or_insert_with(StreamingAssistant::default)
-                    .content
-                    .push_str(&text);
+                self.append_streaming_content(&text);
             }
             AgentEvent::AssistantRefusalItem { content, .. } => {
                 if let Some(content) = content {
-                    let assistant = self
-                        .streaming_assistant
-                        .get_or_insert_with(StreamingAssistant::default);
-                    if assistant.content.is_empty() {
-                        assistant.content = content;
+                    self.ensure_streaming_assistant();
+                    let (id, changed) = {
+                        let assistant = self.streaming_assistant.as_mut().expect("streaming assistant");
+                        if assistant.content.is_empty() {
+                            assistant.content = content;
+                            assistant.revision = assistant.revision.wrapping_add(1);
+                            (assistant.id, true)
+                        } else {
+                            (assistant.id, false)
+                        }
+                    };
+                    if changed {
+                        self.mark_transcript_changed(id);
                     }
                 }
             }
             AgentEvent::AssistantMessageFinished { items } => {
-                let assistant = self
-                    .streaming_assistant
-                    .get_or_insert_with(StreamingAssistant::default);
-                if assistant.content.is_empty() {
-                    assistant.content = items
-                        .iter()
-                        .find_map(|item| match item {
-                            ModelAssistantItem::Text { content }
-                            | ModelAssistantItem::Refusal { content } => Some(content.clone()),
-                            ModelAssistantItem::Reasoning(_) | ModelAssistantItem::ToolCall(_) => {
-                                None
-                            }
-                        })
-                        .unwrap_or_default();
-                }
-                if assistant.thinking.is_empty() {
-                    assistant.thinking = items
-                        .iter()
-                        .find_map(|item| match item {
-                            ModelAssistantItem::Reasoning(thinking) => {
-                                (!thinking.content.is_empty()).then_some(thinking.content.clone())
-                            }
-                            ModelAssistantItem::Text { .. }
-                            | ModelAssistantItem::Refusal { .. }
-                            | ModelAssistantItem::ToolCall(_) => None,
-                        })
-                        .unwrap_or_default();
+                let fallback_content = items.iter().find_map(|item| match item {
+                    ModelAssistantItem::Text { content }
+                    | ModelAssistantItem::Refusal { content } => Some(content.clone()),
+                    ModelAssistantItem::Reasoning(_) | ModelAssistantItem::ToolCall(_) => None,
+                });
+                let fallback_thinking = items.iter().find_map(|item| match item {
+                    ModelAssistantItem::Reasoning(thinking) => {
+                        (!thinking.content.is_empty()).then_some(thinking.content.clone())
+                    }
+                    ModelAssistantItem::Text { .. }
+                    | ModelAssistantItem::Refusal { .. }
+                    | ModelAssistantItem::ToolCall(_) => None,
+                });
+                self.ensure_streaming_assistant();
+                let (id, changed) = {
+                    let assistant = self
+                        .streaming_assistant
+                        .as_mut()
+                        .expect("streaming assistant");
+                    let mut changed = false;
+                    if assistant.content.is_empty() {
+                        if let Some(content) = fallback_content {
+                            assistant.content = content;
+                            changed = true;
+                        }
+                    }
+                    if assistant.thinking.is_empty() {
+                        if let Some(thinking) = fallback_thinking {
+                            assistant.thinking = thinking;
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        assistant.revision = assistant.revision.wrapping_add(1);
+                    }
+                    (assistant.id, changed)
+                };
+                if changed {
+                    self.mark_transcript_changed(id);
                 }
                 self.finalize_streaming_assistant();
             }
@@ -334,28 +432,30 @@ impl AppState {
                 name,
                 arguments,
             } => {
-                self.entries
-                    .push(TranscriptEntry::Tool(ToolTranscriptEntry {
-                        call_id,
-                        name,
-                        arguments: truncate_text(&arguments, MAX_TOOL_TRANSCRIPT_ARGUMENT_BYTES),
-                        output: String::new(),
-                        output_truncated: false,
-                        status: ToolStatus::Running,
-                    }));
+                self.push_entry(TranscriptEntry::Tool(ToolTranscriptEntry {
+                    call_id,
+                    name,
+                    arguments: truncate_text(&arguments, MAX_TOOL_TRANSCRIPT_ARGUMENT_BYTES),
+                    output: String::new(),
+                    output_truncated: false,
+                    status: ToolStatus::Running,
+                }));
             }
             AgentEvent::ToolExecutionOutput {
                 call_id,
                 stream,
                 chunk,
             } => {
-                if let Some(TranscriptEntry::Tool(tool)) = self.entries.iter_mut().rev().find(
-                    |entry| matches!(entry, TranscriptEntry::Tool(tool) if tool.call_id == call_id),
+                if let Some(index) = self.entries.iter().rposition(
+                    |entry| matches!(&entry.entry, TranscriptEntry::Tool(tool) if tool.call_id == call_id),
                 ) {
-                    if matches!(stream, ToolOutputStream::Stderr) && tool.output.is_empty() {
-                        append_tool_output(tool, "[stderr]\n");
+                    if let TranscriptEntry::Tool(tool) = &mut self.entries[index].entry {
+                        if matches!(stream, ToolOutputStream::Stderr) && tool.output.is_empty() {
+                            append_tool_output(tool, "[stderr]\n");
+                        }
+                        append_tool_output(tool, &chunk);
                     }
-                    append_tool_output(tool, &chunk);
+                    self.mark_entry_changed(index);
                 }
             }
             AgentEvent::ToolExecutionFinished {
@@ -363,15 +463,18 @@ impl AppState {
                 name: _,
                 result,
             } => {
-                if let Some(TranscriptEntry::Tool(tool)) = self.entries.iter_mut().rev().find(
-                    |entry| matches!(entry, TranscriptEntry::Tool(tool) if tool.call_id == call_id),
+                if let Some(index) = self.entries.iter().rposition(
+                    |entry| matches!(&entry.entry, TranscriptEntry::Tool(tool) if tool.call_id == call_id),
                 ) {
-                    let live_output_truncated = tool.output_truncated;
-                    tool.output.clear();
-                    tool.output_truncated = false;
-                    append_tool_output(tool, &result.model_content);
-                    tool.output_truncated |= live_output_truncated || result.metadata.truncated;
-                    tool.status = ToolStatus::Finished(result.metadata);
+                    if let TranscriptEntry::Tool(tool) = &mut self.entries[index].entry {
+                        let live_output_truncated = tool.output_truncated;
+                        tool.output.clear();
+                        tool.output_truncated = false;
+                        append_tool_output(tool, &result.model_content);
+                        tool.output_truncated |= live_output_truncated || result.metadata.truncated;
+                        tool.status = ToolStatus::Finished(result.metadata);
+                    }
+                    self.mark_entry_changed(index);
                 }
             }
             AgentEvent::TurnFinished { reason } => {
@@ -443,8 +546,113 @@ impl AppState {
     }
 
     fn push_message(&mut self, message: TranscriptMessage) {
-        self.messages.push(message.clone());
-        self.entries.push(TranscriptEntry::Message(message));
+        let id = self.allocate_transcript_entry_id();
+        self.push_message_with_identity(message, id, 0);
+    }
+
+    fn push_message_with_identity(
+        &mut self,
+        message: TranscriptMessage,
+        id: TranscriptEntryId,
+        revision: u64,
+    ) {
+        let entry_index = self.entries.len();
+        self.push_entry_with_identity(TranscriptEntry::Message(message), id, revision);
+        self.message_entry_indices.push(entry_index);
+    }
+
+    fn push_entry(&mut self, entry: TranscriptEntry) -> TranscriptEntryId {
+        let id = self.allocate_transcript_entry_id();
+        self.push_entry_with_identity(entry, id, 0);
+        id
+    }
+
+    fn push_entry_with_identity(
+        &mut self,
+        entry: TranscriptEntry,
+        id: TranscriptEntryId,
+        revision: u64,
+    ) {
+        self.entries.push(TranscriptEntryState {
+            id,
+            revision,
+            entry,
+        });
+        self.mark_transcript_changed(id);
+    }
+
+    fn allocate_transcript_entry_id(&mut self) -> TranscriptEntryId {
+        self.next_transcript_entry_id = self.next_transcript_entry_id.wrapping_add(1);
+        TranscriptEntryId(self.next_transcript_entry_id)
+    }
+
+    fn new_streaming_assistant(&mut self) -> StreamingAssistantState {
+        StreamingAssistantState {
+            id: self.allocate_transcript_entry_id(),
+            revision: 0,
+            content: String::new(),
+            thinking: String::new(),
+        }
+    }
+
+    fn ensure_streaming_assistant(&mut self) {
+        if self.streaming_assistant.is_none() {
+            self.start_streaming_assistant();
+        }
+    }
+
+    fn start_streaming_assistant(&mut self) {
+        let assistant = self.new_streaming_assistant();
+        self.mark_transcript_changed(assistant.id);
+        self.streaming_assistant = Some(assistant);
+    }
+
+    fn append_streaming_content(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.ensure_streaming_assistant();
+        let id = {
+            let assistant = self
+                .streaming_assistant
+                .as_mut()
+                .expect("streaming assistant");
+            assistant.content.push_str(text);
+            assistant.revision = assistant.revision.wrapping_add(1);
+            assistant.id
+        };
+        self.mark_transcript_changed(id);
+    }
+
+    fn append_streaming_thinking(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.ensure_streaming_assistant();
+        let id = {
+            let assistant = self
+                .streaming_assistant
+                .as_mut()
+                .expect("streaming assistant");
+            assistant.thinking.push_str(text);
+            assistant.revision = assistant.revision.wrapping_add(1);
+            assistant.id
+        };
+        self.mark_transcript_changed(id);
+    }
+
+    fn mark_entry_changed(&mut self, index: usize) {
+        let Some(entry) = self.entries.get_mut(index) else {
+            return;
+        };
+        entry.revision = entry.revision.wrapping_add(1);
+        let id = entry.id;
+        self.mark_transcript_changed(id);
+    }
+
+    fn mark_transcript_changed(&mut self, id: TranscriptEntryId) {
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        self.pending_transcript_changes.push(id);
     }
 
     fn append_semantic_message(&mut self, message: &ModelMessage) {
@@ -493,18 +701,17 @@ impl AppState {
                     else {
                         continue;
                     };
-                    self.entries
-                        .push(TranscriptEntry::Tool(ToolTranscriptEntry {
-                            call_id,
-                            name,
-                            arguments: truncate_text(
-                                &call.arguments,
-                                MAX_TOOL_TRANSCRIPT_ARGUMENT_BYTES,
-                            ),
-                            output: String::new(),
-                            output_truncated: false,
-                            status: ToolStatus::Running,
-                        }));
+                    self.push_entry(TranscriptEntry::Tool(ToolTranscriptEntry {
+                        call_id,
+                        name,
+                        arguments: truncate_text(
+                            &call.arguments,
+                            MAX_TOOL_TRANSCRIPT_ARGUMENT_BYTES,
+                        ),
+                        output: String::new(),
+                        output_truncated: false,
+                        status: ToolStatus::Running,
+                    }));
                 }
             }
             ModelMessage::ToolResult {
@@ -512,15 +719,17 @@ impl AppState {
                 tool_name,
                 content,
             } => {
-                let found = self.entries.iter_mut().rev().find_map(|entry| match entry {
-                    TranscriptEntry::Tool(tool) if tool.call_id == *tool_call_id => Some(tool),
-                    _ => None,
+                let found = self.entries.iter().rposition(|entry| {
+                    matches!(&entry.entry, TranscriptEntry::Tool(tool) if tool.call_id == *tool_call_id)
                 });
-                if let Some(tool) = found {
-                    tool.output.clear();
-                    tool.output_truncated = false;
-                    append_tool_output(tool, content);
-                    tool.status = ToolStatus::Finished(ToolExecutionMetadata::success());
+                if let Some(index) = found {
+                    if let TranscriptEntry::Tool(tool) = &mut self.entries[index].entry {
+                        tool.output.clear();
+                        tool.output_truncated = false;
+                        append_tool_output(tool, content);
+                        tool.status = ToolStatus::Finished(ToolExecutionMetadata::success());
+                    }
+                    self.mark_entry_changed(index);
                 } else {
                     let mut tool = ToolTranscriptEntry {
                         call_id: tool_call_id.clone(),
@@ -531,7 +740,7 @@ impl AppState {
                         status: ToolStatus::Finished(ToolExecutionMetadata::success()),
                     };
                     append_tool_output(&mut tool, content);
-                    self.entries.push(TranscriptEntry::Tool(tool));
+                    self.push_entry(TranscriptEntry::Tool(tool));
                 }
             }
             ModelMessage::System { .. } | ModelMessage::Developer { .. } => {}
@@ -542,12 +751,17 @@ impl AppState {
         let Some(assistant) = self.streaming_assistant.take() else {
             return;
         };
+        self.mark_transcript_changed(assistant.id);
         if !assistant.content.is_empty() || !assistant.thinking.is_empty() {
-            self.push_message(TranscriptMessage {
-                role: MessageRole::Assistant,
-                content: assistant.content,
-                thinking: (!assistant.thinking.is_empty()).then_some(assistant.thinking),
-            });
+            self.push_message_with_identity(
+                TranscriptMessage {
+                    role: MessageRole::Assistant,
+                    content: assistant.content,
+                    thinking: (!assistant.thinking.is_empty()).then_some(assistant.thinking),
+                },
+                assistant.id,
+                assistant.revision.wrapping_add(1),
+            );
         }
     }
 }
@@ -703,7 +917,7 @@ mod tests {
         assert!(state.is_turn_active());
         assert_eq!(state.messages().len(), 2);
         assert!(matches!(
-            state.transcript_entries()[2],
+            state.transcript_entries()[2].entry,
             TranscriptEntry::Tool(_)
         ));
         state.reduce(AgentEvent::AssistantMessageStarted);
@@ -763,7 +977,7 @@ mod tests {
             result: ToolExecutionResultForTest::result_with_content("authoritative result"),
         });
 
-        let TranscriptEntry::Tool(tool) = &state.transcript_entries()[0] else {
+        let TranscriptEntry::Tool(tool) = &state.transcript_entries()[0].entry else {
             panic!("expected tool entry");
         };
         assert_eq!(tool.output, "authoritative result");
@@ -789,7 +1003,7 @@ mod tests {
             result: ToolExecutionResultForTest::result(),
         });
 
-        let TranscriptEntry::Tool(tool) = &state.transcript_entries()[0] else {
+        let TranscriptEntry::Tool(tool) = &state.transcript_entries()[0].entry else {
             panic!("expected tool entry");
         };
         assert!(tool.output_truncated);
@@ -857,12 +1071,79 @@ mod tests {
         assert_eq!(state.messages()[1].thinking.as_deref(), Some("thinking"));
         assert_eq!(state.messages()[2].content, "The note is present.");
         assert_eq!(state.transcript_entries().len(), 4);
-        let TranscriptEntry::Tool(tool) = &state.transcript_entries()[2] else {
+        let TranscriptEntry::Tool(tool) = &state.transcript_entries()[2].entry else {
             panic!("expected historical tool entry");
         };
         assert_eq!(tool.call_id, "call-1");
         assert_eq!(tool.output, "1 | note");
         assert!(matches!(tool.status, ToolStatus::Finished(_)));
+    }
+
+    #[test]
+    fn transcript_entries_have_stable_ids_and_targeted_revisions() {
+        let mut state = AppState::new();
+        state.add_system_message("static");
+        let static_id = state.transcript_entries()[0].id;
+        let static_revision = state.transcript_entries()[0].revision;
+
+        state.reduce(AgentEvent::ToolExecutionStarted {
+            call_id: "call-1".to_owned(),
+            name: "bash".to_owned(),
+            arguments: "{}".to_owned(),
+        });
+        let tool_id = state.transcript_entries()[1].id;
+        state.reduce(AgentEvent::ToolExecutionOutput {
+            call_id: "call-1".to_owned(),
+            stream: ToolOutputStream::Stdout,
+            chunk: "one".to_owned(),
+        });
+
+        assert_ne!(static_id, tool_id);
+        assert_eq!(state.transcript_entries()[0].id, static_id);
+        assert_eq!(state.transcript_entries()[0].revision, static_revision);
+        assert_eq!(state.transcript_entries()[1].id, tool_id);
+        assert_eq!(state.transcript_entries()[1].revision, 1);
+
+        state.reduce(AgentEvent::AssistantMessageStarted);
+        state.reduce(AgentEvent::AssistantTextDelta {
+            index: None,
+            text: "stream".to_owned(),
+        });
+        let streaming = state
+            .streaming_assistant_state()
+            .expect("streaming assistant should have an id");
+        let streaming_id = streaming.id;
+        let streaming_revision = streaming.revision;
+        state.reduce(AgentEvent::AssistantMessageFinished { items: vec![] });
+        let finalized = state
+            .transcript_entries()
+            .last()
+            .expect("streaming assistant should finalize");
+        assert_eq!(finalized.id, streaming_id);
+        assert!(finalized.revision > streaming_revision);
+
+        let epoch = state.transcript_epoch();
+        state.replace_history(&[ModelMessage::user("replacement")]);
+        assert_eq!(state.transcript_epoch(), epoch.wrapping_add(1));
+        assert_ne!(state.transcript_entries()[0].id, static_id);
+    }
+
+    #[test]
+    fn message_view_derives_from_transcript_entries_without_copying_text() {
+        let mut state = AppState::new();
+        state.add_system_message("system");
+        state.reduce(AgentEvent::ToolExecutionStarted {
+            call_id: "call-1".to_owned(),
+            name: "read".to_owned(),
+            arguments: "{}".to_owned(),
+        });
+        state.add_system_message("later");
+
+        let messages = state.messages();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "system");
+        assert_eq!(messages[1].content, "later");
+        assert_eq!(messages.iter().count(), 2);
     }
 
     #[test]
