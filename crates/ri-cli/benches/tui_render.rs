@@ -142,7 +142,8 @@ where
     let iterations = iterations.max(1);
     let started = Instant::now();
     for _ in 0..iterations {
-        black_box(operation());
+        operation();
+        black_box(());
     }
     let elapsed = started.elapsed();
     println!(
