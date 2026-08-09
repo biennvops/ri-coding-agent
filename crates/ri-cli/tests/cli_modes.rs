@@ -262,6 +262,30 @@ fn json_logging_keeps_stdout_parseable_and_redacts_configured_secrets() {
 }
 
 #[test]
+fn help_and_version_do_not_require_configuration() {
+    let _lock = cli_test_lock();
+    for args in [["--help"].as_slice(), &["--version"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_ri"))
+            .args(args)
+            .env_remove("HOME")
+            .env_remove("USERPROFILE")
+            .env_remove("RI_MODELS_FILE")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+        assert!(!output.stdout.is_empty());
+    }
+    let version = Command::new(env!("CARGO_BIN_EXE_ri"))
+        .arg("-V")
+        .env_remove("HOME")
+        .env_remove("USERPROFILE")
+        .env_remove("RI_MODELS_FILE")
+        .output()
+        .unwrap();
+    assert_eq!(text(&version.stdout), "ri 0.1.0\n");
+}
+
+#[test]
 fn setup_and_cli_errors_use_status_two() {
     let _lock = cli_test_lock();
     let home = unique_dir("cli-status");

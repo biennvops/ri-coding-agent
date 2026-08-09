@@ -40,6 +40,7 @@ pub struct Options {
     pub resume_session: bool,
     pub session: Option<String>,
     pub no_session: bool,
+    pub show_version: bool,
 }
 
 impl Options {
@@ -67,6 +68,7 @@ impl Options {
                     }
                 }
                 "--json" => options.json = true,
+                "-V" | "--version" => options.show_version = true,
                 "--provider" => {
                     options.provider = Some(
                         args.next()
@@ -94,7 +96,11 @@ impl Options {
             }
         }
 
-        if options.json && options.print_prompt.is_none() && !options.show_help {
+        if options.json
+            && options.print_prompt.is_none()
+            && !options.show_help
+            && !options.show_version
+        {
             bail!("--json requires --print <prompt>");
         }
 
@@ -114,13 +120,17 @@ impl Options {
         Ok(options)
     }
 
+    pub fn print_version() {
+        println!("ri {}", env!("CARGO_PKG_VERSION"));
+    }
+
     pub fn print_help() {
         println!(
             "ri — a small Rust coding agent\n\n\
              Usage:\n  ri                              start the interactive TUI\n  ri -p, --print <prompt>         run one prompt without the TUI\n  ri --json -p <prompt>           emit versioned NDJSON events\n\n\
              Model:\n  --provider <id>                 select a configured provider\n  --model <id>                   select a configured model\n\n\
              Sessions:\n  -c, --continue                 continue the newest saved session\n  -r, --resume                   choose a saved session interactively\n  --session <id-or-path>         resume one saved session\n  --no-session                   disable session persistence\n\n\
-             Context and help:\n  --no-context                   disable AGENTS context loading\n  -h, --help                    show this help\n\n\
+             Context and help:\n  --no-context                   disable AGENTS context loading\n  -h, --help                    show this help\n  -V, --version                 show the version\n\n\
              Interactive commands:\n  /model                         open the model picker\n  /model <provider/model>        select a model directly\n  /new                           create a new session\n  /resume                        choose a saved session\n  /name [name]                   show or set the session name\n  /session                       show session details\n  /compact                       compact the current context\n  /quit                          exit the TUI\n\n\
              Environment:\n  RI_LOG=error|warn|info|debug|trace  write private diagnostic logs"
         );
@@ -172,6 +182,18 @@ pub async fn run(options: Options) -> Result<(), RunError> {
     }
 }
 
+fn missing_models_message() -> String {
+    let default_path = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .map(|home| home.join(".ri/agent/models.json"))
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "~/.ri/agent/models.json".to_owned());
+    format!(
+        "no models.json found\n\nCreate:\n  {default_path}\n\nor set:\n  RI_MODELS_FILE=/path/to/models.json\n\nSee README.md for a minimal provider example."
+    )
+}
+
 struct AppSetup {
     provider: ConfiguredProvider,
     catalog: Option<ModelCatalog>,
@@ -216,11 +238,7 @@ impl AppSetup {
 
         let catalog = load_default_models()
             .map_err(|error| anyhow!(error.to_string()))?
-            .ok_or_else(|| {
-                anyhow!(
-                    "no models.json found; create ~/.ri/agent/models.json or set RI_MODELS_FILE"
-                )
-            })?;
+            .ok_or_else(|| anyhow!(missing_models_message()))?;
         for warning in catalog.warnings() {
             eprintln!("ri: warning: {}: {}", warning.path, warning.message);
         }
@@ -1341,8 +1359,19 @@ mod tests {
                 resume_session: false,
                 session: None,
                 no_session: false,
+                show_version: false,
             }
         );
+    }
+
+    #[test]
+    fn parses_version_without_application_options() {
+        assert!(
+            Options::parse(["--version".to_owned()])
+                .unwrap()
+                .show_version
+        );
+        assert!(Options::parse(["-V".to_owned()]).unwrap().show_version);
     }
 
     #[test]

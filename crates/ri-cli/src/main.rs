@@ -13,6 +13,10 @@ async fn run_main() -> i32 {
             return 2;
         }
     };
+    if options.show_version {
+        app::Options::print_version();
+        return 0;
+    }
     if options.show_help {
         app::Options::print_help();
         return 0;
