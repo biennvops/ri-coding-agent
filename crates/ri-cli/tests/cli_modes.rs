@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -387,6 +387,70 @@ fn structurally_corrupt_session_fails_with_a_path_and_status_two() {
     assert_eq!(output.status.code(), Some(2));
     assert!(text(&output.stderr).contains(&session.display().to_string()));
     assert!(output.stdout.is_empty());
+    let _ = fs::remove_dir_all(home);
+}
+
+#[cfg(unix)]
+#[test]
+fn json_interrupt_preserves_ndjson_and_reports_cancellation() {
+    let _lock = cli_test_lock();
+    let home = unique_dir("cli-json-interrupt");
+    fs::create_dir_all(&home).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        accepted_tx.send(()).unwrap();
+        let _ = read_request(&mut stream);
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+        );
+        let mut buffer = [0_u8; 1024];
+        while stream.read(&mut buffer).unwrap_or(0) > 0 {}
+    });
+    let models = home.join("models.json");
+    fs::write(
+        &models,
+        format!(
+            r#"{{"providers":{{"test":{{"baseUrl":"http://{}","api":"openai-completions","models":[{{"id":"model"}}]}}}}}}"#,
+            address
+        ),
+    )
+    .unwrap();
+
+    let child = Command::new(env!("CARGO_BIN_EXE_ri"))
+        .args(["--json", "-p", "hello", "--no-session", "--no-context"])
+        .env("HOME", &home)
+        .env_remove("USERPROFILE")
+        .env("RI_MODELS_FILE", &models)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    accepted_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("provider request should reach the test server");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    server.join().unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr: {}",
+        text(&output.stderr)
+    );
+    let records = parse_records(&output.stdout);
+    assert!(records.iter().any(|record| {
+        record["type"] == "turn_finished" && record["data"]["reason"] == "cancelled"
+    }));
+    assert_eq!(records.last().unwrap()["type"], "run_finished");
+    assert_eq!(records.last().unwrap()["data"]["success"], false);
     let _ = fs::remove_dir_all(home);
 }
 
