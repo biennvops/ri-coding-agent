@@ -274,19 +274,27 @@ mod tests {
     fn recent_state_round_trips_global_and_workspace_models() {
         let root = unique_test_dir("state-round-trip");
         let path = root.join("state.json");
-        let workspace = "a43bd19c5e1b4b2f89e114ad2b61ec33";
-        let model = ModelRef::new("local", "qwen");
+        let first_workspace = "a43bd19c5e1b4b2f89e114ad2b61ec33";
+        let second_workspace = "b43bd19c5e1b4b2f89e114ad2b61ec33";
+        let first_model = ModelRef::new("local", "qwen");
+        let second_model = ModelRef::new("remote", "coder");
 
-        persist_recent_model(&path, workspace, &model).expect("state should persist");
+        persist_recent_model(&path, first_workspace, &first_model).expect("state should persist");
+        persist_recent_model(&path, second_workspace, &second_model)
+            .expect("state should preserve other workspaces");
         let state = load_state(&path)
             .expect("state should load")
             .expect("state should exist");
 
         assert_eq!(state.version, STATE_VERSION);
-        assert_eq!(state.last_model, Some(RecentModel::from(&model)));
+        assert_eq!(state.last_model, Some(RecentModel::from(&second_model)));
         assert_eq!(
-            state.workspace_model(workspace),
-            Some(&RecentModel::from(&model))
+            state.workspace_model(first_workspace),
+            Some(&RecentModel::from(&first_model))
+        );
+        assert_eq!(
+            state.workspace_model(second_workspace),
+            Some(&RecentModel::from(&second_model))
         );
         remove_test_dir(root);
     }
@@ -297,6 +305,20 @@ mod tests {
         let path = root.join("state.json");
 
         assert_eq!(load_state(&path).expect("missing state should load"), None);
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn state_write_failures_are_reported_without_partial_state() {
+        let root = unique_test_dir("state-write-failure");
+        fs::create_dir_all(&root).unwrap();
+        let parent_file = root.join("not-a-directory");
+        fs::write(&parent_file, "occupied").unwrap();
+        let path = parent_file.join("state.json");
+
+        let error = persist_recent_model(&path, "workspace", &ModelRef::new("p", "m"))
+            .expect_err("a file cannot be used as the state directory");
+        assert!(error.to_string().contains("state directory"));
         remove_test_dir(root);
     }
 
