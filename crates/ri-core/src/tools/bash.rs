@@ -1338,6 +1338,7 @@ mod tests {
         panic!("marker was not created: {}", path.display());
     }
 
+    #[cfg(unix)]
     fn remove_test_dir(path: PathBuf) {
         let _ = fs::remove_dir_all(path);
     }
