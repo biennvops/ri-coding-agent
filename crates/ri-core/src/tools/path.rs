@@ -19,13 +19,10 @@ pub(crate) fn resolve_for_write(
     context: &ToolContext,
     requested: &str,
 ) -> Result<PathBuf, ToolError> {
-    let requested_is_absolute = Path::new(requested).is_absolute();
     let candidate = candidate_path(context, requested)?;
     let lexical = normalize_lexical(&candidate)
         .ok_or_else(|| ToolError::Failed(format!("path {requested:?} escapes the workspace")))?;
-    if !requested_is_absolute {
-        ensure_inside(context, &lexical, requested)?;
-    }
+    ensure_inside(context, &lexical, requested)?;
 
     match fs::symlink_metadata(&candidate) {
         Ok(_) => {
@@ -163,9 +160,15 @@ mod tests {
         assert!(resolve_for_write(&context, "../outside.txt").is_err());
         assert!(resolve_for_write(&context, "missing/../../outside.txt").is_err());
         assert!(resolve_for_write(&context, "nested/file.txt").is_ok());
-        assert!(
-            resolve_for_write(&context, &root.join("absolute.txt").display().to_string()).is_ok()
-        );
+        assert!(resolve_for_write(
+            &context,
+            &context
+                .workspace_root
+                .join("absolute.txt")
+                .display()
+                .to_string()
+        )
+        .is_ok());
         assert!(resolve_for_write(
             &context,
             &root

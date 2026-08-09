@@ -154,6 +154,41 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[tokio::test]
+    async fn rejects_absolute_escape_through_missing_components() {
+        let root = unique_test_dir("write-absolute-escape");
+        fs::create_dir_all(&root).unwrap();
+        let context = ToolContext::new(&root).unwrap();
+        let workspace = context.workspace_root.clone();
+        let outside = workspace
+            .parent()
+            .unwrap()
+            .join(format!("ri-write-outside-{}", std::process::id()));
+        let requested = workspace
+            .join("missing")
+            .join("..")
+            .join("..")
+            .join(outside.file_name().unwrap())
+            .join("file.txt");
+
+        let result = WriteTool
+            .execute(
+                json!({
+                    "path": requested.to_string_lossy(),
+                    "content": "nope"
+                }),
+                &context,
+                tokio::sync::mpsc::channel(1).0,
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(!outside.join("file.txt").exists());
+        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(outside);
+    }
+
     fn unique_test_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "ri-{name}-{}-{}",
