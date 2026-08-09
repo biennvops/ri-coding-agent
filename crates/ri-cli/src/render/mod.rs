@@ -243,7 +243,7 @@ fn footer_text(state: &AppState, width: u16) -> Line<'static> {
     let model = state
         .active_model()
         .map(ModelRef::display_name)
-        .unwrap_or_else(|| "mock/mock".to_owned());
+        .unwrap_or_else(|| "no model".to_owned());
     let session = state
         .session_info()
         .map(|info| format!("session: {}", info.display_name()))

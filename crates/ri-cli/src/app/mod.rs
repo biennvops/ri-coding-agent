@@ -4,15 +4,20 @@ use anyhow::{anyhow, bail, Context, Result};
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures_util::StreamExt;
 use ri_core::{
-    config::{load_default_models, load_default_settings},
+    config::{
+        default_state_path, load_default_models, load_default_settings, load_state,
+        persist_recent_model,
+    },
     context::{build_system_prompt, discover_project, load_context, ContextBundle},
-    AgentCommand, AgentEvent, AgentRuntime, AgentRuntimeConfig, AppState, ConfiguredProvider,
-    ModelCatalog, ModelMessage, ModelRef, OpenedSession, ResolvedModel, ResolvedSettings,
-    SessionHandle, SessionInfo, SessionMode, SessionRepository, StopReason, ToolContext,
+    workspace_id, AgentCommand, AgentEvent, AgentRuntime, AgentRuntimeConfig, AppState,
+    ConfiguredProvider, ModelCatalog, ModelMessage, ModelRef, OpenedSession, ResolvedModel,
+    ResolvedSettings, SessionHandle, SessionInfo, SessionMode, SessionRepository, StopReason,
+    ToolContext,
 };
 use tokio::sync::mpsc;
 
 use crate::input::{self, Action, VisualLayout};
+use crate::model_selection::resolve_model;
 use crate::render;
 use crate::terminal::TerminalGuard;
 
@@ -138,6 +143,8 @@ struct AppSetup {
     initial_transcript: Vec<ModelMessage>,
     compaction_enabled: bool,
     resume_requested: bool,
+    state_path: Option<std::path::PathBuf>,
+    workspace_id: String,
 }
 
 impl AppSetup {
@@ -150,31 +157,53 @@ impl AppSetup {
             eprintln!("ri: warning: {}: {}", warning.path, warning.message);
         }
 
-        let (requested_provider, requested_model) = model_selection(options, &settings.settings);
-        let catalog = load_default_models().context("could not load models.json")?;
-        let (provider, catalog, selected) = if let Some(catalog) = catalog {
-            for warning in catalog.warnings() {
-                eprintln!("ri: warning: {}: {}", warning.path, warning.message);
-            }
-            let selected = catalog
-                .resolve(requested_provider, requested_model)
-                .context("could not select configured model")?;
-            let provider = ConfiguredProvider::openai(selected.clone())
-                .map_err(|error| anyhow!(error.to_string()))?;
-            (provider, Some(catalog), Some(selected))
-        } else if requested_provider.is_some() || requested_model.is_some() {
-            if settings.settings.default_provider.is_some()
-                || settings.settings.default_model.is_some()
-            {
-                bail!(
-                    "settings select {}, but no models.json is available; create ~/.ri/agent/models.json or set RI_MODELS_FILE",
-                    settings_selection_description(&settings.settings)
-                );
-            }
-            bail!("no models.json found; create ~/.ri/agent/models.json or set RI_MODELS_FILE");
-        } else {
-            (ConfiguredProvider::mock(), None, None)
+        let workspace_id = workspace_id(&project.launch_cwd)
+            .map_err(|error| anyhow!(error.to_string()))?
+            .to_string();
+        let state_path = default_state_path();
+        let recent_state = match state_path.as_ref() {
+            Some(path) => match load_state(path) {
+                Ok(state) => state,
+                Err(error) => {
+                    eprintln!("ri: warning: {error}; ignoring recent model state");
+                    None
+                }
+            },
+            None => None,
         };
+
+        let catalog = load_default_models()
+            .context("could not load models.json")?
+            .ok_or_else(|| {
+                anyhow!(
+                    "no models.json found; create ~/.ri/agent/models.json or set RI_MODELS_FILE"
+                )
+            })?;
+        for warning in catalog.warnings() {
+            eprintln!("ri: warning: {}: {}", warning.path, warning.message);
+        }
+        let selection = resolve_model(
+            &catalog,
+            options.provider.as_deref(),
+            options.model.as_deref(),
+            &settings.settings,
+            recent_state.as_ref(),
+            &workspace_id,
+        )
+        .context("could not select configured model")?;
+        for warning in &selection.warnings {
+            eprintln!("ri: warning: {warning}");
+        }
+        let _selection_source = selection.source;
+        let selected = selection.model;
+        let provider = ConfiguredProvider::openai(selected.clone())
+            .map_err(|error| anyhow!(error.to_string()))?;
+        if let Some(path) = state_path.as_ref() {
+            if let Err(error) = persist_recent_model(path, &workspace_id, &selected.model_ref) {
+                eprintln!("ri: warning: could not persist recent model selection: {error}");
+            }
+        }
+        let (provider, catalog, selected) = (provider, Some(catalog), Some(selected));
 
         let context = if settings.settings.context.enabled && !options.no_context {
             load_context(&project.launch_cwd, &project.project_root)
@@ -259,6 +288,8 @@ impl AppSetup {
             initial_transcript,
             compaction_enabled: settings.settings.compaction.enabled,
             resume_requested,
+            state_path,
+            workspace_id,
         })
     }
 
@@ -267,6 +298,13 @@ impl AppSetup {
             .as_ref()
             .map(|model| model.model_ref.clone())
             .unwrap_or_else(|| self.provider.model_ref())
+    }
+
+    fn remember_model(&self, model: &ModelRef) -> Result<(), String> {
+        let Some(path) = self.state_path.as_ref() else {
+            return Ok(());
+        };
+        persist_recent_model(path, &self.workspace_id, model).map_err(|error| error.to_string())
     }
 
     fn runtime_config(&self) -> AgentRuntimeConfig {
