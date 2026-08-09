@@ -676,6 +676,8 @@ async fn run_tui_loop(
 
     while !exit {
         if redraw.take_ready(Instant::now()) {
+            drain_ready_agent_events(state, event_rx, setup, &mut scroll_from_bottom, &mut redraw)?;
+            redraw.mark_drawn();
             renderer
                 .draw(terminal.terminal_mut(), state, scroll_from_bottom)
                 .context("could not render terminal")?;
@@ -785,22 +787,58 @@ async fn run_tui_loop(
             agent_event = event_rx.recv() => {
                 let event = agent_event
                     .ok_or_else(|| anyhow!("agent event stream disconnected"))?;
-                if matches!(event, AgentEvent::TurnFinished { .. }) {
-                    scroll_from_bottom = 0;
-                }
-                let urgency = redraw_urgency(&event);
-                log_agent_event(&event);
-                let session_loaded = matches!(event, AgentEvent::SessionLoaded { .. });
-                state.reduce(event);
-                if session_loaded {
-                    state.add_system_message(setup.context.diagnostic());
-                }
+                let urgency = apply_agent_event(
+                    event,
+                    state,
+                    setup,
+                    &mut scroll_from_bottom,
+                );
                 redraw.request(urgency, Instant::now());
             }
         }
     }
 
     Ok(())
+}
+
+fn apply_agent_event(
+    event: AgentEvent,
+    state: &mut AppState,
+    setup: &mut AppSetup,
+    scroll_from_bottom: &mut usize,
+) -> RedrawUrgency {
+    if matches!(event, AgentEvent::TurnFinished { .. }) {
+        *scroll_from_bottom = 0;
+    }
+    let urgency = redraw_urgency(&event);
+    log_agent_event(&event);
+    let session_loaded = matches!(event, AgentEvent::SessionLoaded { .. });
+    state.reduce(event);
+    if session_loaded {
+        state.add_system_message(setup.context.diagnostic());
+    }
+    urgency
+}
+
+fn drain_ready_agent_events(
+    state: &mut AppState,
+    event_rx: &mut mpsc::Receiver<AgentEvent>,
+    setup: &mut AppSetup,
+    scroll_from_bottom: &mut usize,
+    redraw: &mut RedrawScheduler,
+) -> Result<()> {
+    loop {
+        match event_rx.try_recv() {
+            Ok(event) => {
+                let urgency = apply_agent_event(event, state, setup, scroll_from_bottom);
+                redraw.request(urgency, Instant::now());
+            }
+            Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                bail!("agent event stream disconnected")
+            }
+        }
+    }
 }
 
 fn redraw_urgency(event: &AgentEvent) -> RedrawUrgency {

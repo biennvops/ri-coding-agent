@@ -44,6 +44,11 @@ impl RedrawScheduler {
         self.immediate || self.deadline.is_some()
     }
 
+    pub fn mark_drawn(&mut self) {
+        self.immediate = false;
+        self.deadline = None;
+    }
+
     pub fn take_ready(&mut self, now: Instant) -> bool {
         let ready = self.immediate || self.deadline.is_some_and(|deadline| now >= deadline);
         if ready {
