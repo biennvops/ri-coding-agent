@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use crossterm::event::{Event, EventStream, KeyEventKind};
@@ -18,6 +19,7 @@ use tokio::sync::mpsc;
 use crate::input::{self, Action};
 use crate::json_output::{JsonEmitter, RunStartedData};
 use crate::model_selection::resolve_model;
+use crate::redraw::{RedrawScheduler, RedrawUrgency};
 use crate::render::TuiRenderer;
 use crate::terminal::TerminalGuard;
 
@@ -658,7 +660,8 @@ async fn run_tui_loop(
     event_rx: &mut mpsc::Receiver<AgentEvent>,
     setup: &mut AppSetup,
 ) -> Result<()> {
-    let mut dirty = true;
+    let mut redraw = RedrawScheduler::new(Duration::from_millis(12));
+    redraw.request(RedrawUrgency::Immediate, Instant::now());
     let mut scroll_from_bottom = 0usize;
     let mut editor_width = terminal
         .terminal_mut()
@@ -672,15 +675,17 @@ async fn run_tui_loop(
     let mut exit = false;
 
     while !exit {
-        if dirty {
+        if redraw.take_ready(Instant::now()) {
             renderer
                 .draw(terminal.terminal_mut(), state, scroll_from_bottom)
                 .context("could not render terminal")?;
             state.acknowledge_transcript_changes();
-            dirty = false;
         }
 
+        let redraw_deadline = redraw.deadline();
         tokio::select! {
+            biased;
+            _ = wait_for_redraw(redraw_deadline) => {}
             terminal_event = terminal_events.next() => {
                 let terminal_event = terminal_event
                     .ok_or_else(|| anyhow!("terminal event stream disconnected"))?
@@ -688,7 +693,7 @@ async fn run_tui_loop(
                 match terminal_event {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         if let Some(action) = input::action_for(key) {
-                            dirty = true;
+                            redraw.request(RedrawUrgency::Immediate, Instant::now());
                             if !matches!(action, Action::Up | Action::Down) {
                                 preferred_column = None;
                             }
@@ -772,7 +777,7 @@ async fn run_tui_loop(
                     Event::Resize(width, _) => {
                         editor_width = width.saturating_sub(2).max(1) as usize;
                         preferred_column = None;
-                        dirty = true;
+                        redraw.request(RedrawUrgency::Immediate, Instant::now());
                     }
                     _ => {}
                 }
@@ -783,18 +788,44 @@ async fn run_tui_loop(
                 if matches!(event, AgentEvent::TurnFinished { .. }) {
                     scroll_from_bottom = 0;
                 }
+                let urgency = redraw_urgency(&event);
                 log_agent_event(&event);
                 let session_loaded = matches!(event, AgentEvent::SessionLoaded { .. });
                 state.reduce(event);
                 if session_loaded {
                     state.add_system_message(setup.context.diagnostic());
                 }
-                dirty = true;
+                redraw.request(urgency, Instant::now());
             }
         }
     }
 
     Ok(())
+}
+
+fn redraw_urgency(event: &AgentEvent) -> RedrawUrgency {
+    match event {
+        AgentEvent::AssistantTextDelta { .. }
+        | AgentEvent::AssistantThinkingDelta { .. }
+        | AgentEvent::AssistantThinkingContentDelta { .. }
+        | AgentEvent::AssistantRefusalDelta { .. }
+        | AgentEvent::AssistantTextItem { .. }
+        | AgentEvent::AssistantRefusalItem { .. }
+        | AgentEvent::AssistantThinkingItem { .. }
+        | AgentEvent::ToolCallDelta { .. }
+        | AgentEvent::ToolExecutionOutput { .. }
+        | AgentEvent::UsageUpdated(_)
+        | AgentEvent::ContextUsageUpdated(_) => RedrawUrgency::Coalesced,
+        _ => RedrawUrgency::Immediate,
+    }
+}
+
+async fn wait_for_redraw(deadline: Option<Instant>) {
+    if let Some(deadline) = deadline {
+        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+    } else {
+        std::future::pending::<()>().await;
+    }
 }
 
 #[cfg(test)]
