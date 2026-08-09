@@ -1,12 +1,14 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::fs::{atomic_write, AtomicWriteOptions};
 
 use super::ModelRef;
 
@@ -186,46 +188,21 @@ fn preserve_corrupt_state(path: &Path) -> Result<(), StateError> {
 }
 
 fn write_state_atomically(path: &Path, state: &RecentModelState) -> Result<(), StateError> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("state.json");
-    let temporary_path = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
-    let source = serde_json::to_vec_pretty(state).expect("recent state is serializable");
-
-    let result = (|| {
-        let mut temporary = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary_path)
-            .map_err(|source| StateError::Io {
-                path: temporary_path.clone(),
-                operation: "creating temporary state",
-                source,
-            })?;
-        set_private_file_permissions(&temporary, &temporary_path)?;
-        temporary
-            .write_all(&source)
-            .and_then(|_| temporary.write_all(b"\n"))
-            .and_then(|_| temporary.flush())
-            .and_then(|_| temporary.sync_all())
-            .map_err(|source| StateError::Io {
-                path: temporary_path.clone(),
-                operation: "writing temporary state",
-                source,
-            })?;
-        fs::rename(&temporary_path, path).map_err(|source| StateError::Io {
-            path: path.to_path_buf(),
-            operation: "replacing state",
-            source,
-        })
-    })();
-
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary_path);
-    }
-    result
+    let mut source = serde_json::to_vec_pretty(state).expect("recent state is serializable");
+    source.push(b'\n');
+    atomic_write(
+        path,
+        &source,
+        AtomicWriteOptions {
+            preserve_permissions: true,
+            private: true,
+        },
+    )
+    .map_err(|source| StateError::Io {
+        path: path.to_path_buf(),
+        operation: "writing state",
+        source,
+    })
 }
 
 fn open_lock(path: &Path, create_parent: bool) -> Result<File, StateError> {
@@ -233,6 +210,8 @@ fn open_lock(path: &Path, create_parent: bool) -> Result<File, StateError> {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         create_state_directory(parent, path)?;
     }
+    // The lock file is only a stable advisory-lock target. Its existence does
+    // not indicate that another process currently owns the lock.
     let lock_path = lock_path(path);
     OpenOptions::new()
         .create(true)
@@ -277,20 +256,6 @@ fn set_private_directory_permissions(_path: &Path, _error_path: &Path) -> Result
     Ok(())
 }
 
-fn set_private_file_permissions(file: &File, path: &Path) -> Result<(), StateError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(|source| StateError::Io {
-                path: path.to_path_buf(),
-                operation: "setting state file permissions",
-                source,
-            })?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,6 +285,26 @@ mod tests {
         assert_eq!(
             state.workspace_model(second_workspace),
             Some(&RecentModel::from(&second_model))
+        );
+        remove_test_dir(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_state_writes_restore_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_test_dir("state-private-permissions");
+        let path = root.join("state.json");
+        let model = ModelRef::new("provider", "model");
+
+        persist_recent_model(&path, "workspace", &model).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        persist_recent_model(&path, "workspace", &model).unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
         );
         remove_test_dir(root);
     }

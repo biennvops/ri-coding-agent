@@ -1,8 +1,7 @@
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::fs::{atomic_write, temporary_path as atomic_temporary_path, AtomicWriteOptions};
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -13,8 +12,6 @@ use crate::model::ToolDefinition;
 
 use super::path::resolve_for_write;
 use super::{Tool, ToolContext, ToolError, ToolEventSender, ToolExecutionResult};
-
-static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) struct WriteTool;
 
@@ -80,67 +77,24 @@ pub(crate) fn atomic_replace(path: &Path, content: &[u8]) -> Result<usize, ToolE
         ))
     })?;
 
-    let existing_permissions = fs::metadata(path)
-        .ok()
-        .map(|metadata| metadata.permissions());
-    let temp_path = temporary_path(parent);
-    let mut temporary = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .map_err(|error| {
-            ToolError::Failed(format!(
-                "could not create temporary file for {}: {error}",
-                path.display()
-            ))
-        })?;
-
-    let write_result = (|| {
-        temporary
-            .write_all(content)
-            .map_err(|error| error.to_string())?;
-        temporary.sync_all().map_err(|error| error.to_string())?;
-        if let Some(permissions) = existing_permissions {
-            fs::set_permissions(&temp_path, permissions).map_err(|error| error.to_string())?;
-        }
-        Ok::<(), String>(())
-    })();
-    drop(temporary);
-
-    if let Err(error) = write_result {
-        let _ = fs::remove_file(&temp_path);
-        return Err(ToolError::Failed(format!(
-            "could not write temporary file for {}: {error}",
-            path.display()
-        )));
-    }
-
-    if let Err(error) = fs::rename(&temp_path, path) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(ToolError::Failed(format!(
+    atomic_write(path, content, AtomicWriteOptions::default()).map_err(|error| {
+        ToolError::Failed(format!(
             "could not atomically replace {}: {error}",
             path.display()
-        )));
-    }
+        ))
+    })?;
 
     Ok(content.len())
 }
 
 pub(crate) fn temporary_path(parent: &Path) -> PathBuf {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    parent.join(format!(
-        ".ri-temp-{}-{timestamp}-{counter}",
-        std::process::id()
-    ))
+    atomic_temporary_path(parent)
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
 
@@ -198,6 +152,41 @@ mod tests {
             .await;
         assert!(result.is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_absolute_escape_through_missing_components() {
+        let root = unique_test_dir("write-absolute-escape");
+        fs::create_dir_all(&root).unwrap();
+        let context = ToolContext::new(&root).unwrap();
+        let workspace = context.workspace_root.clone();
+        let outside = workspace
+            .parent()
+            .unwrap()
+            .join(format!("ri-write-outside-{}", std::process::id()));
+        let requested = workspace
+            .join("missing")
+            .join("..")
+            .join("..")
+            .join(outside.file_name().unwrap())
+            .join("file.txt");
+
+        let result = WriteTool
+            .execute(
+                json!({
+                    "path": requested.to_string_lossy(),
+                    "content": "nope"
+                }),
+                &context,
+                tokio::sync::mpsc::channel(1).0,
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(!outside.join("file.txt").exists());
+        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_dir_all(outside);
     }
 
     fn unique_test_dir(name: &str) -> PathBuf {

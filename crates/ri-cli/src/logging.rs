@@ -3,7 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Result};
@@ -13,6 +13,7 @@ use tracing::span;
 use tracing::{Event, Level, Metadata, Subscriber};
 
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
+static LOG_FILE: OnceLock<Arc<Mutex<File>>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum LogLevel {
@@ -114,7 +115,7 @@ impl LogFilter {
 
 struct FileSubscriber {
     filter: LogFilter,
-    file: Mutex<File>,
+    file: Arc<Mutex<File>>,
     next_span: AtomicU64,
 }
 
@@ -122,7 +123,7 @@ impl FileSubscriber {
     fn new(filter: LogFilter, file: File) -> Self {
         Self {
             filter,
-            file: Mutex::new(file),
+            file: Arc::new(Mutex::new(file)),
             next_span: AtomicU64::new(1),
         }
     }
@@ -247,15 +248,42 @@ pub fn init() -> Result<Option<PathBuf>> {
         })?;
     set_private_file_permissions(&file, &path)?;
 
-    tracing::subscriber::set_global_default(FileSubscriber::new(filter, file)).map_err(|_| {
+    let subscriber = FileSubscriber::new(filter, file);
+    let log_file = Arc::clone(&subscriber.file);
+    tracing::subscriber::set_global_default(subscriber).map_err(|_| {
         anyhow!("could not initialize RI_LOG; a global logger is already installed")
     })?;
+    let _ = LOG_FILE.set(log_file);
     let _ = LOG_PATH.set(path.clone());
     Ok(Some(path))
 }
 
 pub(crate) fn path() -> Option<&'static Path> {
     LOG_PATH.get().map(PathBuf::as_path)
+}
+
+pub(crate) fn flush() {
+    if let Some(file) = LOG_FILE.get() {
+        if let Ok(mut file) = file.lock() {
+            let _ = file.flush();
+        }
+    }
+}
+
+pub(crate) fn flush_best_effort() {
+    if let Some(file) = LOG_FILE.get() {
+        if let Ok(mut file) = file.try_lock() {
+            let _ = file.flush();
+        }
+    }
+}
+
+pub struct FlushGuard;
+
+impl Drop for FlushGuard {
+    fn drop(&mut self) {
+        flush();
+    }
 }
 
 fn default_log_directory() -> Result<PathBuf> {
@@ -293,20 +321,20 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
-fn set_private_directory_permissions(path: &Path) -> Result<()> {
+fn set_private_directory_permissions(_path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(_path, fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
 }
 
-fn set_private_file_permissions(file: &File, _path: &Path) -> Result<()> {
+fn set_private_file_permissions(_file: &File, _path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        _file.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
 }

@@ -6,6 +6,7 @@ async fn main() {
 }
 
 async fn run_main() -> i32 {
+    let _logging_guard = logging::FlushGuard;
     let options = match app::Options::parse(std::env::args().skip(1)) {
         Ok(options) => options,
         Err(error) => {
@@ -13,6 +14,10 @@ async fn run_main() -> i32 {
             return 2;
         }
     };
+    if options.show_version {
+        app::Options::print_version();
+        return 0;
+    }
     if options.show_help {
         app::Options::print_help();
         return 0;

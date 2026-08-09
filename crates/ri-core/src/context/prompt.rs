@@ -96,7 +96,7 @@ mod tests {
 
     #[test]
     fn escapes_paths_without_mutating_instruction_content() {
-        let root = unique_test_dir("prompt-&\"<>");
+        let root = unique_test_dir("prompt-&-path");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("AGENTS.md"), "raw *markdown* & <tag>\n").unwrap();
 

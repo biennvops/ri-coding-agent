@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::ToolDefinition;
@@ -22,6 +23,7 @@ use super::{
 pub const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const TERMINATION_GRACE: Duration = Duration::from_millis(75);
+const READER_DRAIN_GRACE: Duration = Duration::from_millis(100);
 const STREAM_OUTPUT_LIMIT: usize = MAX_TOOL_OUTPUT_BYTES / 2;
 const BASH_CHUNK_BYTES: usize = 8 * 1024;
 
@@ -101,13 +103,18 @@ impl Tool for BashTool {
             .current_dir(&context.workspace_root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // This only covers the shell itself. ProcessTreeGuard below is
+            // still required for best-effort cleanup of descendants that stay
+            // in the owned group or Job; Unix process groups are not complete
+            // ownership of descendants that detach with setsid.
+            .kill_on_drop(true);
         configure_process_group(&mut command);
 
         let mut child = command.spawn().map_err(|error| {
             ToolError::Failed(format!("could not start shell command: {error}"))
         })?;
-        let process_tree = match ProcessTree::attach(&child) {
+        let mut process_tree = match ProcessTreeGuard::attach(&child) {
             Ok(process_tree) => process_tree,
             Err(error) => {
                 let _ = child.kill().await;
@@ -124,12 +131,14 @@ impl Tool for BashTool {
             .ok_or_else(|| ToolError::Failed("shell stderr pipe was unavailable".to_owned()))?;
 
         let (stream_tx, mut stream_rx) = mpsc::channel(64);
-        tokio::spawn(read_stream(
-            stdout,
-            ToolOutputStream::Stdout,
-            stream_tx.clone(),
-        ));
-        tokio::spawn(read_stream(stderr, ToolOutputStream::Stderr, stream_tx));
+        let reader_tasks = ReaderTasks::new(
+            tokio::spawn(read_stream(
+                stdout,
+                ToolOutputStream::Stdout,
+                stream_tx.clone(),
+            )),
+            tokio::spawn(read_stream(stderr, ToolOutputStream::Stderr, stream_tx)),
+        );
 
         let started = Instant::now();
         let mut output = BashOutput::new();
@@ -139,9 +148,16 @@ impl Tool for BashTool {
         let mut cancelled = false;
         let mut event_stream_closed = false;
         let mut process_error = None;
+        let mut tree_cleanup_started = false;
         let mut timeout_sleep = Box::pin(tokio::time::sleep(timeout));
+        let mut reader_drain_sleep = Box::pin(tokio::time::sleep(READER_DRAIN_GRACE));
 
         while status.is_none() || active_readers > 0 {
+            let was_running = status.is_none();
+            if status.is_some() && !tree_cleanup_started {
+                process_tree.kill_best_effort();
+                tree_cleanup_started = true;
+            }
             if status.is_some() && active_readers == 0 {
                 break;
             }
@@ -180,6 +196,10 @@ impl Tool for BashTool {
                         None => active_readers = 0,
                     }
                 }
+                _ = &mut reader_drain_sleep, if status.is_some() && active_readers > 0 => {
+                    reader_tasks.abort();
+                    active_readers = 0;
+                }
                 _ = cancel.cancelled(), if status.is_none() && !cancelled => {
                     cancelled = true;
                     terminate_child(&mut child, &process_tree).await?;
@@ -206,11 +226,22 @@ impl Tool for BashTool {
                 }
                 else => break,
             }
+            if was_running && status.is_some() {
+                reader_drain_sleep
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + READER_DRAIN_GRACE);
+            }
         }
+
+        if status.is_some() && !tree_cleanup_started {
+            process_tree.kill_best_effort();
+        }
+        reader_tasks.join().await;
 
         if let Some(error) = process_error {
             return Err(error);
         }
+        process_tree.disarm();
 
         let duration = started.elapsed();
         let exit_code = status.as_ref().and_then(std::process::ExitStatus::code);
@@ -338,6 +369,36 @@ async fn read_stream<R>(
     let _ = events.send(BashStreamEvent::Closed).await;
 }
 
+struct ReaderTasks {
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl ReaderTasks {
+    fn new(stdout: JoinHandle<()>, stderr: JoinHandle<()>) -> Self {
+        Self {
+            handles: vec![stdout, stderr],
+        }
+    }
+
+    fn abort(&self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+
+    async fn join(mut self) {
+        for handle in self.handles.drain(..) {
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for ReaderTasks {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
 #[derive(Default)]
 struct Utf8Decoder {
     pending: Vec<u8>,
@@ -390,62 +451,141 @@ impl Utf8Decoder {
     }
 }
 
+// On Unix this is a process-group ownership boundary, not a complete
+// representation of every descendant process.
 struct ProcessTree {
+    #[cfg(unix)]
+    process_group: Option<i32>,
     #[cfg(windows)]
     job: WindowsJob,
 }
 
 impl ProcessTree {
     fn attach(child: &Child) -> Result<Self, ToolError> {
+        #[cfg(unix)]
+        {
+            let process_group = child.id().and_then(|pid| {
+                let pid = pid as i32;
+                // SAFETY: getpgrp has no pointers or borrowed state; it only
+                // reads the calling process's group for the ownership check.
+                let own_group = unsafe { getpgrp() };
+                (pid > 1 && pid != own_group).then_some(pid)
+            });
+            Ok(Self { process_group })
+        }
         #[cfg(windows)]
         {
             let job = WindowsJob::attach(child)?;
             resume_suspended_process(child)?;
-            return Ok(Self { job });
+            Ok(Self { job })
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = child;
             Ok(Self {})
         }
     }
 
-    #[cfg(windows)]
-    fn terminate(&self) -> Result<(), ToolError> {
-        self.job.terminate()
+    fn terminate(&self, child: &mut Child) -> Result<(), ToolError> {
+        #[cfg(unix)]
+        self.signal(Some(child), SIGTERM);
+        #[cfg(windows)]
+        {
+            let _ = child;
+            self.job.terminate()?;
+        }
+        #[cfg(not(any(unix, windows)))]
+        child.start_kill().map_err(|error| {
+            ToolError::Failed(format!("could not terminate shell command: {error}"))
+        })?;
+        Ok(())
+    }
+
+    fn kill_best_effort(&self, child: Option<&Child>) {
+        #[cfg(unix)]
+        self.signal(child, SIGKILL);
+        #[cfg(windows)]
+        {
+            let _ = child;
+            let _ = self.job.terminate();
+        }
+        #[cfg(not(any(unix, windows)))]
+        let _ = child;
+    }
+
+    #[cfg(unix)]
+    fn signal(&self, child: Option<&Child>, signal: i32) {
+        if let Some(process_group) = self.process_group {
+            // SAFETY: process_group is the child PID after the child-side
+            // setpgid(0, 0) setup, and attach rejects ri's own process group.
+            unsafe {
+                let _ = kill(-process_group, signal);
+            }
+        } else if let Some(pid) = child.and_then(Child::id) {
+            // SAFETY: this fallback targets only the spawned child PID when
+            // process-group discovery was unavailable.
+            unsafe {
+                let _ = kill(pid as i32, signal);
+            }
+        }
     }
 }
 
-async fn terminate_child(child: &mut Child, process_tree: &ProcessTree) -> Result<(), ToolError> {
-    #[cfg(unix)]
-    let _ = process_tree;
-    #[cfg(unix)]
-    signal_process_group(child, SIGTERM);
-    #[cfg(windows)]
-    process_tree.terminate()?;
-    #[cfg(not(any(unix, windows)))]
-    child.start_kill().map_err(|error| {
-        ToolError::Failed(format!("could not terminate shell command: {error}"))
-    })?;
+struct ProcessTreeGuard {
+    tree: ProcessTree,
+    armed: bool,
+}
 
-    tokio::time::sleep(TERMINATION_GRACE).await;
+impl ProcessTreeGuard {
+    fn attach(child: &Child) -> Result<Self, ToolError> {
+        Ok(Self {
+            tree: ProcessTree::attach(child)?,
+            armed: true,
+        })
+    }
 
-    #[cfg(unix)]
-    signal_process_group(child, SIGKILL);
-    #[cfg(windows)]
+    fn terminate(&self, child: &mut Child) -> Result<(), ToolError> {
+        self.tree.terminate(child)
+    }
+
+    fn kill_best_effort(&self) {
+        self.tree.kill_best_effort(None);
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProcessTreeGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // Drop cannot await. The synchronous group/Job kill is the
+            // ownership backstop for an aborted bash future.
+            self.tree.kill_best_effort(None);
+        }
+    }
+}
+
+async fn terminate_child(
+    child: &mut Child,
+    process_tree: &ProcessTreeGuard,
+) -> Result<(), ToolError> {
+    // Cleanup races with natural exit. In that case the later status poll will
+    // still trigger best-effort descendant cleanup, but termination itself is
+    // not an infrastructure failure.
     if child
         .try_wait()
         .map_err(|error| {
-            ToolError::Failed(format!("could not inspect terminated command: {error}"))
+            ToolError::Failed(format!("could not inspect command during cleanup: {error}"))
         })?
-        .is_none()
+        .is_some()
     {
-        process_tree.terminate()?;
+        return Ok(());
     }
-    #[cfg(not(any(unix, windows)))]
-    child
-        .start_kill()
-        .map_err(|error| ToolError::Failed(format!("could not kill shell command: {error}")))?;
+    process_tree.terminate(child)?;
+    tokio::time::sleep(TERMINATION_GRACE).await;
+    process_tree.kill_best_effort();
     let _ = child
         .wait()
         .await
@@ -461,6 +601,8 @@ struct WindowsJob {
 #[cfg(windows)]
 impl WindowsJob {
     fn attach(child: &Child) -> Result<Self, ToolError> {
+        // SAFETY: null attributes and name request a private unnamed job;
+        // the returned handle is checked before it is stored or used.
         let handle = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
         if handle.is_null() {
             return Err(ToolError::Failed(format!(
@@ -470,6 +612,8 @@ impl WindowsJob {
         }
         let mut limits = JobObjectExtendedLimitInformation::default();
         limits.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: handle is a successfully created job and limits points to a
+        // live, correctly sized C-compatible structure for this call.
         let configured = unsafe {
             SetInformationJobObject(
                 handle,
@@ -479,6 +623,8 @@ impl WindowsJob {
             )
         } != 0;
         if !configured {
+            // SAFETY: handle was returned by CreateJobObjectW and has not been
+            // closed on this failure path.
             unsafe {
                 CloseHandle(handle);
             }
@@ -488,13 +634,17 @@ impl WindowsJob {
             )));
         }
         let process_handle = child.raw_handle().ok_or_else(|| {
+            // SAFETY: handle is still owned exclusively by this setup path.
             unsafe {
                 CloseHandle(handle);
             }
             ToolError::Failed("shell process exited before job assignment".to_owned())
         })?;
+        // SAFETY: both handles are valid for the duration of this call;
+        // process_handle is borrowed from Tokio's live child.
         if unsafe { AssignProcessToJobObject(handle, process_handle) } == 0 {
             let error = std::io::Error::last_os_error();
+            // SAFETY: handle remains exclusively owned on this failure path.
             unsafe {
                 CloseHandle(handle);
             }
@@ -508,6 +658,8 @@ impl WindowsJob {
     }
 
     fn terminate(&self) -> Result<(), ToolError> {
+        // SAFETY: self.handle is closed only by Drop and remains valid while
+        // this borrowed WindowsJob is used.
         if unsafe { TerminateJobObject(self.handle as *mut std::ffi::c_void, 1) } == 0 {
             return Err(ToolError::Failed(format!(
                 "could not terminate Windows process tree: {}",
@@ -521,6 +673,8 @@ impl WindowsJob {
 #[cfg(windows)]
 impl Drop for WindowsJob {
     fn drop(&mut self) {
+        // SAFETY: this handle is created and owned by WindowsJob; Drop is the
+        // single close path after all explicit setup failures have closed it.
         unsafe {
             let _ = CloseHandle(self.handle as *mut std::ffi::c_void);
         }
@@ -624,6 +778,8 @@ fn resume_suspended_process(child: &Child) -> Result<(), ToolError> {
     let process_id = child
         .id()
         .ok_or_else(|| ToolError::Failed("shell process exited before resume".to_owned()))?;
+    // SAFETY: the snapshot is created for thread enumeration and is checked
+    // before any enumeration or close operation.
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
     if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
         return Err(ToolError::Failed(format!(
@@ -637,14 +793,18 @@ fn resume_suspended_process(child: &Child) -> Result<(), ToolError> {
         ..ThreadEntry32::default()
     };
     let mut thread_id = None;
+    // SAFETY: snapshot is valid and entry points to the initialized structure
+    // owned by this function.
     let mut found = unsafe { Thread32First(snapshot, &mut entry) } != 0;
     while found {
         if entry.th32_owner_process_id == process_id {
             thread_id = Some(entry.th32_thread_id);
             break;
         }
+        // SAFETY: snapshot and entry remain valid for the enumeration.
         found = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
     }
+    // SAFETY: snapshot was successfully created and is closed exactly once.
     unsafe {
         CloseHandle(snapshot);
     }
@@ -652,6 +812,8 @@ fn resume_suspended_process(child: &Child) -> Result<(), ToolError> {
     let thread_id = thread_id.ok_or_else(|| {
         ToolError::Failed("could not find suspended shell primary thread".to_owned())
     })?;
+    // SAFETY: the thread ID came from the snapshot and the returned handle is
+    // checked before use.
     let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id) };
     if thread.is_null() {
         return Err(ToolError::Failed(format!(
@@ -659,7 +821,10 @@ fn resume_suspended_process(child: &Child) -> Result<(), ToolError> {
             std::io::Error::last_os_error()
         )));
     }
+    // SAFETY: thread is a valid handle returned by OpenThread and remains
+    // open for this resume call.
     let resumed = unsafe { ResumeThread(thread) };
+    // SAFETY: thread is owned by this function and is closed exactly once.
     unsafe {
         CloseHandle(thread);
     }
@@ -679,14 +844,18 @@ const SIGKILL: i32 = 9;
 
 #[cfg(unix)]
 unsafe extern "C" {
+    fn getpgrp() -> i32;
     fn kill(pid: i32, signal: i32) -> i32;
     fn setpgid(pid: i32, process_group: i32) -> i32;
 }
 
 #[cfg(unix)]
 fn configure_process_group(command: &mut Command) {
+    // SAFETY: pre_exec runs after fork and before exec in the child. The call
+    // uses pid 0 and cannot change ri's parent process group.
     unsafe {
         command.pre_exec(|| {
+            // SAFETY: this is the child process calling setpgid on itself.
             if setpgid(0, 0) == 0 {
                 Ok(())
             } else {
@@ -703,15 +872,6 @@ fn configure_process_group(command: &mut Command) {
 
 #[cfg(not(any(unix, windows)))]
 fn configure_process_group(_command: &mut Command) {}
-
-#[cfg(unix)]
-fn signal_process_group(child: &Child, signal: i32) {
-    if let Some(pid) = child.id() {
-        unsafe {
-            let _ = kill(-(pid as i32), signal);
-        }
-    }
-}
 
 struct BashOutput {
     stdout: BoundedText,
@@ -913,6 +1073,136 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn escaped_descendant_cannot_block_reader_drain_forever() {
+        let root = unique_test_dir("bash-escaped-descendant");
+        fs::create_dir_all(&root).unwrap();
+        let pid_path = root.join("escaped.pid");
+        let context = ToolContext::new(&root).unwrap();
+        let command = format!(
+            "setsid sh -c 'sleep 30' & echo $! > \"{}\"; exit 0",
+            pid_path.display()
+        );
+
+        let execution = tokio::time::timeout(
+            Duration::from_secs(1),
+            BashTool.execute(
+                json!({"command": command}),
+                &context,
+                mpsc::channel(8).0,
+                CancellationToken::new(),
+            ),
+        )
+        .await;
+
+        if let Some(pid) = fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok())
+        {
+            // The escaped command creates its own process group, so clean up
+            // the deliberately long-lived fixture after the assertion.
+            unsafe {
+                let _ = kill(-pid, SIGKILL);
+            }
+        }
+        let result = execution
+            .expect("escaped descendants must not block command completion")
+            .unwrap();
+        assert!(result.metadata.success);
+        remove_test_dir(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn normal_completion_kills_a_background_descendant_that_keeps_pipes_open() {
+        let root = unique_test_dir("bash-normal-tree");
+        fs::create_dir_all(&root).unwrap();
+        let marker = root.join("marker");
+        let context = ToolContext::new(&root).unwrap();
+        let command = format!(
+            "printf x >> \"{}\"; (while :; do printf x >> \"{}\"; sleep 0.02; done) & exit 0",
+            marker.display(),
+            marker.display()
+        );
+
+        let result = BashTool
+            .execute(
+                json!({"command": command}),
+                &context,
+                mpsc::channel(8).0,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(result.metadata.success);
+        wait_for_marker(&marker).await;
+        let size = fs::metadata(&marker).unwrap().len();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(fs::metadata(&marker).unwrap().len(), size);
+        remove_test_dir(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_a_term_ignoring_process_tree() {
+        let root = unique_test_dir("bash-term-ignore");
+        fs::create_dir_all(&root).unwrap();
+        let marker = root.join("marker");
+        let context = ToolContext::new(&root).unwrap();
+        let command = format!(
+            "trap '' TERM; while :; do printf x >> \"{}\"; sleep 0.02; done",
+            marker.display()
+        );
+
+        let result = BashTool
+            .execute(
+                json!({"command": command, "timeout_ms": 50}),
+                &context,
+                mpsc::channel(8).0,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(result.metadata.timed_out);
+        wait_for_marker(&marker).await;
+        let size = fs::metadata(&marker).unwrap().len();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(fs::metadata(&marker).unwrap().len(), size);
+        remove_test_dir(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_execution_future_kills_the_owned_process_tree() {
+        let root = unique_test_dir("bash-drop-tree");
+        fs::create_dir_all(&root).unwrap();
+        let marker = root.join("marker");
+        let context = ToolContext::new(&root).unwrap();
+        let command = format!(
+            "sh -c 'while :; do printf x >> \"{}\"; sleep 0.02; done'",
+            marker.display()
+        );
+        let task = tokio::spawn(async move {
+            BashTool
+                .execute(
+                    json!({"command": command}),
+                    &context,
+                    mpsc::channel(8).0,
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        wait_for_marker(&marker).await;
+        task.abort();
+        let _ = task.await;
+
+        let size = fs::metadata(&marker).unwrap().len();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(fs::metadata(&marker).unwrap().len(), size);
+        remove_test_dir(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn stdout_truncation_spills_before_combined_limit() {
         let root = unique_test_dir("bash-stdout-boundary");
         fs::create_dir_all(&root).unwrap();
@@ -988,6 +1278,29 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn dropping_execution_future_kills_windows_descendants() {
+        let root = unique_test_dir("bash-windows-drop");
+        fs::create_dir_all(&root).unwrap();
+        let context = ToolContext::new(&root).unwrap();
+        let task = tokio::spawn(async move {
+            BashTool
+                .execute(
+                    json!({"command":"start \"\" /B cmd /C \"ping -n 6 127.0.0.1 >NUL & echo leaked > descendant.txt\" & ping -n 6 127.0.0.1 >NUL"}),
+                    &context,
+                    mpsc::channel(8).0,
+                    CancellationToken::new(),
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        task.abort();
+        let _ = task.await;
+        assert!(!root.join("descendant.txt").exists());
+        remove_test_dir(root).await;
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn large_output_is_bounded_and_spilled() {
@@ -1011,6 +1324,42 @@ mod tests {
             .expect("output should spill");
         assert!(fs::metadata(path).unwrap().len() > MAX_TOOL_OUTPUT_BYTES as u64);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_marker(path: &std::path::Path) {
+        for _ in 0..200 {
+            if path.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("marker was not created: {}", path.display());
+    }
+
+    #[cfg(windows)]
+    async fn remove_test_dir(path: PathBuf) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match fs::remove_dir_all(&path) {
+                Ok(()) => return,
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(5 | 32))
+                        && Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!(
+                    "could not remove test directory {}: {error}",
+                    path.display()
+                ),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn remove_test_dir(path: PathBuf) {
+        let _ = fs::remove_dir_all(path);
     }
 
     fn unique_test_dir(name: &str) -> PathBuf {

@@ -640,6 +640,7 @@ struct SessionWriter {
     info: SessionInfo,
     header: SessionHeader,
     file: Option<File>,
+    _lock: Option<SessionLockGuard>,
     head: Option<MessageId>,
     active_messages: Vec<(MessageId, ModelMessage)>,
     transcript: Vec<ModelMessage>,
@@ -684,6 +685,7 @@ impl SessionWriter {
                 info,
                 header,
                 file: None,
+                _lock: None,
                 head: None,
                 active_messages: Vec::new(),
                 transcript: Vec::new(),
@@ -695,32 +697,25 @@ impl SessionWriter {
         path: PathBuf,
         current_workspace: &Path,
     ) -> Result<(SessionHandle, SessionSnapshot), SessionError> {
-        let preflight = read_session(&path)?;
-        if preflight.info.workspace_root != current_workspace {
-            return Err(SessionError::WorkspaceMismatch {
-                session_workspace: preflight.info.workspace_root,
-                current_workspace: current_workspace.to_path_buf(),
-            });
-        }
+        let mut lock = open_session_lock(&path)?;
+        lock_exclusive(&mut lock)?;
         let mut options = OpenOptions::new();
-        options.read(true).write(true).append(true);
+        options.read(true).write(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let file = options
+        let mut file = options
             .open(&path)
             .map_err(|source| io_error(&path, source))?;
-        lock_exclusive(&file)?;
-        let snapshot = read_session(&path)?;
+        let snapshot = read_session_from_file(&path, &mut file, true)?;
         if snapshot.info.workspace_root != current_workspace {
             return Err(SessionError::WorkspaceMismatch {
                 session_workspace: snapshot.info.workspace_root,
                 current_workspace: current_workspace.to_path_buf(),
             });
         }
-        let mut file = file;
         if let Some(offset) = snapshot.truncate_at {
             file.set_len(offset)
                 .map_err(|source| io_error(&path, source))?;
@@ -735,6 +730,8 @@ impl SessionWriter {
                 .and_then(|_| file.sync_data())
                 .map_err(|source| io_error(&path, source))?;
         }
+        file.seek(SeekFrom::End(0))
+            .map_err(|source| io_error(&path, source))?;
         let mut info = snapshot.info.clone();
         info.materialized = true;
         let active_messages = snapshot
@@ -760,6 +757,7 @@ impl SessionWriter {
                 project_root: snapshot.info.project_root.clone(),
             },
             file: Some(file),
+            _lock: Some(lock),
             head: snapshot.last_message_id.clone(),
             active_messages,
             transcript: snapshot.transcript.clone(),
@@ -877,11 +875,14 @@ impl SessionWriter {
 
     fn materialize(&mut self) -> Result<(), SessionError> {
         if self.file.is_some() {
+            debug_assert!(self._lock.is_some());
             return Ok(());
         }
         ensure_private_directory(self.info.path.parent().unwrap_or_else(|| Path::new(".")))?;
+        let mut lock = open_session_lock(&self.info.path)?;
+        lock_exclusive(&mut lock)?;
         let mut options = OpenOptions::new();
-        options.create_new(true).read(true).write(true).append(true);
+        options.create_new(true).read(true).write(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -890,7 +891,6 @@ impl SessionWriter {
         let mut file = options
             .open(&self.info.path)
             .map_err(|source| io_error(&self.info.path, source))?;
-        lock_exclusive(&file)?;
         append_record(
             &mut file,
             &SessionRecord::Session {
@@ -903,6 +903,7 @@ impl SessionWriter {
             &self.info.path,
         )?;
         self.file = Some(file);
+        self._lock = Some(lock);
         self.info.path = fs::canonicalize(&self.info.path)
             .map_err(|source| io_error(&self.info.path, source))?;
         self.info.materialized = true;
@@ -1124,7 +1125,17 @@ fn read_session_summary(path: &Path) -> Result<SessionSnapshot, SessionError> {
 }
 
 fn read_session_inner(path: &Path, include_history: bool) -> Result<SessionSnapshot, SessionError> {
-    let file = File::open(path).map_err(|source| io_error(path, source))?;
+    let mut file = File::open(path).map_err(|source| io_error(path, source))?;
+    read_session_from_file(path, &mut file, include_history)
+}
+
+fn read_session_from_file(
+    path: &Path,
+    file: &mut File,
+    include_history: bool,
+) -> Result<SessionSnapshot, SessionError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| io_error(path, source))?;
     let mut reader = BufReader::new(file);
     let mut line_bytes = Vec::new();
     let mut offset = 0u64;
@@ -1519,8 +1530,8 @@ fn unresolved_tool_calls(history: &[ModelMessage]) -> Vec<ModelToolCall> {
     pending
 }
 
-fn read_bounded_line(
-    reader: &mut BufReader<File>,
+fn read_bounded_line<R: Read>(
+    reader: &mut BufReader<R>,
     buffer: &mut Vec<u8>,
     limit: usize,
 ) -> io::Result<Option<bool>> {
@@ -1593,16 +1604,56 @@ fn ensure_private_directory(path: &Path) -> Result<(), SessionError> {
     Ok(())
 }
 
-fn lock_exclusive(file: &File) -> Result<(), SessionError> {
+struct SessionLockGuard {
+    file: File,
+    locked: bool,
+}
+
+impl Drop for SessionLockGuard {
+    fn drop(&mut self) {
+        if self.locked {
+            let _ = fs2::FileExt::unlock(&self.file);
+        }
+    }
+}
+
+fn open_session_lock(path: &Path) -> Result<SessionLockGuard, SessionError> {
+    let lock_path = session_lock_path(path);
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&lock_path)
+        .map_err(|source| io_error(&lock_path, source))?;
+    Ok(SessionLockGuard {
+        file,
+        locked: false,
+    })
+}
+
+fn session_lock_path(path: &Path) -> PathBuf {
+    let mut lock = path.as_os_str().to_os_string();
+    lock.push(".lock");
+    PathBuf::from(lock)
+}
+
+fn lock_exclusive(lock: &mut SessionLockGuard) -> Result<(), SessionError> {
     use fs2::FileExt;
 
-    file.try_lock_exclusive().map_err(|error| {
-        if error.kind() == fs2::lock_contended_error().kind() {
-            SessionError::AlreadyOpen
-        } else {
-            io_error("session lock", error)
-        }
-    })
+    lock.file
+        .try_lock_exclusive()
+        .map(|()| lock.locked = true)
+        .map_err(|error| {
+            if error.kind() == fs2::lock_contended_error().kind() {
+                SessionError::AlreadyOpen
+            } else {
+                io_error("session lock", error)
+            }
+        })
 }
 
 fn preview(content: &str) -> String {
@@ -2016,10 +2067,30 @@ mod tests {
                 && tool_name == "write"
                 && content == SYNTHETIC_TOOL_RESULT
         ));
-        assert!(!path.with_extension("lock").exists());
+        assert!(session_lock_path(&path).exists());
         let lines = fs::read_to_string(path).unwrap().lines().count();
         assert_eq!(lines, 5);
         drop(opened);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn active_session_data_can_be_read_and_listed_while_writer_is_open() {
+        let root = test_dir("live-read");
+        fs::create_dir_all(&root).unwrap();
+        let repository = SessionRepository::new(root.join("sessions"), &root, &root).unwrap();
+        let handle = repository.create().unwrap();
+        handle
+            .append_message(&ModelMessage::user("live session"))
+            .unwrap();
+        let path = handle.info().unwrap().path;
+
+        let snapshot = read_session(&path).unwrap();
+        assert_eq!(snapshot.history, vec![ModelMessage::user("live session")]);
+        let summaries = repository.list().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].path, path);
+        drop(handle);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2040,6 +2111,34 @@ mod tests {
         ));
         drop(first);
         assert!(repository.open_path(&path).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn opening_and_resuming_session_reads_through_the_locked_handle() {
+        let root = test_dir("windows-resume-lock");
+        fs::create_dir_all(&root).unwrap();
+        let repository = SessionRepository::new(root.join("sessions"), &root, &root).unwrap();
+        let handle = repository.create().unwrap();
+        handle
+            .append_message(&ModelMessage::user("before resume"))
+            .unwrap();
+        let path = handle.info().unwrap().path;
+        drop(handle);
+
+        let opened = repository.open_path(&path).unwrap();
+        opened
+            .handle
+            .append_message(&ModelMessage::user("after resume"))
+            .unwrap();
+
+        let transcript = opened.handle.transcript_history().unwrap();
+        assert_eq!(transcript.len(), 2);
+        assert_eq!(transcript[1], ModelMessage::user("after resume"));
+        drop(opened);
+        let snapshot = read_session(&path).unwrap();
+        assert_eq!(snapshot.transcript.len(), 2);
         fs::remove_dir_all(root).unwrap();
     }
 

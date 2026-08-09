@@ -1495,6 +1495,7 @@ fn agent_event_from_model(event: ModelEvent) -> AgentEvent {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -1646,6 +1647,203 @@ mod tests {
             .await
             .expect("runtime should shut down");
         runtime_task.await.expect("runtime should join");
+    }
+
+    #[tokio::test]
+    async fn provider_task_panic_becomes_a_recoverable_runtime_error() {
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let runtime = AgentRuntime::new(PanickingProvider);
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "panic".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let events = collect_turn(&mut event_rx).await;
+        assert!(events.iter().any(|event| {
+            matches!(event, AgentEvent::Error(error) if error.message.contains("provider task failed"))
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::TurnFinished {
+                    reason: StopReason::Error
+                }
+            )
+        }));
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_provider_request_cancels_and_joins_without_a_second_request() {
+        let provider = BlockingProvider::default();
+        let calls = Arc::clone(&provider.calls);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let runtime = AgentRuntime::new(provider);
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "wait".to_owned(),
+            })
+            .await
+            .unwrap();
+        wait_for_call(&calls).await;
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+
+        let mut saw_cancelled = false;
+        while let Some(event) = event_rx.recv().await {
+            if matches!(
+                event,
+                AgentEvent::TurnFinished {
+                    reason: StopReason::Cancelled
+                }
+            ) {
+                saw_cancelled = true;
+                break;
+            }
+        }
+        assert!(saw_cancelled);
+        runtime_task.await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_compaction_cancels_without_starting_a_turn() {
+        let provider = BlockingProvider::default();
+        let calls = Arc::clone(&provider.calls);
+        let root = unique_test_dir("agent-shutdown-compaction");
+        std::fs::create_dir_all(&root).unwrap();
+        let repository =
+            crate::session::SessionRepository::new(root.join("sessions"), &root, &root).unwrap();
+        let handle = repository.create().unwrap();
+        let session_path = handle.info().unwrap().path.clone();
+        let initial_history = vec![
+            ModelMessage::user("old one"),
+            ModelMessage::Assistant {
+                items: vec![ModelAssistantItem::Text {
+                    content: "old answer".to_owned(),
+                }],
+            },
+            ModelMessage::user("old two"),
+            ModelMessage::Assistant {
+                items: vec![ModelAssistantItem::Text {
+                    content: "second answer".to_owned(),
+                }],
+            },
+            ModelMessage::user("recent"),
+            ModelMessage::Assistant {
+                items: vec![ModelAssistantItem::Text {
+                    content: "recent answer".to_owned(),
+                }],
+            },
+        ];
+        for message in &initial_history {
+            handle.append_message(message).unwrap();
+        }
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let runtime = AgentRuntime::with_config(
+            provider,
+            AgentRuntimeConfig {
+                tool_context: ToolContext::new(&root).unwrap(),
+                base_messages: Vec::new(),
+                initial_history,
+                session: SessionMode::Enabled(handle.clone()),
+            },
+        );
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+        command_tx.send(AgentCommand::Compact).await.unwrap();
+
+        loop {
+            if matches!(
+                event_rx.recv().await.unwrap(),
+                AgentEvent::CompactionStarted { .. }
+            ) {
+                break;
+            }
+        }
+        wait_for_call(&calls).await;
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        while let Ok(event) = event_rx.try_recv() {
+            assert!(!matches!(event, AgentEvent::TurnStarted));
+        }
+        drop(handle);
+        let snapshot = crate::session::read_session(&session_path).unwrap();
+        assert_eq!(snapshot.history.len(), 6);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_bash_cancels_the_process_tree_before_runtime_exit() {
+        let root = unique_test_dir("agent-shutdown-bash");
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("marker");
+        let arguments = serde_json::json!({
+            "command": format!(
+                "while :; do printf x >> \"{}\"; sleep 0.02; done",
+                marker.display()
+            )
+        })
+        .to_string();
+        let call = tool_call("long", "bash", &arguments);
+        let provider = ScriptedProvider::new(vec![
+            ScriptedStep {
+                events: Vec::new(),
+                response: ModelResponse {
+                    items: vec![ModelAssistantItem::ToolCall(call)],
+                    stop_reason: StopReason::ToolCalls,
+                    usage: None,
+                },
+            },
+            final_step("should not run"),
+        ]);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let runtime = AgentRuntime::with_workspace_root(provider, &root).unwrap();
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "run command".to_owned(),
+            })
+            .await
+            .unwrap();
+        loop {
+            if matches!(
+                event_rx.recv().await.unwrap(),
+                AgentEvent::ToolExecutionStarted { .. }
+            ) {
+                break;
+            }
+        }
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        let mut saw_cancelled = false;
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                AgentEvent::ToolExecutionFinished { result, .. } => {
+                    saw_cancelled |= result.metadata.cancelled;
+                }
+                AgentEvent::TurnFinished {
+                    reason: StopReason::Cancelled,
+                } => break,
+                _ => {}
+            }
+        }
+        runtime_task.await.unwrap();
+        assert!(saw_cancelled);
+        if marker.exists() {
+            let size = std::fs::metadata(&marker).unwrap().len();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(std::fs::metadata(&marker).unwrap().len(), size);
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -2879,6 +3077,49 @@ mod tests {
         command_tx.send(AgentCommand::Shutdown).await.unwrap();
         runtime_task.await.unwrap();
         assert_eq!(requests.lock().unwrap().len(), 3);
+    }
+
+    struct PanickingProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for PanickingProvider {
+        async fn stream(
+            &self,
+            _request: ModelRequest,
+            _events: mpsc::Sender<ModelEvent>,
+            _cancel: CancellationToken,
+        ) -> Result<ModelResponse, ProviderError> {
+            panic!("intentional provider task panic");
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct BlockingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for BlockingProvider {
+        async fn stream(
+            &self,
+            _request: ModelRequest,
+            _events: mpsc::Sender<ModelEvent>,
+            cancel: CancellationToken,
+        ) -> Result<ModelResponse, ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            cancel.cancelled().await;
+            Err(ProviderError::Cancelled)
+        }
+    }
+
+    async fn wait_for_call(calls: &AtomicUsize) {
+        for _ in 0..100 {
+            if calls.load(Ordering::SeqCst) > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("provider request did not start");
     }
 
     #[derive(Clone)]
