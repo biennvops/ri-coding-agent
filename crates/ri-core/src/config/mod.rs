@@ -14,7 +14,7 @@ pub mod settings;
 
 pub use settings::{
     default_settings_path, load_default_settings, load_settings_from_paths, project_settings_path,
-    ContextSettings, ResolvedSettings, Settings, SettingsError, SettingsLoad,
+    CompactionSettings, ContextSettings, ResolvedSettings, Settings, SettingsError, SettingsLoad,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
