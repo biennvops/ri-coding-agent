@@ -1717,6 +1717,12 @@ mod tests {
     async fn shutdown_during_compaction_cancels_without_starting_a_turn() {
         let provider = BlockingProvider::default();
         let calls = Arc::clone(&provider.calls);
+        let root = unique_test_dir("agent-shutdown-compaction");
+        std::fs::create_dir_all(&root).unwrap();
+        let repository =
+            crate::session::SessionRepository::new(root.join("sessions"), &root, &root).unwrap();
+        let handle = repository.create().unwrap();
+        let session_path = handle.info().unwrap().path.clone();
         let initial_history = vec![
             ModelMessage::user("old one"),
             ModelMessage::Assistant {
@@ -1737,15 +1743,18 @@ mod tests {
                 }],
             },
         ];
+        for message in &initial_history {
+            handle.append_message(message).unwrap();
+        }
         let (command_tx, command_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let runtime = AgentRuntime::with_config(
             provider,
             AgentRuntimeConfig {
-                tool_context: ToolContext::from_current_dir().unwrap(),
+                tool_context: ToolContext::new(&root).unwrap(),
                 base_messages: Vec::new(),
                 initial_history,
-                session: SessionMode::Disabled,
+                session: SessionMode::Enabled(handle.clone()),
             },
         );
         let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
@@ -1766,6 +1775,10 @@ mod tests {
         while let Ok(event) = event_rx.try_recv() {
             assert!(!matches!(event, AgentEvent::TurnStarted));
         }
+        drop(handle);
+        let snapshot = crate::session::read_session(&session_path).unwrap();
+        assert_eq!(snapshot.history.len(), 6);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
