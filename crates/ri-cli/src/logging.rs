@@ -219,7 +219,7 @@ fn is_sensitive_field(name: &str) -> bool {
         || name.contains("refresh_token")
 }
 
-pub(crate) fn init() -> Result<Option<PathBuf>> {
+pub fn init() -> Result<Option<PathBuf>> {
     let Some(value) = env::var_os("RI_LOG") else {
         return Ok(None);
     };

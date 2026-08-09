@@ -98,8 +98,8 @@ fn render_frame(frame: &mut Frame<'_>, state: &AppState, scroll_from_bottom: usi
 fn transcript_lines(state: &AppState, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
-    for entry in state.transcript_entries() {
-        match entry {
+    for entry_state in state.transcript_entries() {
+        match &entry_state.entry {
             TranscriptEntry::Message(message) => {
                 let (label, style) = match message.role {
                     MessageRole::System => ("system", Style::default().fg(Color::Cyan)),
