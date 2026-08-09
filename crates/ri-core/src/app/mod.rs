@@ -381,7 +381,7 @@ impl AppState {
                     self.ensure_streaming_assistant();
                     let (id, changed) = {
                         let assistant = self.streaming_assistant.as_mut().expect("streaming assistant");
-                        if assistant.content.is_empty() {
+                        if assistant.content.is_empty() && !content.is_empty() {
                             assistant.content = content;
                             assistant.revision = assistant.revision.wrapping_add(1);
                             (assistant.id, true)
@@ -416,13 +416,13 @@ impl AppState {
                         .expect("streaming assistant");
                     let mut changed = false;
                     if assistant.content.is_empty() {
-                        if let Some(content) = fallback_content {
+                        if let Some(content) = fallback_content.filter(|content| !content.is_empty()) {
                             assistant.content = content;
                             changed = true;
                         }
                     }
                     if assistant.thinking.is_empty() {
-                        if let Some(thinking) = fallback_thinking {
+                        if let Some(thinking) = fallback_thinking.filter(|thinking| !thinking.is_empty()) {
                             assistant.thinking = thinking;
                             changed = true;
                         }
@@ -459,13 +459,17 @@ impl AppState {
                 if let Some(index) = self.entries.iter().rposition(
                     |entry| matches!(&entry.entry, TranscriptEntry::Tool(tool) if tool.call_id == call_id),
                 ) {
+                    let mut changed = !chunk.is_empty();
                     if let TranscriptEntry::Tool(tool) = &mut self.entries[index].entry {
                         if matches!(stream, ToolOutputStream::Stderr) && tool.output.is_empty() {
                             append_tool_output(tool, "[stderr]\n");
+                            changed = true;
                         }
                         append_tool_output(tool, &chunk);
                     }
-                    self.mark_entry_changed(index);
+                    if changed {
+                        self.mark_entry_changed(index);
+                    }
                 }
             }
             AgentEvent::ToolExecutionFinished {
@@ -1112,6 +1116,12 @@ mod tests {
         assert_eq!(state.transcript_entries()[0].id, static_id);
         assert_eq!(state.transcript_entries()[0].revision, static_revision);
         assert_eq!(state.transcript_entries()[1].id, tool_id);
+        assert_eq!(state.transcript_entries()[1].revision, 1);
+        state.reduce(AgentEvent::ToolExecutionOutput {
+            call_id: "call-1".to_owned(),
+            stream: ToolOutputStream::Stdout,
+            chunk: String::new(),
+        });
         assert_eq!(state.transcript_entries()[1].revision, 1);
 
         state.reduce(AgentEvent::AssistantMessageStarted);
