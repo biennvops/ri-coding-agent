@@ -521,12 +521,12 @@ async fn run_tui_loop(
                             }
                             match action {
                                 Action::Submit => {
-                                    if let Some(command) = slash_command(state.input()) {
+                                    if is_slash_input(state.input()) {
                                         if state.is_busy() {
                                             state.add_system_message("a turn or compaction is already active");
-                                        } else {
+                                        } else if let Some(command) = slash_command(state.input()) {
                                             state.take_input();
-                                            handle_slash_command(
+                                            let outcome = handle_slash_command(
                                                 command,
                                                 terminal,
                                                 state,
@@ -534,7 +534,14 @@ async fn run_tui_loop(
                                                 setup,
                                             )
                                             .await?;
+                                            if matches!(outcome, SlashCommandOutcome::Quit) {
+                                                exit = true;
+                                            }
                                             scroll_from_bottom = 0;
+                                        } else {
+                                            let command = unknown_command_name(state.input()).to_owned();
+                                            state.take_input();
+                                            state.add_system_message(format!("unknown command: {command}"));
                                         }
                                     } else if let Some(text) = state.submit_input() {
                                         command_tx
@@ -654,11 +661,30 @@ fn settings_selection_description(settings: &ResolvedSettings) -> String {
 
 enum SlashCommand {
     Model(Option<String>),
+    Quit,
     Compact,
     New,
     Resume,
     Name(Option<String>),
     Session,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlashCommandOutcome {
+    Continue,
+    Quit,
+}
+
+fn is_slash_input(input: &str) -> bool {
+    input.trim_start().starts_with('/')
+}
+
+fn unknown_command_name(input: &str) -> &str {
+    input
+        .trim()
+        .split_whitespace()
+        .next()
+        .unwrap_or(input.trim())
 }
 
 fn slash_command(input: &str) -> Option<SlashCommand> {
@@ -673,7 +699,9 @@ fn slash_command(input: &str) -> Option<SlashCommand> {
             .then_some(SlashCommand::Model(None))
             .or_else(|| Some(SlashCommand::Model(Some(argument.trim().to_owned()))));
     }
-    if input == "/compact" {
+    if input == "/quit" {
+        Some(SlashCommand::Quit)
+    } else if input == "/compact" {
         Some(SlashCommand::Compact)
     } else if input == "/new" {
         Some(SlashCommand::New)
@@ -696,20 +724,29 @@ async fn handle_slash_command(
     state: &mut AppState,
     command_tx: &mpsc::Sender<AgentCommand>,
     setup: &mut AppSetup,
-) -> Result<()> {
+) -> Result<SlashCommandOutcome> {
     match command {
         SlashCommand::Model(argument) => {
-            handle_model_command(terminal, state, setup, command_tx, argument.as_deref()).await?
+            handle_model_command(terminal, state, setup, command_tx, argument.as_deref()).await?;
+            Ok(SlashCommandOutcome::Continue)
         }
+        SlashCommand::Quit => Ok(SlashCommandOutcome::Quit),
         SlashCommand::Compact => {
             state.set_compaction_active(true);
             command_tx
                 .send(AgentCommand::Compact)
                 .await
                 .context("could not start compaction")?;
+            Ok(SlashCommandOutcome::Continue)
         }
-        SlashCommand::Session => state.add_system_message(session_diagnostic(setup)?),
-        SlashCommand::Name(None) => state.add_system_message(session_diagnostic(setup)?),
+        SlashCommand::Session => {
+            state.add_system_message(session_diagnostic(setup)?);
+            Ok(SlashCommandOutcome::Continue)
+        }
+        SlashCommand::Name(None) => {
+            state.add_system_message(session_diagnostic(setup)?);
+            Ok(SlashCommandOutcome::Continue)
+        }
         SlashCommand::Name(Some(name)) => {
             if setup.session.is_none() {
                 state.add_system_message("sessions are disabled for this run");
@@ -719,11 +756,12 @@ async fn handle_slash_command(
                     .await
                     .context("could not rename the session")?;
             }
+            Ok(SlashCommandOutcome::Continue)
         }
         SlashCommand::New => {
             let Some(repository) = setup.repository.as_ref() else {
                 state.add_system_message("sessions are disabled for this run");
-                return Ok(());
+                return Ok(SlashCommandOutcome::Continue);
             };
             let session = repository
                 .create()
@@ -739,23 +777,24 @@ async fn handle_slash_command(
             state.replace_history(&[]);
             state.set_session_info(setup.session_info()?);
             state.add_system_message(setup.context.diagnostic());
+            Ok(SlashCommandOutcome::Continue)
         }
         SlashCommand::Resume => {
             let Some(repository) = setup.repository.as_ref() else {
                 state.add_system_message("sessions are disabled for this run");
-                return Ok(());
+                return Ok(SlashCommandOutcome::Continue);
             };
             let path = match crate::session_picker::pick_path_in_terminal(terminal, repository) {
                 Ok(Some(path)) => path,
-                Ok(None) => return Ok(()),
+                Ok(None) => return Ok(SlashCommandOutcome::Continue),
                 Err(error) => {
                     state.add_system_message(format!("ri: {error}"));
-                    return Ok(());
+                    return Ok(SlashCommandOutcome::Continue);
                 }
             };
             if setup.session_info()?.is_some_and(|info| info.path == path) {
                 state.add_system_message("that session is already active");
-                return Ok(());
+                return Ok(SlashCommandOutcome::Continue);
             }
             let opened = repository
                 .open_path(path)
@@ -773,9 +812,9 @@ async fn handle_slash_command(
             state.replace_history(&setup.initial_transcript);
             state.set_session_info(setup.session_info()?);
             state.add_system_message(setup.context.diagnostic());
+            Ok(SlashCommandOutcome::Continue)
         }
     }
-    Ok(())
 }
 
 fn session_diagnostic(setup: &AppSetup) -> Result<String> {
@@ -1056,16 +1095,19 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_direct_and_cycling_model_commands() {
+    fn recognizes_direct_model_quit_and_unknown_commands() {
         assert!(matches!(
             slash_command("/compact"),
             Some(SlashCommand::Compact)
         ));
+        assert!(matches!(slash_command("/quit"), Some(SlashCommand::Quit)));
         assert_eq!(model_command("/model"), Some(None));
         assert_eq!(
             model_command("  /model custom/coding  "),
             Some(Some("custom/coding".to_owned()))
         );
         assert_eq!(model_command("/modelish"), None);
+        assert!(is_slash_input(" /compcat"));
+        assert_eq!(unknown_command_name(" /compcat extra"), "/compcat");
     }
 }
