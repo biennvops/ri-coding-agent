@@ -699,7 +699,7 @@ async fn handle_slash_command(
 ) -> Result<()> {
     match command {
         SlashCommand::Model(argument) => {
-            handle_model_command(state, setup, command_tx, argument.as_deref()).await?
+            handle_model_command(terminal, state, setup, command_tx, argument.as_deref()).await?
         }
         SlashCommand::Compact => {
             state.set_compaction_active(true);
@@ -805,6 +805,7 @@ fn model_command(input: &str) -> Option<Option<String>> {
 }
 
 async fn handle_model_command(
+    terminal: &mut TerminalGuard,
     state: &mut AppState,
     setup: &mut AppSetup,
     command_tx: &mpsc::Sender<AgentCommand>,
@@ -819,34 +820,31 @@ async fn handle_model_command(
 
     let selected = if let Some(argument) = argument {
         catalog.resolve(None, Some(argument))
-    } else if catalog.models().is_empty() {
-        Err(ri_core::ConfigError::Invalid(
-            "models.json contains no selectable model".to_owned(),
-        ))
     } else {
+        if catalog.models().is_empty() {
+            state.add_system_message("models.json contains no selectable model");
+            return Ok(());
+        }
         let current = setup.selected.as_ref().map(|model| &model.model_ref);
-        let current_index = current
-            .and_then(|current| {
-                catalog
-                    .models()
-                    .iter()
-                    .position(|model| model.model_ref == *current)
-            })
-            .unwrap_or(usize::MAX);
-        let next_index = if current_index == usize::MAX {
-            0
-        } else {
-            (current_index + 1) % catalog.models().len()
-        };
-        Ok(catalog.models()[next_index].clone())
+        match crate::model_picker::pick_model_in_terminal(terminal, catalog, current)? {
+            Some(selected) => Ok(selected),
+            None => return Ok(()),
+        }
     };
 
     match selected {
         Ok(selected) => match setup.provider.set_model(selected.clone()) {
             Ok(()) => {
                 let name = selected.model_ref.display_name();
-                setup.selected = Some(selected.clone());
-                state.reduce(AgentEvent::ModelChanged(selected.model_ref));
+                let model_ref = selected.model_ref.clone();
+                setup.selected = Some(selected);
+                if let Err(error) = setup.remember_model(&model_ref) {
+                    eprintln!("ri: warning: could not persist recent model selection: {error}");
+                    state.add_system_message(format!(
+                        "could not persist recent model selection: {error}"
+                    ));
+                }
+                state.reduce(AgentEvent::ModelChanged(model_ref));
                 state.reduce(AgentEvent::ContextLimitsUpdated(setup.provider.limits()));
                 command_tx
                     .send(AgentCommand::RefreshContext)

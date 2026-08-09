@@ -1,6 +1,8 @@
 mod app;
 mod input;
+mod model_picker;
 mod model_selection;
+mod picker;
 mod render;
 mod session_picker;
 mod terminal;
