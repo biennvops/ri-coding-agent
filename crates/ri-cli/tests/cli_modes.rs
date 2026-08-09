@@ -203,6 +203,26 @@ fn setup_and_cli_errors_use_status_two() {
     );
 
     let output = Command::new(env!("CARGO_BIN_EXE_ri"))
+        .args(["--no-session", "--no-context"])
+        .env("HOME", &home)
+        .env_remove("RI_MODELS_FILE")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(text(&output.stderr).contains("no models.json found"));
+
+    let empty_models = home.join("empty-models.json");
+    fs::write(&empty_models, r#"{"providers":{}}"#).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_ri"))
+        .args(["--no-session", "--no-context"])
+        .env("HOME", &home)
+        .env("RI_MODELS_FILE", &empty_models)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(text(&output.stderr).contains("no selectable model"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ri"))
         .args(["--json"])
         .env("HOME", &home)
         .output()
