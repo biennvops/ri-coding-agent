@@ -666,7 +666,9 @@ impl AppState {
 
     fn mark_transcript_changed(&mut self, id: TranscriptEntryId) {
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
-        self.pending_transcript_changes.push(id);
+        if self.pending_transcript_changes.last().copied() != Some(id) {
+            self.pending_transcript_changes.push(id);
+        }
     }
 
     fn append_semantic_message(&mut self, message: &ModelMessage) {
@@ -1124,11 +1126,17 @@ mod tests {
         });
         assert_eq!(state.transcript_entries()[1].revision, 1);
 
+        state.acknowledge_transcript_changes();
         state.reduce(AgentEvent::AssistantMessageStarted);
         state.reduce(AgentEvent::AssistantTextDelta {
             index: None,
             text: "stream".to_owned(),
         });
+        state.reduce(AgentEvent::AssistantTextDelta {
+            index: None,
+            text: " more".to_owned(),
+        });
+        assert_eq!(state.pending_transcript_changes().len(), 1);
         let streaming = state
             .streaming_assistant_state()
             .expect("streaming assistant should have an id");
