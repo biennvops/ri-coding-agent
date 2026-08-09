@@ -262,6 +262,135 @@ fn json_logging_keeps_stdout_parseable_and_redacts_configured_secrets() {
 }
 
 #[test]
+fn malformed_models_and_settings_fail_before_runtime_setup() {
+    let _lock = cli_test_lock();
+    let home = unique_dir("cli-config-errors");
+    fs::create_dir_all(home.join(".ri/agent")).unwrap();
+    let models = home.join("models.json");
+
+    fs::write(&models, "{ not json").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_ri"))
+        .args(["-p", "hello", "--no-session", "--no-context"])
+        .env("HOME", &home)
+        .env_remove("USERPROFILE")
+        .env_remove("RI_MODELS_FILE")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(text(&output.stderr).contains("models.json"));
+    assert!(output.stdout.is_empty());
+
+    fs::write(&models, valid_models()).unwrap();
+    let settings = home.join(".ri/agent/settings.json");
+    fs::write(&settings, "{ not json").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_ri"))
+        .args(["-p", "hello", "--no-session", "--no-context"])
+        .env("HOME", &home)
+        .env_remove("USERPROFILE")
+        .env_remove("RI_MODELS_FILE")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(text(&output.stderr).contains(&settings.display().to_string()));
+    assert!(output.stdout.is_empty());
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn malformed_model_environment_references_are_actionable() {
+    let _lock = cli_test_lock();
+    let home = unique_dir("cli-model-env-error");
+    fs::create_dir_all(&home).unwrap();
+    let models = home.join("models.json");
+    fs::write(
+        &models,
+        r#"{"providers":{"p":{"baseUrl":"https://example.test","api":"openai-responses","apiKey":"$RI_TEST_MISSING","models":[{"id":"m"}]}}}"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ri"))
+        .args(["-p", "hello", "--no-session", "--no-context"])
+        .env("HOME", &home)
+        .env_remove("USERPROFILE")
+        .env("RI_MODELS_FILE", &models)
+        .env_remove("RI_TEST_MISSING")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(text(&output.stderr).contains("RI_TEST_MISSING"));
+    assert!(output.stdout.is_empty());
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn invalid_context_fails_before_any_provider_request() {
+    let _lock = cli_test_lock();
+    for (name, contents, expected) in [
+        ("invalid-utf8", vec![0xff, 0xfe, 0xfd], "not valid UTF-8"),
+        ("too-large", vec![b'x'; 128 * 1024 + 1], "maximum is"),
+    ] {
+        let home = unique_dir(&format!("cli-context-home-{name}"));
+        let project = unique_dir(name);
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        let models = home.join("models.json");
+        fs::write(&models, valid_models()).unwrap();
+        fs::write(project.join("AGENTS.md"), contents).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_ri"))
+            .args(["-p", "hello", "--no-session"])
+            .current_dir(&project)
+            .env("HOME", &home)
+            .env_remove("USERPROFILE")
+            .env("RI_MODELS_FILE", &models)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(text(&output.stderr).contains(expected));
+        assert!(output.stdout.is_empty());
+        let _ = fs::remove_dir_all(home);
+        let _ = fs::remove_dir_all(project);
+    }
+}
+
+#[test]
+fn structurally_corrupt_session_fails_with_a_path_and_status_two() {
+    let _lock = cli_test_lock();
+    let home = unique_dir("cli-session-error");
+    fs::create_dir_all(&home).unwrap();
+    let models = home.join("models.json");
+    fs::write(&models, valid_models()).unwrap();
+    let workspace = std::env::current_dir().unwrap();
+    let session = home.join("corrupt.jsonl");
+    let header = serde_json::json!({
+        "type": "session",
+        "version": 1,
+        "id": "bad-session",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "workspaceRoot": workspace,
+        "projectRoot": std::env::current_dir().unwrap(),
+    });
+    fs::write(&session, format!("{}\nnot json\n", header)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ri"))
+        .args([
+            "--session",
+            session.to_str().unwrap(),
+            "-p",
+            "hello",
+            "--no-context",
+        ])
+        .env("HOME", &home)
+        .env_remove("USERPROFILE")
+        .env("RI_MODELS_FILE", &models)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(text(&output.stderr).contains(&session.display().to_string()));
+    assert!(output.stdout.is_empty());
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
 fn help_and_version_do_not_require_configuration() {
     let _lock = cli_test_lock();
     for args in [["--help"].as_slice(), &["--version"]] {
@@ -570,6 +699,10 @@ fn read_request(stream: &mut TcpStream) -> Vec<u8> {
         }
     }
     request
+}
+
+fn valid_models() -> &'static str {
+    r#"{"providers":{"test":{"baseUrl":"https://example.test","api":"openai-responses","models":[{"id":"model"}]}}}"#
 }
 
 fn unique_dir(name: &str) -> PathBuf {
