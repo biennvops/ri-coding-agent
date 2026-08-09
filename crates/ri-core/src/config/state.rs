@@ -213,6 +213,7 @@ fn open_lock(path: &Path, create_parent: bool) -> Result<File, StateError> {
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .open(&lock_path)
         .map_err(|source| StateError::Io {
             path: lock_path,

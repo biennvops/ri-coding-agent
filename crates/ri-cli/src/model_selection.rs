@@ -111,20 +111,22 @@ mod tests {
     #[test]
     fn precedence_is_cli_then_settings_then_workspace_then_global_then_first() {
         let catalog = catalog();
-        let mut state = RecentModelState::default();
-        state.last_model = Some(RecentModel {
-            provider: "provider".to_owned(),
-            model: "global".to_owned(),
-        });
-        state.workspaces = BTreeMap::from([(
-            "workspace".to_owned(),
-            WorkspaceRecentModel {
-                last_model: Some(RecentModel {
-                    provider: "provider".to_owned(),
-                    model: "workspace".to_owned(),
-                }),
-            },
-        )]);
+        let state = RecentModelState {
+            last_model: Some(RecentModel {
+                provider: "provider".to_owned(),
+                model: "global".to_owned(),
+            }),
+            workspaces: BTreeMap::from([(
+                "workspace".to_owned(),
+                WorkspaceRecentModel {
+                    last_model: Some(RecentModel {
+                        provider: "provider".to_owned(),
+                        model: "workspace".to_owned(),
+                    }),
+                },
+            )]),
+            ..RecentModelState::default()
+        };
         let no_settings = ResolvedSettings::default();
 
         let first = resolve_model(&catalog, None, None, &no_settings, None, "workspace")

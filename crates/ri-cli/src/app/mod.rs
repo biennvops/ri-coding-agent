@@ -11,8 +11,7 @@ use ri_core::{
     context::{build_system_prompt, discover_project, load_context, ContextBundle},
     workspace_id, AgentCommand, AgentEvent, AgentRuntime, AgentRuntimeConfig, AppState,
     ConfiguredProvider, ModelCatalog, ModelMessage, ModelRef, OpenedSession, ResolvedModel,
-    ResolvedSettings, SessionHandle, SessionInfo, SessionMode, SessionRepository, StopReason,
-    ToolContext,
+    SessionHandle, SessionInfo, SessionMode, SessionRepository, StopReason, ToolContext,
 };
 use tokio::sync::mpsc;
 
@@ -792,9 +791,10 @@ async fn run_tui_loop(
     Ok(())
 }
 
+#[cfg(test)]
 fn model_selection<'a>(
     options: &'a Options,
-    settings: &'a ResolvedSettings,
+    settings: &'a ri_core::ResolvedSettings,
 ) -> (Option<&'a str>, Option<&'a str>) {
     let model = options
         .model
@@ -815,7 +815,8 @@ fn model_selection<'a>(
     (provider, model)
 }
 
-fn settings_selection_description(settings: &ResolvedSettings) -> String {
+#[cfg(test)]
+fn settings_selection_description(settings: &ri_core::ResolvedSettings) -> String {
     match (
         settings.default_provider.as_deref(),
         settings.default_model.as_deref(),
@@ -850,11 +851,7 @@ fn is_slash_input(input: &str) -> bool {
 }
 
 fn unknown_command_name(input: &str) -> &str {
-    input
-        .trim()
-        .split_whitespace()
-        .next()
-        .unwrap_or(input.trim())
+    input.split_whitespace().next().unwrap_or(input.trim())
 }
 
 fn slash_command(input: &str) -> Option<SlashCommand> {
@@ -1190,6 +1187,7 @@ fn log_agent_event(event: &AgentEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ri_core::ResolvedSettings;
 
     #[test]
     fn parses_print_prompt_and_model_flags() {

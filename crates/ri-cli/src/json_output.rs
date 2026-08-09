@@ -2,8 +2,7 @@ use std::io::Write;
 
 use anyhow::Result;
 use ri_core::{
-    AgentEvent, ContextUsage, ModelLimits, ModelRef, SessionInfo, StopReason, ToolOutputStream,
-    Usage,
+    AgentEvent, ContextUsage, ModelRef, SessionInfo, StopReason, ToolOutputStream, Usage,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -398,7 +397,7 @@ pub(crate) fn stop_reason_name(reason: &StopReason) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ri_core::{ToolExecutionMetadata, ToolExecutionResult};
+    use ri_core::{ModelLimits, ToolExecutionMetadata, ToolExecutionResult};
     use serde_json::Value;
     use std::time::Duration;
 

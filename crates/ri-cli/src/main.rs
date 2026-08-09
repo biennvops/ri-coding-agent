@@ -53,6 +53,15 @@ async fn run_main() -> i32 {
 }
 
 #[cfg(test)]
+fn run_main_exit_code_for_test(error: Option<app::RunError>) -> i32 {
+    match error {
+        None => 0,
+        Some(app::RunError::Setup(_)) => 2,
+        Some(app::RunError::Runtime(_)) => 1,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn exit_codes_are_stable() {
@@ -69,14 +78,5 @@ mod tests {
             ))),
             1
         );
-    }
-}
-
-#[cfg(test)]
-fn run_main_exit_code_for_test(error: Option<app::RunError>) -> i32 {
-    match error {
-        None => 0,
-        Some(app::RunError::Setup(_)) => 2,
-        Some(app::RunError::Runtime(_)) => 1,
     }
 }
