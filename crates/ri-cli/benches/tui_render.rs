@@ -3,88 +3,120 @@ use std::time::{Duration, Instant};
 
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
-use ri::render;
+use ri::render::{self, TuiRenderer};
 use ri_core::{AgentEvent, ToolOutputStream};
 
 const WIDTH: u16 = 100;
 const HEIGHT: u16 = 28;
 
 fn main() {
+    let fresh_state = render::synthetic_transcript(20, 4);
     measure("fresh first frame", 10, || {
-        let state = render::synthetic_transcript(20, 4);
         let mut terminal = test_terminal(WIDTH, HEIGHT);
-        render::draw_terminal(&mut terminal, &state, 0).expect("test backend draw");
+        let mut renderer = TuiRenderer::new();
+        renderer
+            .draw(&mut terminal, &fresh_state, 0)
+            .expect("test backend draw");
     });
 
     for rows in [1_000, 10_000, 100_000] {
+        let state = render::synthetic_transcript(rows, (rows / 10).max(1));
         measure(&format!("cold layout · {rows} rows"), 1, || {
-            let state = render::synthetic_transcript(rows, (rows / 10).max(1));
             let mut terminal = test_terminal(WIDTH, HEIGHT);
-            render::draw_terminal(&mut terminal, &state, 0).expect("test backend draw");
+            let mut renderer = TuiRenderer::new();
+            renderer
+                .draw(&mut terminal, &state, 0)
+                .expect("test backend draw");
         });
     }
 
+    let cached_state = render::synthetic_transcript(100_000, 10_000);
+    let mut cached_terminal = test_terminal(WIDTH, HEIGHT);
+    let mut cached_renderer = TuiRenderer::new();
+    cached_renderer
+        .draw(&mut cached_terminal, &cached_state, 0)
+        .expect("warmup draw");
     measure("cached redraw · 100k rows", 10, || {
-        let state = render::synthetic_transcript(100_000, 10_000);
-        let mut terminal = test_terminal(WIDTH, HEIGHT);
-        render::draw_terminal(&mut terminal, &state, 0).expect("test backend draw");
-        render::draw_terminal(&mut terminal, &state, 0).expect("test backend draw");
+        cached_renderer
+            .draw(&mut cached_terminal, &cached_state, 0)
+            .expect("test backend draw");
     });
 
     measure("scroll · 100k rows", 10, || {
-        let state = render::synthetic_transcript(100_000, 10_000);
-        let mut terminal = test_terminal(WIDTH, HEIGHT);
-        render::draw_terminal(&mut terminal, &state, 20_000).expect("test backend draw");
+        cached_renderer
+            .draw(&mut cached_terminal, &cached_state, 20_000)
+            .expect("test backend draw");
     });
 
+    let mut streaming_state = render::synthetic_transcript(100_000, 10_000);
+    streaming_state.reduce(AgentEvent::AssistantMessageStarted);
+    render::append_streaming_delta(&mut streaming_state, "initial streaming response");
+    let mut streaming_terminal = test_terminal(WIDTH, HEIGHT);
+    let mut streaming_renderer = TuiRenderer::new();
+    streaming_renderer
+        .draw(&mut streaming_terminal, &streaming_state, 0)
+        .expect("warmup draw");
     measure("single streaming append · 100k rows", 10, || {
-        let mut state = render::synthetic_transcript(100_000, 10_000);
-        state.reduce(AgentEvent::AssistantMessageStarted);
-        state.reduce(AgentEvent::AssistantTextDelta {
-            index: None,
-            text: "initial streaming response".to_owned(),
-        });
-        let mut terminal = test_terminal(WIDTH, HEIGHT);
-        render::draw_terminal(&mut terminal, &state, 0).expect("test backend draw");
-        render::append_streaming_delta(&mut state, " + delta");
-        render::draw_terminal(&mut terminal, &state, 0).expect("test backend draw");
+        render::append_streaming_delta(&mut streaming_state, " + delta");
+        streaming_renderer
+            .draw(&mut streaming_terminal, &streaming_state, 0)
+            .expect("test backend draw");
     });
 
+    let mut burst_state = render::synthetic_transcript(100_000, 10_000);
+    burst_state.reduce(AgentEvent::AssistantMessageStarted);
+    let mut burst_terminal = test_terminal(WIDTH, HEIGHT);
+    let mut burst_renderer = TuiRenderer::new();
+    burst_renderer
+        .draw(&mut burst_terminal, &burst_state, 0)
+        .expect("warmup draw");
     measure("1,000 streaming deltas · 100k rows", 1, || {
-        let mut state = render::synthetic_transcript(100_000, 10_000);
-        state.reduce(AgentEvent::AssistantMessageStarted);
-        let mut terminal = test_terminal(WIDTH, HEIGHT);
-        render::draw_terminal(&mut terminal, &state, 0).expect("test backend draw");
         for _ in 0..1_000 {
-            render::append_streaming_delta(&mut state, " token");
-            render::draw_terminal(&mut terminal, &state, 0).expect("test backend draw");
+            render::append_streaming_delta(&mut burst_state, " token");
+            burst_renderer
+                .draw(&mut burst_terminal, &burst_state, 0)
+                .expect("test backend draw");
         }
     });
 
+    let resize_state = render::synthetic_transcript(100_000, 10_000);
+    let mut resize_terminal = test_terminal(WIDTH, HEIGHT);
+    let mut resize_renderer = TuiRenderer::new();
+    resize_renderer
+        .draw(&mut resize_terminal, &resize_state, 0)
+        .expect("warmup draw");
     measure("resize · 100k rows", 3, || {
-        let state = render::synthetic_transcript(100_000, 10_000);
-        let mut terminal = test_terminal(WIDTH, HEIGHT);
-        render::draw_terminal(&mut terminal, &state, 0).expect("test backend draw");
-        terminal.backend_mut().resize(80, HEIGHT);
-        render::draw_terminal(&mut terminal, &state, 0).expect("test backend draw");
+        resize_terminal.backend_mut().resize(80, HEIGHT);
+        resize_renderer
+            .draw(&mut resize_terminal, &resize_state, 0)
+            .expect("width 80 draw");
+        resize_terminal.backend_mut().resize(WIDTH, HEIGHT);
+        resize_renderer
+            .draw(&mut resize_terminal, &resize_state, 0)
+            .expect("width 100 draw");
     });
 
+    let mut tool_state = render::synthetic_transcript(10_000, 1_000);
+    tool_state.reduce(AgentEvent::ToolExecutionStarted {
+        call_id: "live-tool".to_owned(),
+        name: "bash".to_owned(),
+        arguments: "{}".to_owned(),
+    });
+    let mut tool_terminal = test_terminal(WIDTH, HEIGHT);
+    let mut tool_renderer = TuiRenderer::new();
+    tool_renderer
+        .draw(&mut tool_terminal, &tool_state, 0)
+        .expect("warmup draw");
     measure("large live tool-output burst", 3, || {
-        let mut state = render::synthetic_transcript(10_000, 1_000);
-        state.reduce(AgentEvent::ToolExecutionStarted {
-            call_id: "live-tool".to_owned(),
-            name: "bash".to_owned(),
-            arguments: "{}".to_owned(),
-        });
-        let mut terminal = test_terminal(WIDTH, HEIGHT);
-        render::draw_terminal(&mut terminal, &state, 0).expect("test backend draw");
         for index in 0..100 {
-            state.reduce(AgentEvent::ToolExecutionOutput {
+            tool_state.reduce(AgentEvent::ToolExecutionOutput {
                 call_id: "live-tool".to_owned(),
                 stream: ToolOutputStream::Stdout,
                 chunk: format!("output {index}\n"),
             });
-            render::draw_terminal(&mut terminal, &state, 0).expect("test backend draw");
+            tool_renderer
+                .draw(&mut tool_terminal, &tool_state, 0)
+                .expect("test backend draw");
         }
     });
 }
