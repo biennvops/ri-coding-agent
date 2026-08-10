@@ -18,6 +18,8 @@ pub use bash::DEFAULT_BASH_TIMEOUT_MS;
 pub use registry::ToolRegistry;
 
 pub const MAX_TOOL_OUTPUT_BYTES: usize = 1024 * 1024;
+pub const MAX_TOOL_PREVIEW_LINES: usize = 20;
+pub const MAX_TOOL_PREVIEW_BYTES: usize = 16 * 1024;
 pub const MAX_READ_LINES: usize = 1_000;
 pub const MAX_READ_FILE_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_EDIT_FILE_BYTES: u64 = 16 * 1024 * 1024;
@@ -118,6 +120,26 @@ impl ToolExecutionResult {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolCallPresentation {
+    pub summary: String,
+    pub preview: Option<String>,
+}
+
+impl ToolCallPresentation {
+    pub(crate) fn fallback(name: &str, arguments: &Value) -> Self {
+        let arguments = serde_json::to_string(arguments)
+            .unwrap_or_else(|_| "<arguments unavailable>".to_owned());
+        Self {
+            summary: name.to_owned(),
+            preview: Some(bounded_preview(
+                arguments.lines().map(|line| (None, line)),
+                arguments.lines().count(),
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ToolError {
     #[error("invalid arguments: {0}")]
@@ -134,6 +156,10 @@ pub enum ToolError {
 pub trait Tool: Send + Sync {
     fn definition(&self) -> crate::model::ToolDefinition;
 
+    fn presentation(&self, arguments: &Value) -> ToolCallPresentation {
+        ToolCallPresentation::fallback(&self.definition().name, arguments)
+    }
+
     async fn execute(
         &self,
         arguments: Value,
@@ -141,6 +167,52 @@ pub trait Tool: Send + Sync {
         events: ToolEventSender,
         cancel: CancellationToken,
     ) -> Result<ToolExecutionResult, ToolError>;
+}
+
+pub(crate) fn bounded_preview<'a>(
+    lines: impl Iterator<Item = (Option<char>, &'a str)>,
+    total_lines: usize,
+) -> String {
+    const TRUNCATED_MARKER: &str = "… content preview truncated …";
+    const MARKER_RESERVE: usize = 64;
+
+    if total_lines == 0 {
+        return "(empty content)".to_owned();
+    }
+
+    let mut preview = String::new();
+    let mut shown = 0usize;
+    for (prefix, line) in lines.take(MAX_TOOL_PREVIEW_LINES) {
+        let separator_bytes = usize::from(!preview.is_empty());
+        let prefix_bytes = usize::from(prefix.is_some());
+        let content_limit = MAX_TOOL_PREVIEW_BYTES.saturating_sub(MARKER_RESERVE);
+        let available = content_limit
+            .saturating_sub(preview.len())
+            .saturating_sub(separator_bytes)
+            .saturating_sub(prefix_bytes);
+        if separator_bytes == 1 {
+            preview.push('\n');
+        }
+        if let Some(prefix) = prefix {
+            preview.push(prefix);
+        }
+        if line.len() > available {
+            preview.push_str(prefix_at_byte_boundary(line, available));
+            preview.push('\n');
+            preview.push_str(TRUNCATED_MARKER);
+            return preview;
+        }
+        preview.push_str(line);
+        shown += 1;
+    }
+
+    if shown < total_lines {
+        if !preview.is_empty() {
+            preview.push('\n');
+        }
+        preview.push_str(&format!("… {} more lines …", total_lines - shown));
+    }
+    preview
 }
 
 #[derive(Debug)]

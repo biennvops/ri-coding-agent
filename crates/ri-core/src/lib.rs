@@ -41,7 +41,7 @@ pub use session::{
     MAX_SESSION_RECORD_BYTES, SESSION_VERSION,
 };
 pub use tools::{
-    Tool, ToolContext, ToolError, ToolEvent, ToolEventSender, ToolExecutionMetadata,
-    ToolExecutionResult, ToolOutputStream, ToolRegistry, DEFAULT_BASH_TIMEOUT_MS,
-    MAX_TOOL_OUTPUT_BYTES,
+    Tool, ToolCallPresentation, ToolContext, ToolError, ToolEvent, ToolEventSender,
+    ToolExecutionMetadata, ToolExecutionResult, ToolOutputStream, ToolRegistry,
+    DEFAULT_BASH_TIMEOUT_MS, MAX_TOOL_OUTPUT_BYTES, MAX_TOOL_PREVIEW_BYTES, MAX_TOOL_PREVIEW_LINES,
 };

@@ -9,7 +9,9 @@ use super::bash::BashTool;
 use super::edit::EditTool;
 use super::read::ReadTool;
 use super::write::WriteTool;
-use super::{Tool, ToolContext, ToolError, ToolEventSender, ToolExecutionResult};
+use super::{
+    Tool, ToolCallPresentation, ToolContext, ToolError, ToolEventSender, ToolExecutionResult,
+};
 
 #[derive(Clone)]
 struct RegisteredTool {
@@ -64,6 +66,16 @@ impl ToolRegistry {
             .iter()
             .map(|registered| registered.name.clone())
             .collect()
+    }
+
+    pub fn presentation(&self, name: &str, arguments: &Value) -> ToolCallPresentation {
+        self.tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .map_or_else(
+                || ToolCallPresentation::fallback(name, arguments),
+                |registered| registered.tool.presentation(arguments),
+            )
     }
 
     pub async fn execute(

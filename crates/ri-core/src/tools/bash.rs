@@ -16,8 +16,9 @@ use crate::model::ToolDefinition;
 
 use super::write::temporary_path;
 use super::{
-    BoundedText, Tool, ToolContext, ToolError, ToolEvent, ToolEventSender, ToolExecutionMetadata,
-    ToolExecutionResult, ToolOutputStream, MAX_TOOL_OUTPUT_BYTES,
+    bounded_preview, BoundedText, Tool, ToolCallPresentation, ToolContext, ToolError, ToolEvent,
+    ToolEventSender, ToolExecutionMetadata, ToolExecutionResult, ToolOutputStream,
+    MAX_TOOL_OUTPUT_BYTES,
 };
 
 pub const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
@@ -34,6 +35,13 @@ pub(crate) struct BashTool;
 struct BashArguments {
     command: String,
     timeout_ms: Option<u64>,
+}
+
+impl BashArguments {
+    fn parse(arguments: &Value) -> Result<Self, ToolError> {
+        serde_json::from_value(arguments.clone())
+            .map_err(|error| ToolError::InvalidArguments(error.to_string()))
+    }
 }
 
 #[derive(Debug)]
@@ -74,6 +82,19 @@ impl Tool for BashTool {
         }
     }
 
+    fn presentation(&self, arguments: &Value) -> ToolCallPresentation {
+        let Ok(arguments) = BashArguments::parse(arguments) else {
+            return ToolCallPresentation::fallback("bash", arguments);
+        };
+        ToolCallPresentation {
+            summary: "bash".to_owned(),
+            preview: Some(bounded_preview(
+                arguments.command.lines().map(|line| (None, line)),
+                arguments.command.lines().count(),
+            )),
+        }
+    }
+
     async fn execute(
         &self,
         arguments: Value,
@@ -84,8 +105,7 @@ impl Tool for BashTool {
         if cancel.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
-        let arguments: BashArguments = serde_json::from_value(arguments)
-            .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+        let arguments = BashArguments::parse(&arguments)?;
         if arguments.command.trim().is_empty() {
             return Err(ToolError::InvalidArguments(
                 "command must not be empty".to_owned(),
@@ -975,6 +995,20 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn presents_command_without_json_wrapper() {
+        let presentation = BashTool.presentation(&json!({
+            "command": "cargo test -p ri-core"
+        }));
+
+        assert_eq!(presentation.summary, "bash");
+        assert_eq!(
+            presentation.preview.as_deref(),
+            Some("cargo test -p ri-core")
+        );
+        assert!(!presentation.preview.unwrap().contains("\"command\":"));
+    }
 
     #[test]
     fn utf8_decoder_preserves_code_points_split_between_reads() {

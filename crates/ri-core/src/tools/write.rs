@@ -11,7 +11,10 @@ use tokio_util::sync::CancellationToken;
 use crate::model::ToolDefinition;
 
 use super::path::resolve_for_write;
-use super::{Tool, ToolContext, ToolError, ToolEventSender, ToolExecutionResult};
+use super::{
+    bounded_preview, Tool, ToolCallPresentation, ToolContext, ToolError, ToolEventSender,
+    ToolExecutionResult,
+};
 
 pub(crate) struct WriteTool;
 
@@ -20,6 +23,13 @@ pub(crate) struct WriteTool;
 struct WriteArguments {
     path: String,
     content: String,
+}
+
+impl WriteArguments {
+    fn parse(arguments: &Value) -> Result<Self, ToolError> {
+        serde_json::from_value(arguments.clone())
+            .map_err(|error| ToolError::InvalidArguments(error.to_string()))
+    }
 }
 
 #[async_trait]
@@ -40,6 +50,19 @@ impl Tool for WriteTool {
         }
     }
 
+    fn presentation(&self, arguments: &Value) -> ToolCallPresentation {
+        let Ok(arguments) = WriteArguments::parse(arguments) else {
+            return ToolCallPresentation::fallback("write", arguments);
+        };
+        ToolCallPresentation {
+            summary: format!("write {}", arguments.path),
+            preview: Some(bounded_preview(
+                arguments.content.lines().map(|line| (None, line)),
+                arguments.content.lines().count(),
+            )),
+        }
+    }
+
     async fn execute(
         &self,
         arguments: Value,
@@ -50,8 +73,7 @@ impl Tool for WriteTool {
         if cancel.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
-        let arguments: WriteArguments = serde_json::from_value(arguments)
-            .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+        let arguments = WriteArguments::parse(&arguments)?;
         let path = resolve_for_write(context, &arguments.path)?;
         let existed = path.exists();
         let bytes_written = atomic_replace(&path, arguments.content.as_bytes())?;
@@ -97,6 +119,45 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn presents_path_and_unescaped_content() {
+        let presentation = WriteTool.presentation(&json!({
+            "path": "src/foo.rs",
+            "content": "one\ntwo\nthree\n"
+        }));
+
+        assert_eq!(presentation.summary, "write src/foo.rs");
+        assert_eq!(presentation.preview.as_deref(), Some("one\ntwo\nthree"));
+        assert!(!presentation.preview.unwrap().contains("\"content\":"));
+    }
+
+    #[test]
+    fn bounds_large_content_preview_by_lines_and_bytes() {
+        let lines = (1..=100)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let presentation = WriteTool.presentation(&json!({
+            "path": "src/large.rs",
+            "content": lines
+        }));
+        let preview = presentation.preview.unwrap();
+
+        assert_eq!(presentation.summary, "write src/large.rs");
+        assert!(preview.contains("line 20"));
+        assert!(preview.contains("… 80 more lines …"));
+        assert!(!preview.contains("line 21\n"));
+        assert!(preview.len() <= super::super::MAX_TOOL_PREVIEW_BYTES);
+
+        let presentation = WriteTool.presentation(&json!({
+            "path": "src/wide.rs",
+            "content": "x".repeat(super::super::MAX_TOOL_PREVIEW_BYTES * 2)
+        }));
+        let preview = presentation.preview.unwrap();
+        assert!(preview.contains("… content preview truncated …"));
+        assert!(preview.len() <= super::super::MAX_TOOL_PREVIEW_BYTES);
+    }
 
     #[tokio::test]
     async fn creates_replaces_and_creates_nested_files() {

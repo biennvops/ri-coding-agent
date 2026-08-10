@@ -10,7 +10,10 @@ use crate::model::ToolDefinition;
 use super::path::resolve_existing;
 use super::write::atomic_replace;
 use super::MAX_EDIT_FILE_BYTES;
-use super::{Tool, ToolContext, ToolError, ToolEventSender, ToolExecutionResult};
+use super::{
+    bounded_preview, Tool, ToolCallPresentation, ToolContext, ToolError, ToolEventSender,
+    ToolExecutionResult,
+};
 
 pub(crate) struct EditTool;
 
@@ -20,6 +23,13 @@ struct EditArguments {
     path: String,
     old_text: String,
     new_text: String,
+}
+
+impl EditArguments {
+    fn parse(arguments: &Value) -> Result<Self, ToolError> {
+        serde_json::from_value(arguments.clone())
+            .map_err(|error| ToolError::InvalidArguments(error.to_string()))
+    }
 }
 
 #[async_trait]
@@ -43,6 +53,25 @@ impl Tool for EditTool {
         }
     }
 
+    fn presentation(&self, arguments: &Value) -> ToolCallPresentation {
+        let Ok(arguments) = EditArguments::parse(arguments) else {
+            return ToolCallPresentation::fallback("edit", arguments);
+        };
+        let old_lines = arguments.old_text.lines().count();
+        let new_lines = arguments.new_text.lines().count();
+        ToolCallPresentation {
+            summary: format!("edit {}", arguments.path),
+            preview: Some(bounded_preview(
+                arguments
+                    .old_text
+                    .lines()
+                    .map(|line| (Some('-'), line))
+                    .chain(arguments.new_text.lines().map(|line| (Some('+'), line))),
+                old_lines + new_lines,
+            )),
+        }
+    }
+
     async fn execute(
         &self,
         arguments: Value,
@@ -53,8 +82,7 @@ impl Tool for EditTool {
         if cancel.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
-        let arguments: EditArguments = serde_json::from_value(arguments)
-            .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+        let arguments = EditArguments::parse(&arguments)?;
         if arguments.old_text.is_empty() {
             return Err(ToolError::InvalidArguments(
                 "old_text must not be empty".to_owned(),
@@ -144,6 +172,45 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn presents_single_line_replacement_as_diff() {
+        let presentation = EditTool.presentation(&json!({
+            "path": "src/foo.rs",
+            "old_text": "let a = 1;",
+            "new_text": "let a = 2;"
+        }));
+
+        assert_eq!(presentation.summary, "edit src/foo.rs");
+        assert_eq!(
+            presentation.preview.as_deref(),
+            Some("-let a = 1;\n+let a = 2;")
+        );
+    }
+
+    #[test]
+    fn presents_and_bounds_multiline_replacement() {
+        let old_text = (1..=15)
+            .map(|line| format!("old {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new_text = (1..=15)
+            .map(|line| format!("new {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let presentation = EditTool.presentation(&json!({
+            "path": "src/foo.rs",
+            "old_text": old_text,
+            "new_text": new_text
+        }));
+        let preview = presentation.preview.unwrap();
+
+        assert!(preview.contains("-old 1"));
+        assert!(preview.contains("+new 1"));
+        assert!(preview.contains("… 10 more lines …"));
+        assert!(preview.lines().count() <= super::super::MAX_TOOL_PREVIEW_LINES + 1);
+        assert!(preview.len() <= super::super::MAX_TOOL_PREVIEW_BYTES);
+    }
 
     #[tokio::test]
     async fn replaces_one_exact_multiline_match() {
