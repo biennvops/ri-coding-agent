@@ -870,14 +870,21 @@ fn tool_call_presentation(name: &str, arguments: &str) -> ToolCallPresentation {
 }
 
 fn truncate_text(text: &str, limit: usize) -> String {
+    const MARKER: &str = "\n[… text truncated …]\n";
+
     if text.len() <= limit {
         return text.to_owned();
     }
-    let head_limit = limit / 2;
-    let tail_limit = limit - head_limit;
+    if limit <= MARKER.len() {
+        return prefix_at_boundary(MARKER, limit).to_owned();
+    }
+    let retained = limit - MARKER.len();
+    let head_limit = retained / 2;
+    let tail_limit = retained - head_limit;
     format!(
-        "{}\n[… text truncated …]\n{}",
+        "{}{}{}",
         prefix_at_boundary(text, head_limit),
+        MARKER,
         suffix_at_boundary(text, tail_limit)
     )
 }
@@ -1094,6 +1101,24 @@ mod tests {
             tool.status,
             ToolStatus::Finished(ref metadata) if !metadata.success
         ));
+    }
+
+    #[test]
+    fn malformed_tool_arguments_have_a_strictly_bounded_fallback_preview() {
+        let mut state = AppState::new();
+        state.reduce(AgentEvent::ToolExecutionStarted {
+            call_id: "malformed".to_owned(),
+            name: "write".to_owned(),
+            arguments: "x".repeat(MAX_TOOL_PREVIEW_BYTES * 2),
+        });
+
+        let TranscriptEntry::Tool(tool) = &state.transcript_entries()[0].entry else {
+            panic!("expected tool entry");
+        };
+        let preview = tool.preview.as_deref().expect("fallback preview");
+        assert_eq!(tool.summary, "write");
+        assert!(preview.contains("[… text truncated …]"));
+        assert!(preview.len() <= MAX_TOOL_PREVIEW_BYTES);
     }
 
     #[test]
