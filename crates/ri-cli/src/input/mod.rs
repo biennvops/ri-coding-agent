@@ -8,6 +8,7 @@ pub(crate) use layout::VisualLayout;
 pub enum Action {
     Submit,
     Newline,
+    Complete,
     Escape,
     CtrlC,
     Insert(char),
@@ -40,6 +41,7 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
     match key.code {
         KeyCode::Enter if modifiers.contains(KeyModifiers::SHIFT) => Some(Action::Newline),
         KeyCode::Enter => Some(Action::Submit),
+        KeyCode::Tab => Some(Action::Complete),
         KeyCode::Esc => Some(Action::Escape),
         KeyCode::Char(character) => Some(Action::Insert(character)),
         KeyCode::Backspace => Some(Action::Backspace),
@@ -81,6 +83,10 @@ mod tests {
         assert_eq!(
             action_for(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             Some(Action::Escape)
+        );
+        assert_eq!(
+            action_for(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            Some(Action::Complete)
         );
         assert_eq!(
             action_for(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),

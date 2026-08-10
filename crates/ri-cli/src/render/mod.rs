@@ -9,14 +9,17 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 use ri_core::{
     AppState, MessageRole, ModelRef, StreamingAssistantState, ToolStatus, ToolTranscriptEntry,
     TranscriptEntry, TranscriptEntryId, TranscriptEntryState,
 };
 
+use crate::commands::{matching_commands, CommandSuggestions};
 use crate::input::VisualLayout;
+
+const MAX_VISIBLE_COMMAND_SUGGESTIONS: usize = 6;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RenderStats {
@@ -148,25 +151,37 @@ impl TuiRenderer {
     ) -> Result<(), B::Error> {
         self.last_stats = RenderStats::default();
         terminal.draw(|frame| {
-            self.render_frame(frame, state, Viewport::FromBottom(scroll_from_bottom));
+            self.render_frame(frame, state, Viewport::FromBottom(scroll_from_bottom), None);
         })?;
         Ok(())
     }
 
-    pub fn draw_interactive<B: Backend>(
+    pub(crate) fn draw_interactive<B: Backend>(
         &mut self,
         terminal: &mut Terminal<B>,
         state: &AppState,
         scroll: &mut TranscriptScroll,
+        suggestions: &CommandSuggestions,
     ) -> Result<(), B::Error> {
         self.last_stats = RenderStats::default();
         terminal.draw(|frame| {
-            self.render_frame(frame, state, Viewport::Interactive(scroll));
+            self.render_frame(
+                frame,
+                state,
+                Viewport::Interactive(scroll),
+                Some(suggestions),
+            );
         })?;
         Ok(())
     }
 
-    fn render_frame(&mut self, frame: &mut Frame<'_>, state: &AppState, viewport: Viewport<'_>) {
+    fn render_frame(
+        &mut self,
+        frame: &mut Frame<'_>,
+        state: &AppState,
+        viewport: Viewport<'_>,
+        suggestions: Option<&CommandSuggestions>,
+    ) {
         let area = frame.area();
         let editor_width = area.width.saturating_sub(2).max(1) as usize;
         let (editor_rows, editor_cursor_row) = {
@@ -247,6 +262,9 @@ impl TuiRenderer {
             .block(Block::default().borders(Borders::ALL).title(editor_title))
             .scroll((editor_scroll.min(u16::MAX as usize) as u16, 0));
         frame.render_widget(editor, chunks[1]);
+        if let Some(suggestions) = suggestions {
+            render_command_suggestions(frame, state, suggestions, chunks[1]);
+        }
 
         let footer = footer_text(state, chunks[2].width, scroll_from_bottom);
         frame.render_widget(Paragraph::new(footer), chunks[2]);
@@ -269,6 +287,59 @@ impl TuiRenderer {
             frame.set_cursor_position((x.min(max_x), y.min(max_y)));
         }
     }
+}
+
+fn render_command_suggestions(
+    frame: &mut Frame<'_>,
+    state: &AppState,
+    suggestions: &CommandSuggestions,
+    editor_area: Rect,
+) {
+    if !suggestions.is_visible(state) {
+        return;
+    }
+    let total = matching_commands(state.input()).count();
+    let available_height = editor_area.y.saturating_sub(frame.area().y) as usize;
+    let width = editor_area.width.saturating_sub(2).min(64);
+    if total == 0 || available_height < 3 || width < 4 {
+        return;
+    }
+
+    let visible = total
+        .min(MAX_VISIBLE_COMMAND_SUGGESTIONS)
+        .min(available_height.saturating_sub(2));
+    if visible == 0 {
+        return;
+    }
+    let selected = suggestions.selected(state);
+    let start = selected
+        .saturating_sub(visible.saturating_sub(1))
+        .min(total.saturating_sub(visible));
+    let lines = matching_commands(state.input())
+        .skip(start)
+        .take(visible)
+        .enumerate()
+        .map(|(offset, spec)| {
+            let text = format!("/{:<10} {}", spec.name, spec.description);
+            if start + offset == selected {
+                Line::styled(text, Style::default().fg(Color::Black).bg(Color::Cyan))
+            } else {
+                Line::from(text)
+            }
+        })
+        .collect::<Vec<_>>();
+    let height = visible.saturating_add(2) as u16;
+    let area = Rect::new(
+        editor_area.x.saturating_add(1),
+        editor_area.y.saturating_sub(height),
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" commands ")),
+        area,
+    );
 }
 
 #[derive(Clone, Debug)]
@@ -1308,6 +1379,20 @@ mod tests {
         assert_eq!(renderer.cached_transcript_entries(), 1);
         assert!(renderer.cached_transcript_rows() < 10);
         assert!(renderer.transcript.layouts.capacity() < old_capacity);
+    }
+
+    #[test]
+    fn command_suggestions_render_safely_in_a_narrow_terminal() {
+        let mut state = AppState::new();
+        state.insert_text("/");
+        let suggestions = CommandSuggestions::default();
+        let mut scroll = TranscriptScroll::default();
+        let mut renderer = TuiRenderer::new();
+        let mut terminal = Terminal::new(TestBackend::new(8, 5)).expect("test terminal");
+
+        renderer
+            .draw_interactive(&mut terminal, &state, &mut scroll, &suggestions)
+            .expect("narrow suggestion draw should succeed");
     }
 
     #[test]

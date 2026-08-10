@@ -277,6 +277,15 @@ impl AppState {
         self.input_revision = self.input_revision.wrapping_add(1);
     }
 
+    pub fn set_input(&mut self, text: String) {
+        if self.is_busy() || self.input == text {
+            return;
+        }
+        self.input = text;
+        self.cursor = self.input.len();
+        self.input_revision = self.input_revision.wrapping_add(1);
+    }
+
     pub fn insert_newline(&mut self) {
         self.insert_text("\n");
     }
@@ -1262,6 +1271,19 @@ mod tests {
         assert_eq!(state.input_revision(), after_insert);
         state.backspace();
         assert!(state.input_revision() > after_insert);
+    }
+
+    #[test]
+    fn replacing_editor_input_moves_the_cursor_and_revision() {
+        let mut state = AppState::new();
+        state.insert_text("old");
+        let revision = state.input_revision();
+
+        state.set_input("/model ".to_owned());
+
+        assert_eq!(state.input(), "/model ");
+        assert_eq!(state.cursor(), state.input().len());
+        assert!(state.input_revision() > revision);
     }
 
     #[test]
