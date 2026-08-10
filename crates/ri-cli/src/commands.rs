@@ -136,10 +136,7 @@ impl CommandSuggestions {
     }
 
     pub fn complete(&mut self, state: &mut AppState) -> bool {
-        if !self.is_visible(state) {
-            return false;
-        }
-        let Some(spec) = matching_commands(state.input()).nth(self.selected(state)) else {
+        let Some(spec) = self.selected_spec(state) else {
             return false;
         };
         let suffix = match spec.argument {
@@ -148,6 +145,20 @@ impl CommandSuggestions {
         };
         state.set_input(format!("/{}{suffix}", spec.name));
         true
+    }
+
+    pub fn accept(&self, state: &mut AppState) -> bool {
+        let Some(spec) = self.selected_spec(state) else {
+            return false;
+        };
+        state.set_input(format!("/{}", spec.name));
+        true
+    }
+
+    fn selected_spec(&self, state: &AppState) -> Option<&'static CommandSpec> {
+        self.is_visible(state)
+            .then(|| matching_commands(state.input()).nth(self.selected(state)))
+            .flatten()
     }
 
     pub fn dismiss(&mut self, state: &AppState) {
@@ -199,6 +210,17 @@ mod tests {
         suggestions.move_up(&state);
         assert!(suggestions.complete(&mut state));
         assert_eq!(state.input(), "/quit");
+    }
+
+    #[test]
+    fn enter_accepts_the_highlighted_command_without_argument_spacing() {
+        let mut state = AppState::new();
+        state.insert_text("/");
+        let mut suggestions = CommandSuggestions::default();
+        suggestions.move_down(&state);
+
+        assert!(suggestions.accept(&mut state));
+        assert_eq!(state.input(), "/new");
     }
 
     #[test]

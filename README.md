@@ -81,7 +81,7 @@ The project file is relative to the discovered project root. CLI model selection
 ri
 ```
 
-Useful commands include `/model`, `/new`, `/resume`, `/name [name]`, `/session`, `/compact`, and `/quit`. Type `/` while the agent is idle to show command suggestions, use Up/Down to select one, Tab to complete it, or Esc to dismiss the suggestions without clearing the input.
+Useful commands include `/model`, `/new`, `/resume`, `/name [name]`, `/session`, `/compact`, and `/quit`. Type `/` while the agent is idle to show command suggestions, use Up/Down to select one, Enter to execute it, Tab to complete it for further editing, or Esc to dismiss the suggestions without clearing the input.
 
 Use PgUp/PgDn or Ctrl+U/Ctrl+D to move through transcript scrollback; mouse-wheel and trackpad scrolling are also supported. The footer shows the distance from the latest output while scrolled upward. Streaming output follows the bottom only when the viewport is already at the bottom, so new output and turn completion do not interrupt reading older content. Submitting a new prompt resumes following the latest output.
 

@@ -831,6 +831,7 @@ async fn run_tui_loop(
                             }
                             match action {
                                 Action::Submit => {
+                                    suggestions.accept(state);
                                     if is_slash_input(state.input()) {
                                         if state.is_busy() {
                                             state.add_system_message("a turn or compaction is already active");
@@ -1693,6 +1694,16 @@ mod tests {
         assert!(slash_command("/quit now").is_none());
         assert!(is_slash_input(" /compcat"));
         assert_eq!(unknown_command_name(" /compcat extra"), "/compcat");
+    }
+
+    #[test]
+    fn accepting_a_suggestion_produces_an_executable_slash_command() {
+        let mut state = AppState::new();
+        state.insert_text("/m");
+        let suggestions = CommandSuggestions::default();
+
+        assert!(suggestions.accept(&mut state));
+        assert_eq!(model_command(state.input()), Some(None));
     }
 
     #[test]
