@@ -1377,11 +1377,16 @@ fn log_agent_event(event: &AgentEvent) {
             reason = crate::json_output::stop_reason_name(reason),
             "turn finished"
         ),
-        AgentEvent::Error(error) => tracing::error!(
-            target: "ri",
-            message_bytes = error.message.len(),
-            "agent error"
-        ),
+        AgentEvent::Error(error) => {
+            let (error_kind, http_status) = agent_error_metadata(&error.message);
+            tracing::error!(
+                target: "ri",
+                error_kind,
+                http_status,
+                message_bytes = error.message.len(),
+                "agent error"
+            );
+        }
         AgentEvent::AssistantTextDelta { .. }
         | AgentEvent::AssistantTextItem { .. }
         | AgentEvent::AssistantRefusalDelta { .. }
@@ -1394,6 +1399,25 @@ fn log_agent_event(event: &AgentEvent) {
         | AgentEvent::ContextLimitsUpdated(_)
         | AgentEvent::SessionLoaded { .. } => {}
     }
+}
+
+fn agent_error_metadata(message: &str) -> (&'static str, Option<u16>) {
+    let http_status = message
+        .strip_prefix("provider returned HTTP ")
+        .and_then(|rest| rest.split_once(':').map(|(status, _)| status))
+        .and_then(|status| status.parse().ok());
+    let kind = if http_status.is_some() {
+        "provider_http"
+    } else if message.starts_with("provider context window exceeded") {
+        "context_overflow"
+    } else if message.starts_with("provider returned malformed streaming data") {
+        "provider_malformed"
+    } else if message.starts_with("provider request failed") {
+        "provider_failed"
+    } else {
+        "runtime"
+    };
+    (kind, http_status)
 }
 
 #[cfg(test)]
@@ -1609,6 +1633,18 @@ mod tests {
         assert_eq!(
             settings_selection_description(&settings),
             "provider \"foo\" and model \"coding\""
+        );
+    }
+
+    #[test]
+    fn agent_error_logging_metadata_identifies_provider_http_failures() {
+        assert_eq!(
+            agent_error_metadata("provider returned HTTP 400: {\"error\":\"bad\"}"),
+            ("provider_http", Some(400))
+        );
+        assert_eq!(
+            agent_error_metadata("provider request failed: connection refused"),
+            ("provider_failed", None)
         );
     }
 

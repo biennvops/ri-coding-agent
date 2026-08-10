@@ -920,8 +920,8 @@ fn footer_text(state: &AppState, width: u16) -> Line<'static> {
         Some(window) => format!("ctx ~{current}/{}", format_token_count(window)),
         None => format!("ctx ~{current}"),
     };
-    let text = if let Some(error) = state.last_error() {
-        format!("{model} · {context} · {session} · error: {error}")
+    let text = if state.last_error().is_some() {
+        format!("{model} · {context} · {session} · error — see transcript")
     } else if state.is_busy() {
         format!("{model} · {context} · {session} · busy · Esc cancel")
     } else {
@@ -1301,6 +1301,26 @@ mod tests {
             .expect("append stream draw should succeed");
         assert_eq!(renderer.stats().entries_reflowed, 1);
         assert!(renderer.stats().bytes_reflowed < 500);
+    }
+
+    #[test]
+    fn footer_reports_errors_without_embedding_the_provider_message() {
+        let mut state = AppState::new();
+        let provider_message = "provider returned HTTP 400: a very detailed response body";
+        state.reduce(AgentEvent::Error(ri_core::AgentError::new(
+            provider_message,
+        )));
+
+        let footer = footer_text(&state, 200);
+        let text = footer
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.contains("error — see transcript"));
+        assert!(!text.contains(provider_message));
+        assert!(text.len() < 120);
     }
 
     fn buffer_contains(buffer: &Buffer, needle: &str) -> bool {

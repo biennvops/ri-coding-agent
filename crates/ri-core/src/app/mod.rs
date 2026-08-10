@@ -554,7 +554,12 @@ impl AppState {
                 self.replace_history(&history);
             }
             AgentEvent::Error(AgentError { message }) => {
-                self.last_error = Some(message);
+                self.last_error = Some(message.clone());
+                self.push_message(TranscriptMessage {
+                    role: MessageRole::System,
+                    content: format!("error: {message}"),
+                    thinking: None,
+                });
             }
         }
     }
@@ -1231,6 +1236,19 @@ mod tests {
             .messages()
             .iter()
             .any(|message| { message.content.contains("context compacted") }));
+    }
+
+    #[test]
+    fn agent_errors_remain_available_and_are_appended_to_the_transcript() {
+        let mut state = AppState::new();
+        let message = "provider returned HTTP 400:\n{\"error\":\"bad request\"}";
+
+        state.reduce(AgentEvent::Error(AgentError::new(message)));
+
+        assert_eq!(state.last_error(), Some(message));
+        assert_eq!(state.messages().len(), 1);
+        assert_eq!(state.messages()[0].role, MessageRole::System);
+        assert_eq!(state.messages()[0].content, format!("error: {message}"));
     }
 
     #[test]

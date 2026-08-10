@@ -15,6 +15,10 @@ use super::{
     ModelResponse, ModelThinking, ModelToolCall, ProviderError, StopReason, ToolDefinition, Usage,
 };
 
+const MAX_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_ERROR_LOG_BYTES: usize = 2 * 1024;
+const ERROR_RESPONSE_TRUNCATED_MARKER: &str = "\n[… provider error body truncated …]";
+
 #[derive(Clone)]
 pub struct OpenAiProvider {
     selected: Arc<RwLock<ResolvedModel>>,
@@ -122,12 +126,26 @@ impl ModelProvider for OpenAiProvider {
             target: "ri_core::model",
             provider = %model.model_ref.provider,
             model = %model.model_ref.model,
+            api = %model.api,
             status = response.status().as_u16(),
             "provider response received"
         );
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let message = read_error_body(response, cancel.clone()).await?;
+            if tracing::enabled!(target: "ri_core::model", tracing::Level::WARN) {
+                let diagnostic = provider_error_diagnostic(&message, &model);
+                tracing::warn!(
+                    target: "ri_core::model",
+                    provider = %model.model_ref.provider,
+                    model = %model.model_ref.model,
+                    api = %model.api,
+                    status,
+                    error_body_bytes = message.len(),
+                    error_body = %diagnostic,
+                    "provider HTTP request failed"
+                );
+            }
             if is_context_overflow(status, &message) {
                 return Err(ProviderError::ContextOverflow { message });
             }
@@ -245,9 +263,9 @@ async fn read_error_body(
     response: reqwest::Response,
     cancel: CancellationToken,
 ) -> Result<String, ProviderError> {
-    const MAX_ERROR_BYTES: usize = 64 * 1024;
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
+    let mut truncated = false;
 
     while let Some(chunk) = tokio::select! {
         _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
@@ -256,14 +274,97 @@ async fn read_error_body(
         let chunk = chunk.map_err(|error| ProviderError::Failed {
             message: error.to_string(),
         })?;
-        let remaining = MAX_ERROR_BYTES.saturating_sub(bytes.len());
-        bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-        if bytes.len() == MAX_ERROR_BYTES {
+        let remaining = MAX_ERROR_RESPONSE_BYTES.saturating_sub(bytes.len());
+        if chunk.len() > remaining {
+            bytes.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
             break;
         }
+        bytes.extend_from_slice(&chunk);
     }
 
-    Ok(String::from_utf8_lossy(&bytes).trim().to_owned())
+    let mut message = String::from_utf8_lossy(&bytes).trim().to_owned();
+    if truncated {
+        message.push_str(ERROR_RESPONSE_TRUNCATED_MARKER);
+    }
+    Ok(message)
+}
+
+fn provider_error_diagnostic(message: &str, model: &ResolvedModel) -> String {
+    let mut diagnostic = match serde_json::from_str::<Value>(message) {
+        Ok(mut value) => {
+            redact_diagnostic_json(&mut value);
+            value.to_string()
+        }
+        Err(_) => message
+            .chars()
+            .flat_map(|character| match character {
+                '\n' => "\\n".chars().collect::<Vec<_>>(),
+                '\r' => "\\r".chars().collect(),
+                character if character.is_control() => " ".chars().collect(),
+                character => vec![character],
+            })
+            .collect(),
+    };
+
+    for secret in model
+        .api_key
+        .iter()
+        .chain(model.headers.values())
+        .filter(|secret| !secret.is_empty())
+    {
+        diagnostic = diagnostic.replace(secret, "<redacted>");
+    }
+
+    truncate_diagnostic(&diagnostic, message.len())
+}
+
+fn redact_diagnostic_json(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                if is_sensitive_diagnostic_key(key) {
+                    *value = Value::String("<redacted>".to_owned());
+                } else {
+                    redact_diagnostic_json(value);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                redact_diagnostic_json(value);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn is_sensitive_diagnostic_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase().replace('-', "_");
+    key.contains("api_key")
+        || key.contains("apikey")
+        || key.contains("authorization")
+        || key.contains("secret")
+        || key.contains("password")
+        || key.contains("credential")
+        || key.contains("access_token")
+        || key.contains("refresh_token")
+        || matches!(
+            key.as_str(),
+            "prompt" | "prompts" | "messages" | "input" | "tool_output" | "tool_outputs"
+        )
+}
+
+fn truncate_diagnostic(diagnostic: &str, original_bytes: usize) -> String {
+    if diagnostic.len() <= MAX_ERROR_LOG_BYTES {
+        return diagnostic.to_owned();
+    }
+    let marker = format!("… [diagnostic truncated; response {original_bytes} bytes]");
+    let mut end = MAX_ERROR_LOG_BYTES.saturating_sub(marker.len());
+    while end > 0 && !diagnostic.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &diagnostic[..end], marker)
 }
 
 #[derive(Default)]
@@ -2158,6 +2259,60 @@ mod tests {
             .expect_err("HTTP error should surface");
         assert!(matches!(error, ProviderError::Http { status: 401, .. }));
         assert!(error.to_string().contains("invalid API key"));
+        server.await.expect("test server should finish");
+    }
+
+    #[test]
+    fn provider_error_diagnostics_redact_credentials_and_prompt_fields() {
+        let mut model = test_model(ApiKind::OpenAiResponses, "https://example.test".to_owned());
+        model
+            .headers
+            .insert("X-Custom-Secret".to_owned(), "header-secret".to_owned());
+        let message = r#"{"error":{"message":"bad request for test-key and header-secret","api_key":"test-key"},"prompt":"private prompt"}"#;
+
+        let diagnostic = provider_error_diagnostic(message, &model);
+
+        assert!(diagnostic.contains("bad request"));
+        assert!(!diagnostic.contains("test-key"));
+        assert!(!diagnostic.contains("header-secret"));
+        assert!(!diagnostic.contains("private prompt"));
+        assert!(diagnostic.contains("<redacted>"));
+    }
+
+    #[test]
+    fn provider_error_diagnostics_are_bounded_with_an_explicit_marker() {
+        let model = test_model(ApiKind::OpenAiResponses, "https://example.test".to_owned());
+        let message = format!(r#"{{"error":{{"message":"{}"}}}}"#, "x".repeat(8_000));
+
+        let diagnostic = provider_error_diagnostic(&message, &model);
+
+        assert!(diagnostic.len() <= MAX_ERROR_LOG_BYTES);
+        assert!(diagnostic.contains("diagnostic truncated"));
+        assert!(diagnostic.contains(&format!("response {} bytes", message.len())));
+    }
+
+    #[tokio::test]
+    async fn provider_error_response_body_is_bounded_with_an_explicit_marker() {
+        let body = "x".repeat(MAX_ERROR_RESPONSE_BYTES + 1_024);
+        let (base_url, server) = spawn_sse_server("400 Bad Request", &body).await;
+        let provider = OpenAiProvider::new(test_model(ApiKind::OpenAiResponses, base_url))
+            .expect("provider should build");
+        let (tx, _rx) = mpsc::channel(4);
+
+        let error = provider
+            .stream(
+                ModelRequest::single_user("hello"),
+                tx,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("HTTP error should surface");
+
+        let ProviderError::Http { message, .. } = error else {
+            panic!("expected HTTP error");
+        };
+        assert!(message.len() <= MAX_ERROR_RESPONSE_BYTES + ERROR_RESPONSE_TRUNCATED_MARKER.len());
+        assert!(message.ends_with(ERROR_RESPONSE_TRUNCATED_MARKER));
         server.await.expect("test server should finish");
     }
 
