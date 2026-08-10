@@ -45,6 +45,9 @@ pub enum AgentCommand {
         name: String,
     },
     RefreshContext,
+    SetReasoningEffort {
+        effort: Option<String>,
+    },
     Shutdown,
 }
 
@@ -285,7 +288,8 @@ where
                                 | Some(AgentCommand::NewSession { .. })
                                 | Some(AgentCommand::LoadSession { .. })
                                 | Some(AgentCommand::RenameSession { .. })
-                                | Some(AgentCommand::RefreshContext) => {
+                                | Some(AgentCommand::RefreshContext)
+                                | Some(AgentCommand::SetReasoningEffort { .. }) => {
                                     let _ = events.send(AgentEvent::Error(AgentError::new(
                                         "a turn or compaction is already active",
                                     ))).await;
@@ -440,6 +444,9 @@ where
                             &events,
                         )
                         .await;
+                    }
+                    Some(AgentCommand::SetReasoningEffort { effort }) => {
+                        self.reasoning_effort = effort;
                     }
                     Some(AgentCommand::Cancel) => {
                         let _ = events

@@ -3,6 +3,7 @@ use ri_core::AppState;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CommandKind {
     Model,
+    Thinking,
     New,
     Resume,
     Name,
@@ -31,6 +32,12 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         name: "model",
         description: "Select model",
         argument: CommandArgument::Optional("provider/model"),
+    },
+    CommandSpec {
+        kind: CommandKind::Thinking,
+        name: "thinking",
+        description: "Show or set thinking level",
+        argument: CommandArgument::Optional("level"),
     },
     CommandSpec {
         kind: CommandKind::New,

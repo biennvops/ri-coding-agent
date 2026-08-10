@@ -222,6 +222,7 @@ struct AppSetup {
     initial_history: Vec<ModelMessage>,
     initial_transcript: Vec<ModelMessage>,
     compaction_enabled: bool,
+    thinking_level: Option<ri_core::ThinkingLevel>,
     reasoning_effort: Option<String>,
     resume_requested: bool,
     state_path: Option<std::path::PathBuf>,
@@ -396,6 +397,7 @@ impl AppSetup {
             initial_history,
             initial_transcript,
             compaction_enabled: settings.settings.compaction.enabled,
+            thinking_level,
             reasoning_effort,
             resume_requested,
             state_path,
@@ -1107,6 +1109,7 @@ fn settings_selection_description(settings: &ri_core::ResolvedSettings) -> Strin
 
 enum SlashCommand {
     Model(Option<String>),
+    Thinking(Option<String>),
     Quit,
     Compact,
     New,
@@ -1143,6 +1146,7 @@ fn slash_command(input: &str) -> Option<SlashCommand> {
 
     match spec.kind {
         CommandKind::Model => Some(SlashCommand::Model(argument.map(str::to_owned))),
+        CommandKind::Thinking => Some(SlashCommand::Thinking(argument.map(str::to_owned))),
         CommandKind::New => Some(SlashCommand::New),
         CommandKind::Resume => Some(SlashCommand::Resume),
         CommandKind::Name => Some(SlashCommand::Name(argument.map(str::to_owned))),
@@ -1162,6 +1166,10 @@ async fn handle_slash_command(
     match command {
         SlashCommand::Model(argument) => {
             handle_model_command(terminal, state, setup, command_tx, argument.as_deref()).await?;
+            Ok(SlashCommandOutcome::Continue)
+        }
+        SlashCommand::Thinking(argument) => {
+            handle_thinking_command(state, setup, command_tx, argument.as_deref()).await?;
             Ok(SlashCommandOutcome::Continue)
         }
         SlashCommand::Quit => Ok(SlashCommandOutcome::Quit),
@@ -1277,6 +1285,57 @@ fn model_command(input: &str) -> Option<Option<String>> {
     }
 }
 
+async fn handle_thinking_command(
+    state: &mut AppState,
+    setup: &mut AppSetup,
+    command_tx: &mpsc::Sender<AgentCommand>,
+    argument: Option<&str>,
+) -> Result<()> {
+    let Some(model) = setup.selected.as_ref() else {
+        state.add_system_message("no model is selected");
+        return Ok(());
+    };
+    let Some(argument) = argument else {
+        let supported = model
+            .supported_thinking_levels()
+            .into_iter()
+            .map(|level| level.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        state.add_system_message(format!("thinking levels: {supported}"));
+        return Ok(());
+    };
+    let level: ri_core::ThinkingLevel = match argument.parse() {
+        Ok(level) => level,
+        Err(error) => {
+            state.add_system_message(error.to_string());
+            return Ok(());
+        }
+    };
+    if level != ri_core::ThinkingLevel::Off && model.thinking_effort(level).is_none() {
+        state.add_system_message(format!(
+            "{level} is not supported by {}; supported levels: {}",
+            model.model_ref.display_name(),
+            model
+                .supported_thinking_levels()
+                .into_iter()
+                .map(|level| level.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        return Ok(());
+    }
+    let effort = model.thinking_effort(level);
+    setup.reasoning_effort = effort.clone();
+    setup.thinking_level = Some(level);
+    command_tx
+        .send(AgentCommand::SetReasoningEffort { effort })
+        .await
+        .context("could not set thinking level")?;
+    state.add_system_message(format!("thinking level: {level}"));
+    Ok(())
+}
+
 async fn handle_model_command(
     terminal: &mut TerminalGuard,
     state: &mut AppState,
@@ -1316,7 +1375,34 @@ async fn handle_model_command(
                     model = %model_ref.model,
                     "model switched"
                 );
+                let previous_level = setup.thinking_level;
+                let effective_level = previous_level.map(|level| {
+                    if selected.thinking_effort(level).is_some()
+                        || level == ri_core::ThinkingLevel::Off
+                    {
+                        level
+                    } else {
+                        ri_core::ThinkingLevel::ALL
+                            .into_iter()
+                            .rev()
+                            .find(|candidate| {
+                                *candidate < level && selected.thinking_effort(*candidate).is_some()
+                            })
+                            .unwrap_or(ri_core::ThinkingLevel::Off)
+                    }
+                });
+                setup.thinking_level = effective_level;
+                setup.reasoning_effort =
+                    effective_level.and_then(|level| selected.thinking_effort(level));
                 setup.selected = Some(selected);
+                if let Some(previous_level) = previous_level {
+                    if Some(previous_level) != effective_level {
+                        state.add_system_message(format!(
+                            "thinking level adjusted: {previous_level} → {}",
+                            effective_level.unwrap_or(ri_core::ThinkingLevel::Off)
+                        ));
+                    }
+                }
                 if let Err(error) = setup.remember_model(&model_ref) {
                     eprintln!("ri: warning: could not persist recent model selection: {error}");
                     state.add_system_message(format!(
