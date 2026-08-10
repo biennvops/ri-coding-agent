@@ -20,13 +20,14 @@ use crate::input::{self, Action};
 use crate::json_output::{JsonEmitter, RunStartedData};
 use crate::model_selection::resolve_model;
 use crate::redraw::{RedrawScheduler, RedrawUrgency};
-use crate::render::TuiRenderer;
+use crate::render::{TranscriptScroll, TuiRenderer};
 use crate::signals::ShutdownSignals;
 use crate::terminal::TerminalGuard;
 
 const COMMAND_CHANNEL_CAPACITY: usize = 16;
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 const MAX_AGENT_EVENTS_PER_FRAME: usize = 64;
+const MOUSE_SCROLL_ROWS: usize = 3;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Options {
@@ -779,7 +780,7 @@ async fn run_tui_loop(
 ) -> Result<()> {
     let mut redraw = RedrawScheduler::new(Duration::from_millis(12));
     redraw.request(RedrawUrgency::Immediate, Instant::now());
-    let mut scroll_from_bottom = 0usize;
+    let mut scroll = TranscriptScroll::default();
     let mut editor_width = terminal
         .terminal_mut()
         .size()
@@ -794,16 +795,10 @@ async fn run_tui_loop(
 
     while !exit {
         if redraw.take_ready(Instant::now()) {
-            drain_ready_agent_events(
-                state,
-                event_rx,
-                &setup.context,
-                &mut scroll_from_bottom,
-                &mut redraw,
-            )?;
+            drain_ready_agent_events(state, event_rx, &setup.context, &mut redraw)?;
             redraw.mark_drawn();
             renderer
-                .draw(terminal.terminal_mut(), state, scroll_from_bottom)
+                .draw_interactive(terminal.terminal_mut(), state, &mut scroll)
                 .context("could not render terminal")?;
             state.acknowledge_transcript_changes();
         }
@@ -847,7 +842,7 @@ async fn run_tui_loop(
                                             if matches!(outcome, SlashCommandOutcome::Quit) {
                                                 exit = true;
                                             }
-                                            scroll_from_bottom = 0;
+                                            scroll.follow_bottom();
                                         } else {
                                             let command = unknown_command_name(state.input()).to_owned();
                                             state.take_input();
@@ -857,7 +852,7 @@ async fn run_tui_loop(
                                         command_tx
                                             .try_send(AgentCommand::Submit { text })
                                             .context("could not send prompt to the agent")?;
-                                        scroll_from_bottom = 0;
+                                        scroll.follow_bottom();
                                     }
                                 }
                                 Action::Newline => state.insert_newline(),
@@ -898,12 +893,24 @@ async fn run_tui_loop(
                                 Action::Home => state.move_home(),
                                 Action::End => state.move_end(),
                                 Action::PageUp => {
-                                    scroll_from_bottom = scroll_from_bottom.saturating_add(10)
+                                    scroll.scroll_up(renderer.transcript_page_rows())
                                 }
                                 Action::PageDown => {
-                                    scroll_from_bottom = scroll_from_bottom.saturating_sub(10)
+                                    scroll.scroll_down(renderer.transcript_page_rows())
                                 }
+                                Action::MouseScrollUp => scroll.scroll_up(MOUSE_SCROLL_ROWS),
+                                Action::MouseScrollDown => scroll.scroll_down(MOUSE_SCROLL_ROWS),
                             }
+                        }
+                    }
+                    Event::Mouse(mouse) => {
+                        if let Some(action) = input::action_for_mouse(mouse) {
+                            match action {
+                                Action::MouseScrollUp => scroll.scroll_up(MOUSE_SCROLL_ROWS),
+                                Action::MouseScrollDown => scroll.scroll_down(MOUSE_SCROLL_ROWS),
+                                _ => unreachable!("mouse input only maps to mouse actions"),
+                            }
+                            redraw.request(RedrawUrgency::Immediate, Instant::now());
                         }
                     }
                     Event::Resize(width, _) => {
@@ -917,12 +924,7 @@ async fn run_tui_loop(
             agent_event = event_rx.recv() => {
                 let event = agent_event
                     .ok_or_else(|| anyhow!("agent event stream disconnected"))?;
-                let urgency = apply_agent_event(
-                    event,
-                    state,
-                    &setup.context,
-                    &mut scroll_from_bottom,
-                );
+                let urgency = apply_agent_event(event, state, &setup.context);
                 redraw.request(urgency, Instant::now());
             }
         }
@@ -935,11 +937,7 @@ fn apply_agent_event(
     event: AgentEvent,
     state: &mut AppState,
     context: &ContextBundle,
-    scroll_from_bottom: &mut usize,
 ) -> RedrawUrgency {
-    if matches!(event, AgentEvent::TurnFinished { .. }) {
-        *scroll_from_bottom = 0;
-    }
     let urgency = redraw_urgency(&event);
     log_agent_event(&event);
     let session_loaded = matches!(event, AgentEvent::SessionLoaded { .. });
@@ -954,13 +952,12 @@ fn drain_ready_agent_events(
     state: &mut AppState,
     event_rx: &mut mpsc::Receiver<AgentEvent>,
     context: &ContextBundle,
-    scroll_from_bottom: &mut usize,
     redraw: &mut RedrawScheduler,
 ) -> Result<()> {
     for _ in 0..MAX_AGENT_EVENTS_PER_FRAME {
         match event_rx.try_recv() {
             Ok(event) => {
-                let urgency = apply_agent_event(event, state, context, scroll_from_bottom);
+                let urgency = apply_agent_event(event, state, context);
                 redraw.request(urgency, Instant::now());
             }
             Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
@@ -1666,6 +1663,25 @@ mod tests {
     }
 
     #[test]
+    fn turn_completion_does_not_reset_manual_scrollback() {
+        let mut state = AppState::new();
+        let context = ContextBundle::disabled(PathBuf::new(), PathBuf::new());
+        let mut scroll = TranscriptScroll::default();
+        scroll.update_maximum(100);
+        scroll.scroll_up(20);
+
+        apply_agent_event(
+            AgentEvent::TurnFinished {
+                reason: StopReason::Stop,
+            },
+            &mut state,
+            &context,
+        );
+
+        assert_eq!(scroll.from_bottom(), 20);
+    }
+
+    #[test]
     fn bounded_agent_event_drain_returns_while_sender_refills_channel() {
         fn text_delta() -> AgentEvent {
             AgentEvent::AssistantTextDelta {
@@ -1696,16 +1712,9 @@ mod tests {
 
         let mut state = AppState::new();
         let context = ContextBundle::disabled(PathBuf::new(), PathBuf::new());
-        let mut scroll_from_bottom = 0;
         let mut redraw = RedrawScheduler::new(Duration::from_millis(12));
-        drain_ready_agent_events(
-            &mut state,
-            &mut event_rx,
-            &context,
-            &mut scroll_from_bottom,
-            &mut redraw,
-        )
-        .expect("draining ready agent events should succeed");
+        drain_ready_agent_events(&mut state, &mut event_rx, &context, &mut redraw)
+            .expect("draining ready agent events should succeed");
 
         assert_eq!(
             state

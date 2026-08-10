@@ -1,6 +1,6 @@
 mod layout;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
 pub(crate) use layout::VisualLayout;
 
@@ -21,6 +21,8 @@ pub enum Action {
     End,
     PageUp,
     PageDown,
+    MouseScrollUp,
+    MouseScrollDown,
 }
 
 pub fn action_for(key: KeyEvent) -> Option<Action> {
@@ -29,6 +31,8 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
     if modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => Some(Action::CtrlC),
+            KeyCode::Char('u') => Some(Action::PageUp),
+            KeyCode::Char('d') => Some(Action::PageDown),
             _ => None,
         };
     }
@@ -48,6 +52,14 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
         KeyCode::End => Some(Action::End),
         KeyCode::PageUp => Some(Action::PageUp),
         KeyCode::PageDown => Some(Action::PageDown),
+        _ => None,
+    }
+}
+
+pub fn action_for_mouse(mouse: MouseEvent) -> Option<Action> {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => Some(Action::MouseScrollUp),
+        MouseEventKind::ScrollDown => Some(Action::MouseScrollDown),
         _ => None,
     }
 }
@@ -73,6 +85,36 @@ mod tests {
         assert_eq!(
             action_for(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Some(Action::CtrlC)
+        );
+    }
+
+    #[test]
+    fn maps_control_and_mouse_scrollback_actions() {
+        assert_eq!(
+            action_for(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            Some(Action::PageUp)
+        );
+        assert_eq!(
+            action_for(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            Some(Action::PageDown)
+        );
+        assert_eq!(
+            action_for_mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+            Some(Action::MouseScrollUp)
+        );
+        assert_eq!(
+            action_for_mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+            Some(Action::MouseScrollDown)
         );
     }
 }
