@@ -9,11 +9,13 @@ use serde_json::Value;
 use thiserror::Error;
 
 use super::ConfigWarning;
+use super::ThinkingLevel;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResolvedSettings {
     pub default_provider: Option<String>,
     pub default_model: Option<String>,
+    pub default_thinking_level: Option<ThinkingLevel>,
     pub context: ContextSettings,
     pub compaction: CompactionSettings,
 }
@@ -152,6 +154,10 @@ fn apply_raw_settings(
         &format_path(source_path, "defaultModel"),
         "defaultModel",
     )?;
+    let default_thinking_level = optional_thinking_level(
+        raw.default_thinking_level,
+        &format_path(source_path, "defaultThinkingLevel"),
+    )?;
     let context_enabled = optional_bool(
         raw.context.enabled,
         &format_path(source_path, "context.enabled"),
@@ -168,6 +174,9 @@ fn apply_raw_settings(
     }
     if default_model.is_some() {
         load.settings.default_model = default_model;
+    }
+    if default_thinking_level.is_some() {
+        load.settings.default_thinking_level = default_thinking_level;
     }
     if let Some(enabled) = context_enabled {
         load.settings.context.enabled = enabled;
@@ -202,6 +211,29 @@ fn optional_string(
     Ok(Some(value))
 }
 
+fn optional_thinking_level(
+    value: RawField<String>,
+    path: &str,
+) -> Result<Option<ThinkingLevel>, SettingsError> {
+    let value = match value {
+        RawField::Missing => return Ok(None),
+        RawField::Null => {
+            return Err(SettingsError::Invalid {
+                path: path.to_owned(),
+                message: "defaultThinkingLevel must be a valid thinking level".to_owned(),
+            });
+        }
+        RawField::Value(value) => value,
+    };
+    value
+        .parse()
+        .map(Some)
+        .map_err(|error: super::ThinkingLevelError| SettingsError::Invalid {
+            path: path.to_owned(),
+            message: error.to_string(),
+        })
+}
+
 fn optional_bool(
     value: RawField<bool>,
     path: &str,
@@ -233,6 +265,8 @@ struct RawSettings {
     default_provider: RawField<String>,
     #[serde(rename = "defaultModel", default)]
     default_model: RawField<String>,
+    #[serde(rename = "defaultThinkingLevel", default)]
+    default_thinking_level: RawField<String>,
     #[serde(default)]
     context: RawContextSettings,
     #[serde(default)]

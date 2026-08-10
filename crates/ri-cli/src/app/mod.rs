@@ -38,6 +38,7 @@ pub struct Options {
     pub json: bool,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub thinking: Option<ri_core::ThinkingLevel>,
     pub no_context: bool,
     pub show_help: bool,
     pub continue_session: bool,
@@ -83,6 +84,16 @@ impl Options {
                     options.model = Some(
                         args.next()
                             .ok_or_else(|| anyhow!("--model requires a model id"))?,
+                    );
+                }
+                "--thinking" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--thinking requires a level"))?;
+                    options.thinking = Some(
+                        value
+                            .parse()
+                            .map_err(|error: ri_core::ThinkingLevelError| anyhow!(error))?,
                     );
                 }
                 "--no-context" => options.no_context = true,
