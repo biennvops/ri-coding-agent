@@ -85,6 +85,7 @@ impl TranscriptScroll {
             self.top_row = maximum_scroll;
         } else {
             self.top_row = self.top_row.min(maximum_scroll);
+            self.following_bottom = self.top_row == maximum_scroll;
         }
     }
 }
@@ -1137,6 +1138,24 @@ mod tests {
         assert_eq!(scroll.from_bottom(), 0);
         scroll.update_maximum(150);
         assert_eq!(scroll.top_row, 150);
+        assert_eq!(scroll.from_bottom(), 0);
+    }
+
+    #[test]
+    fn resize_clamping_to_the_bottom_resumes_follow_mode() {
+        let mut scroll = TranscriptScroll::default();
+        scroll.update_maximum(100);
+        scroll.scroll_up(10);
+        assert_eq!(scroll.top_row, 90);
+        assert!(!scroll.following_bottom);
+
+        scroll.update_maximum(80);
+        assert_eq!(scroll.top_row, 80);
+        assert_eq!(scroll.from_bottom(), 0);
+        assert!(scroll.following_bottom);
+
+        scroll.update_maximum(81);
+        assert_eq!(scroll.top_row, 81);
         assert_eq!(scroll.from_bottom(), 0);
     }
 
