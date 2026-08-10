@@ -10,7 +10,10 @@ use crate::model::ToolDefinition;
 use super::path::resolve_existing;
 use super::write::atomic_replace;
 use super::MAX_EDIT_FILE_BYTES;
-use super::{Tool, ToolContext, ToolError, ToolEventSender, ToolExecutionResult};
+use super::{
+    bounded_preview_with_limits, Tool, ToolCallPresentation, ToolContext, ToolError,
+    ToolEventSender, ToolExecutionResult, MAX_TOOL_PREVIEW_BYTES, MAX_TOOL_PREVIEW_LINES,
+};
 
 pub(crate) struct EditTool;
 
@@ -20,6 +23,13 @@ struct EditArguments {
     path: String,
     old_text: String,
     new_text: String,
+}
+
+impl EditArguments {
+    fn parse(arguments: &Value) -> Result<Self, ToolError> {
+        serde_json::from_value(arguments.clone())
+            .map_err(|error| ToolError::InvalidArguments(error.to_string()))
+    }
 }
 
 #[async_trait]
@@ -43,6 +53,51 @@ impl Tool for EditTool {
         }
     }
 
+    fn presentation(&self, arguments: &Value) -> ToolCallPresentation {
+        let Ok(arguments) = EditArguments::parse(arguments) else {
+            return ToolCallPresentation::fallback("edit", arguments);
+        };
+        let old_lines = arguments.old_text.lines().count();
+        let new_lines = arguments.new_text.lines().count();
+        let (old_line_limit, new_line_limit) =
+            split_preview_budget(old_lines, new_lines, MAX_TOOL_PREVIEW_LINES);
+        let (old_byte_limit, new_byte_limit) = if old_lines > 0 && new_lines > 0 {
+            let old_limit = MAX_TOOL_PREVIEW_BYTES / 2;
+            (
+                old_limit,
+                MAX_TOOL_PREVIEW_BYTES.saturating_sub(old_limit + 1),
+            )
+        } else {
+            (MAX_TOOL_PREVIEW_BYTES, MAX_TOOL_PREVIEW_BYTES)
+        };
+        let old_preview = (old_lines > 0).then(|| {
+            bounded_preview_with_limits(
+                arguments.old_text.lines().map(|line| (Some('-'), line)),
+                old_lines,
+                old_line_limit,
+                old_byte_limit,
+            )
+        });
+        let new_preview = (new_lines > 0).then(|| {
+            bounded_preview_with_limits(
+                arguments.new_text.lines().map(|line| (Some('+'), line)),
+                new_lines,
+                new_line_limit,
+                new_byte_limit,
+            )
+        });
+        ToolCallPresentation {
+            summary: format!("edit {}", arguments.path),
+            preview: Some(
+                [old_preview, new_preview]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+        }
+    }
+
     async fn execute(
         &self,
         arguments: Value,
@@ -53,8 +108,7 @@ impl Tool for EditTool {
         if cancel.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
-        let arguments: EditArguments = serde_json::from_value(arguments)
-            .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+        let arguments = EditArguments::parse(&arguments)?;
         if arguments.old_text.is_empty() {
             return Err(ToolError::InvalidArguments(
                 "old_text must not be empty".to_owned(),
@@ -137,6 +191,19 @@ impl Tool for EditTool {
     }
 }
 
+fn split_preview_budget(first_lines: usize, second_lines: usize, total: usize) -> (usize, usize) {
+    if first_lines == 0 {
+        return (0, total);
+    }
+    if second_lines == 0 {
+        return (total, 0);
+    }
+
+    let first = first_lines.min(total / 2);
+    let second = second_lines.min(total.saturating_sub(first));
+    (first_lines.min(total.saturating_sub(second)), second)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -144,6 +211,77 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn presents_single_line_replacement_as_diff() {
+        let presentation = EditTool.presentation(&json!({
+            "path": "src/foo.rs",
+            "old_text": "let a = 1;",
+            "new_text": "let a = 2;"
+        }));
+
+        assert_eq!(presentation.summary, "edit src/foo.rs");
+        assert_eq!(
+            presentation.preview.as_deref(),
+            Some("-let a = 1;\n+let a = 2;")
+        );
+    }
+
+    #[test]
+    fn presents_and_bounds_multiline_replacement() {
+        let old_text = (1..=15)
+            .map(|line| format!("old {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new_text = (1..=15)
+            .map(|line| format!("new {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let presentation = EditTool.presentation(&json!({
+            "path": "src/foo.rs",
+            "old_text": old_text,
+            "new_text": new_text
+        }));
+        let preview = presentation.preview.unwrap();
+
+        assert!(preview.contains("-old 1"));
+        assert!(preview.contains("+new 1"));
+        assert!(preview.contains("… 5 more lines …"));
+        assert!(
+            preview
+                .lines()
+                .filter(|line| line.starts_with(['-', '+']))
+                .count()
+                <= super::super::MAX_TOOL_PREVIEW_LINES
+        );
+        assert!(preview.len() <= super::super::MAX_TOOL_PREVIEW_BYTES);
+    }
+
+    #[test]
+    fn long_old_text_still_shows_short_replacement() {
+        let old_text = (1..=30)
+            .map(|line| format!("old {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let presentation = EditTool.presentation(&json!({
+            "path": "src/foo.rs",
+            "old_text": old_text,
+            "new_text": "replacement"
+        }));
+        let preview = presentation.preview.unwrap();
+
+        assert!(preview.contains("-old 1"));
+        assert!(preview.contains("+replacement"));
+        assert!(preview.contains("… 11 more lines …"));
+        assert_eq!(
+            preview
+                .lines()
+                .filter(|line| line.starts_with(['-', '+']))
+                .count(),
+            super::super::MAX_TOOL_PREVIEW_LINES
+        );
+        assert!(preview.len() <= super::super::MAX_TOOL_PREVIEW_BYTES);
+    }
 
     #[tokio::test]
     async fn replaces_one_exact_multiline_match() {

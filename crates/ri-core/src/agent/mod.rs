@@ -24,7 +24,6 @@ use crate::tools::{
     ToolOutputStream, ToolRegistry,
 };
 
-pub const MAX_TOOL_ROUNDS_PER_TURN: usize = 32;
 const MODEL_EVENT_CHANNEL_CAPACITY: usize = 64;
 const TOOL_EVENT_CHANNEL_CAPACITY: usize = 64;
 
@@ -755,27 +754,12 @@ where
         }
 
         tool_rounds += 1;
-        if tool_rounds > MAX_TOOL_ROUNDS_PER_TURN {
-            if let Err(error) = append_synthetic_results(
-                &mut history,
-                &config.session,
-                &calls,
-                &events,
-                "tool loop limit reached; this tool call was not executed",
-            )
-            .await
-            {
-                fail_turn(&events, error).await;
-            }
-            fail_turn(
-                &events,
-                format!(
-                    "tool loop limit reached after {MAX_TOOL_ROUNDS_PER_TURN} rounds; start a new turn to continue"
-                ),
-            )
-            .await;
-            return turn_outcome(history, StopReason::Error);
-        }
+        tracing::debug!(
+            target: "ri_core::agent",
+            tool_round = tool_rounds,
+            tool_calls = calls.len(),
+            "tool round started"
+        );
 
         for (index, call) in calls.iter().enumerate() {
             if cancel.is_cancelled() {
@@ -2176,48 +2160,144 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_loop_limit_stops_a_provider_that_never_finishes() {
-        let steps = (0..=MAX_TOOL_ROUNDS_PER_TURN)
-            .map(|index| ScriptedStep {
+    async fn forty_tool_rounds_complete_normally() {
+        const TOOL_ROUNDS: usize = 40;
+
+        let root = unique_test_dir("agent-long-tool-loop");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("note.txt"), "ok\n").unwrap();
+        let mut steps = (1..=TOOL_ROUNDS)
+            .map(|round| ScriptedStep {
                 events: Vec::new(),
                 response: ModelResponse {
                     items: vec![ModelAssistantItem::ToolCall(tool_call(
-                        &format!("call-{index}"),
-                        "bash",
-                        r#"{"command":"printf ok"}"#,
+                        &format!("call-{round}"),
+                        "read",
+                        r#"{"path":"note.txt"}"#,
                     ))],
                     stop_reason: StopReason::ToolCalls,
                     usage: None,
                 },
             })
-            .collect();
+            .collect::<Vec<_>>();
+        steps.push(final_step("finished after 40 tool rounds"));
         let provider = ScriptedProvider::new(steps);
         let requests = Arc::clone(&provider.requests);
         let (command_tx, command_rx) = mpsc::channel(8);
-        let (event_tx, mut event_rx) = mpsc::channel(128);
-        let runtime = AgentRuntime::new(provider);
+        let (event_tx, mut event_rx) = mpsc::channel(512);
+        let runtime = AgentRuntime::with_workspace_root(provider, &root).unwrap();
         let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
         command_tx
             .send(AgentCommand::Submit {
-                text: "loop forever".to_owned(),
+                text: "inspect repeatedly".to_owned(),
             })
             .await
             .unwrap();
         let events = collect_turn(&mut event_rx).await;
-        assert!(events.iter().any(|event| {
-            matches!(event, AgentEvent::Error(error) if error.message.contains("tool loop limit"))
-        }));
-        assert!(events.iter().any(|event| {
-            matches!(
-                event,
-                AgentEvent::TurnFinished {
-                    reason: StopReason::Error
-                }
-            )
-        }));
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ToolExecutionStarted { .. }))
+                .count(),
+            TOOL_ROUNDS
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ToolExecutionFinished { .. }))
+                .count(),
+            TOOL_ROUNDS
+        );
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, AgentEvent::Error(_))));
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::TurnFinished {
+                reason: StopReason::Stop
+            })
+        ));
+        assert_eq!(requests.lock().unwrap().len(), TOOL_ROUNDS + 1);
+
         command_tx.send(AgentCommand::Shutdown).await.unwrap();
         runtime_task.await.unwrap();
-        assert_eq!(requests.lock().unwrap().len(), MAX_TOOL_ROUNDS_PER_TURN + 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_thirty_two_rounds_stops_before_another_tool_call() {
+        const CANCEL_ROUND: usize = 40;
+
+        let root = unique_test_dir("agent-cancel-long-tool-loop");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("note.txt"), "ok\n").unwrap();
+        let steps = (1..=64)
+            .map(|round| {
+                let (name, arguments) = if round == CANCEL_ROUND {
+                    ("bash", r#"{"command":"sleep 5"}"#)
+                } else {
+                    ("read", r#"{"path":"note.txt"}"#)
+                };
+                ScriptedStep {
+                    events: Vec::new(),
+                    response: ModelResponse {
+                        items: vec![ModelAssistantItem::ToolCall(tool_call(
+                            &format!("call-{round}"),
+                            name,
+                            arguments,
+                        ))],
+                        stop_reason: StopReason::ToolCalls,
+                        usage: None,
+                    },
+                }
+            })
+            .collect();
+        let provider = ScriptedProvider::new(steps);
+        let requests = Arc::clone(&provider.requests);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(512);
+        let runtime = AgentRuntime::with_workspace_root(provider, &root).unwrap();
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "continue until cancelled".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let mut started = 0usize;
+        loop {
+            let event = event_rx.recv().await.unwrap();
+            if matches!(event, AgentEvent::ToolExecutionStarted { .. }) {
+                started += 1;
+                if started == CANCEL_ROUND {
+                    command_tx.send(AgentCommand::Cancel).await.unwrap();
+                    break;
+                }
+            }
+        }
+        let events = collect_turn(&mut event_rx).await;
+
+        assert_eq!(started, CANCEL_ROUND);
+        assert!(events.iter().all(|event| {
+            !matches!(event, AgentEvent::ToolExecutionStarted { .. })
+                && !matches!(event, AgentEvent::Error(error) if error.message.contains("tool loop limit"))
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(event, AgentEvent::ToolExecutionFinished { result, .. } if result.metadata.cancelled)
+        }));
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::TurnFinished {
+                reason: StopReason::Cancelled
+            })
+        ));
+        assert_eq!(requests.lock().unwrap().len(), CANCEL_ROUND);
+
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

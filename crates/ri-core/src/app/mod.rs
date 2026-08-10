@@ -7,10 +7,12 @@ use crate::config::ModelRef;
 use crate::context::ContextUsage;
 use crate::model::{ModelAssistantItem, ModelLimits, ModelMessage, StopReason, Usage};
 use crate::session::SessionInfo;
-use crate::tools::{ToolExecutionMetadata, ToolOutputStream};
+use crate::tools::{
+    ToolCallPresentation, ToolExecutionMetadata, ToolOutputStream, ToolRegistry,
+    MAX_TOOL_PREVIEW_BYTES,
+};
 
 const MAX_TOOL_TRANSCRIPT_OUTPUT_BYTES: usize = 256 * 1024;
-const MAX_TOOL_TRANSCRIPT_ARGUMENT_BYTES: usize = 16 * 1024;
 const TOOL_OUTPUT_MARKER: &str = "\n[… output truncated …]\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,7 +100,8 @@ pub enum ToolStatus {
 pub struct ToolTranscriptEntry {
     pub call_id: String,
     pub name: String,
-    pub arguments: String,
+    pub summary: String,
+    pub preview: Option<String>,
     pub output: String,
     pub output_truncated: bool,
     pub status: ToolStatus,
@@ -451,10 +454,12 @@ impl AppState {
                 name,
                 arguments,
             } => {
+                let presentation = tool_call_presentation(&name, &arguments);
                 self.push_entry(TranscriptEntry::Tool(ToolTranscriptEntry {
                     call_id,
                     name,
-                    arguments: truncate_text(&arguments, MAX_TOOL_TRANSCRIPT_ARGUMENT_BYTES),
+                    summary: presentation.summary,
+                    preview: presentation.preview,
                     output: String::new(),
                     output_truncated: false,
                     status: ToolStatus::Running,
@@ -731,13 +736,12 @@ impl AppState {
                     else {
                         continue;
                     };
+                    let presentation = tool_call_presentation(&name, &call.arguments);
                     self.push_entry(TranscriptEntry::Tool(ToolTranscriptEntry {
                         call_id,
                         name,
-                        arguments: truncate_text(
-                            &call.arguments,
-                            MAX_TOOL_TRANSCRIPT_ARGUMENT_BYTES,
-                        ),
+                        summary: presentation.summary,
+                        preview: presentation.preview,
                         output: String::new(),
                         output_truncated: false,
                         status: ToolStatus::Running,
@@ -764,7 +768,8 @@ impl AppState {
                     let mut tool = ToolTranscriptEntry {
                         call_id: tool_call_id.clone(),
                         name: tool_name.clone(),
-                        arguments: String::new(),
+                        summary: tool_name.clone(),
+                        preview: None,
                         output: String::new(),
                         output_truncated: false,
                         status: ToolStatus::Finished(ToolExecutionMetadata::success()),
@@ -854,15 +859,32 @@ fn append_tool_output(tool: &mut ToolTranscriptEntry, chunk: &str) {
     tool.output = format!("{head}{TOOL_OUTPUT_MARKER}{tail}");
 }
 
+fn tool_call_presentation(name: &str, arguments: &str) -> ToolCallPresentation {
+    match serde_json::from_str(arguments) {
+        Ok(arguments) => ToolRegistry::new().presentation(name, &arguments),
+        Err(_) => ToolCallPresentation {
+            summary: name.to_owned(),
+            preview: Some(truncate_text(arguments, MAX_TOOL_PREVIEW_BYTES)),
+        },
+    }
+}
+
 fn truncate_text(text: &str, limit: usize) -> String {
+    const MARKER: &str = "\n[… text truncated …]\n";
+
     if text.len() <= limit {
         return text.to_owned();
     }
-    let head_limit = limit / 2;
-    let tail_limit = limit - head_limit;
+    if limit <= MARKER.len() {
+        return prefix_at_boundary(MARKER, limit).to_owned();
+    }
+    let retained = limit - MARKER.len();
+    let head_limit = retained / 2;
+    let tail_limit = retained - head_limit;
     format!(
-        "{}\n[… text truncated …]\n{}",
+        "{}{}{}",
         prefix_at_boundary(text, head_limit),
+        MARKER,
         suffix_at_boundary(text, tail_limit)
     )
 }
@@ -1015,6 +1037,91 @@ mod tests {
     }
 
     #[test]
+    fn write_and_edit_previews_survive_tool_completion() {
+        let cases = [
+            (
+                "write",
+                r#"{"path":"src/foo.rs","content":"one\ntwo\nthree\n"}"#,
+                "write src/foo.rs",
+                "one\ntwo\nthree",
+            ),
+            (
+                "edit",
+                r#"{"path":"src/foo.rs","old_text":"let a = 1;","new_text":"let a = 2;"}"#,
+                "edit src/foo.rs",
+                "-let a = 1;\n+let a = 2;",
+            ),
+        ];
+
+        for (name, arguments, summary, preview) in cases {
+            let mut state = AppState::new();
+            state.reduce(AgentEvent::ToolExecutionStarted {
+                call_id: name.to_owned(),
+                name: name.to_owned(),
+                arguments: arguments.to_owned(),
+            });
+            state.reduce(AgentEvent::ToolExecutionFinished {
+                call_id: name.to_owned(),
+                name: name.to_owned(),
+                result: ToolExecutionResultForTest::result_with_content("completed result"),
+            });
+
+            let TranscriptEntry::Tool(tool) = &state.transcript_entries()[0].entry else {
+                panic!("expected tool entry");
+            };
+            assert_eq!(tool.summary, summary);
+            assert_eq!(tool.preview.as_deref(), Some(preview));
+            assert_eq!(tool.output, "completed result");
+            assert!(matches!(tool.status, ToolStatus::Finished(_)));
+        }
+    }
+
+    #[test]
+    fn failed_edit_preserves_proposed_change_and_error() {
+        let mut state = AppState::new();
+        state.reduce(AgentEvent::ToolExecutionStarted {
+            call_id: "edit-1".to_owned(),
+            name: "edit".to_owned(),
+            arguments: r#"{"path":"src/foo.rs","old_text":"old","new_text":"new"}"#.to_owned(),
+        });
+        state.reduce(AgentEvent::ToolExecutionFinished {
+            call_id: "edit-1".to_owned(),
+            name: "edit".to_owned(),
+            result: crate::tools::ToolExecutionResult::failure(
+                "old_text matched 3 locations; provide more surrounding context",
+            ),
+        });
+
+        let TranscriptEntry::Tool(tool) = &state.transcript_entries()[0].entry else {
+            panic!("expected tool entry");
+        };
+        assert_eq!(tool.preview.as_deref(), Some("-old\n+new"));
+        assert!(tool.output.contains("matched 3 locations"));
+        assert!(matches!(
+            tool.status,
+            ToolStatus::Finished(ref metadata) if !metadata.success
+        ));
+    }
+
+    #[test]
+    fn malformed_tool_arguments_have_a_strictly_bounded_fallback_preview() {
+        let mut state = AppState::new();
+        state.reduce(AgentEvent::ToolExecutionStarted {
+            call_id: "malformed".to_owned(),
+            name: "write".to_owned(),
+            arguments: "x".repeat(MAX_TOOL_PREVIEW_BYTES * 2),
+        });
+
+        let TranscriptEntry::Tool(tool) = &state.transcript_entries()[0].entry else {
+            panic!("expected tool entry");
+        };
+        let preview = tool.preview.as_deref().expect("fallback preview");
+        assert_eq!(tool.summary, "write");
+        assert!(preview.contains("[… text truncated …]"));
+        assert!(preview.len() <= MAX_TOOL_PREVIEW_BYTES);
+    }
+
+    #[test]
     fn tool_output_is_bounded_and_finishes_with_metadata() {
         let mut state = AppState::new();
         state.reduce(AgentEvent::ToolExecutionStarted {
@@ -1105,6 +1212,8 @@ mod tests {
             panic!("expected historical tool entry");
         };
         assert_eq!(tool.call_id, "call-1");
+        assert_eq!(tool.summary, "read note.txt");
+        assert_eq!(tool.preview, None);
         assert_eq!(tool.output, "1 | note");
         assert!(matches!(tool.status, ToolStatus::Finished(_)));
     }

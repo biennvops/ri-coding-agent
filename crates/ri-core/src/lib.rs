@@ -8,10 +8,7 @@ pub mod model;
 pub mod session;
 pub mod tools;
 
-pub use agent::{
-    AgentCommand, AgentError, AgentEvent, AgentRuntime, AgentRuntimeConfig,
-    MAX_TOOL_ROUNDS_PER_TURN,
-};
+pub use agent::{AgentCommand, AgentError, AgentEvent, AgentRuntime, AgentRuntimeConfig};
 pub use app::{
     AppState, MessageRole, StreamingAssistantState, ToolStatus, ToolTranscriptEntry,
     TranscriptEntry, TranscriptEntryId, TranscriptEntryState, TranscriptMessage,
@@ -41,7 +38,7 @@ pub use session::{
     MAX_SESSION_RECORD_BYTES, SESSION_VERSION,
 };
 pub use tools::{
-    Tool, ToolContext, ToolError, ToolEvent, ToolEventSender, ToolExecutionMetadata,
-    ToolExecutionResult, ToolOutputStream, ToolRegistry, DEFAULT_BASH_TIMEOUT_MS,
-    MAX_TOOL_OUTPUT_BYTES,
+    Tool, ToolCallPresentation, ToolContext, ToolError, ToolEvent, ToolEventSender,
+    ToolExecutionMetadata, ToolExecutionResult, ToolOutputStream, ToolRegistry,
+    DEFAULT_BASH_TIMEOUT_MS, MAX_TOOL_OUTPUT_BYTES, MAX_TOOL_PREVIEW_BYTES, MAX_TOOL_PREVIEW_LINES,
 };

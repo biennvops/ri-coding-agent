@@ -8,7 +8,10 @@ use tokio_util::sync::CancellationToken;
 use crate::model::ToolDefinition;
 
 use super::path::resolve_existing;
-use super::{BoundedText, Tool, ToolContext, ToolError, ToolEventSender, ToolExecutionResult};
+use super::{
+    BoundedText, Tool, ToolCallPresentation, ToolContext, ToolError, ToolEventSender,
+    ToolExecutionResult,
+};
 use super::{MAX_READ_FILE_BYTES, MAX_READ_LINES, MAX_TOOL_OUTPUT_BYTES};
 
 const DEFAULT_READ_LIMIT: usize = 200;
@@ -21,6 +24,13 @@ struct ReadArguments {
     path: String,
     offset: Option<usize>,
     limit: Option<usize>,
+}
+
+impl ReadArguments {
+    fn parse(arguments: &Value) -> Result<Self, ToolError> {
+        serde_json::from_value(arguments.clone())
+            .map_err(|error| ToolError::InvalidArguments(error.to_string()))
+    }
 }
 
 #[async_trait]
@@ -53,6 +63,23 @@ impl Tool for ReadTool {
         }
     }
 
+    fn presentation(&self, arguments: &Value) -> ToolCallPresentation {
+        let Ok(arguments) = ReadArguments::parse(arguments) else {
+            return ToolCallPresentation::fallback("read", arguments);
+        };
+        let mut summary = format!("read {}", arguments.path);
+        if arguments.offset.is_some() || arguments.limit.is_some() {
+            let start = arguments.offset.unwrap_or(1);
+            let limit = arguments.limit.unwrap_or(DEFAULT_READ_LIMIT);
+            let end = start.saturating_add(limit).saturating_sub(1);
+            summary.push_str(&format!(" · lines {start}–{end}"));
+        }
+        ToolCallPresentation {
+            summary,
+            preview: None,
+        }
+    }
+
     async fn execute(
         &self,
         arguments: Value,
@@ -63,8 +90,7 @@ impl Tool for ReadTool {
         if cancel.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
-        let arguments: ReadArguments = serde_json::from_value(arguments)
-            .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+        let arguments = ReadArguments::parse(&arguments)?;
         let offset = arguments.offset.unwrap_or(1);
         let requested_limit = arguments.limit.unwrap_or(DEFAULT_READ_LIMIT);
         if offset == 0 || requested_limit == 0 {
@@ -170,6 +196,19 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    #[test]
+    fn presents_path_and_requested_line_range() {
+        let presentation = ReadTool.presentation(&json!({
+            "path": "src/foo.rs",
+            "offset": 10,
+            "limit": 20
+        }));
+
+        assert_eq!(presentation.summary, "read src/foo.rs · lines 10–29");
+        assert_eq!(presentation.preview, None);
+        assert!(!presentation.summary.contains("{\"path\":"));
+    }
 
     #[tokio::test]
     async fn reads_numbered_ranges_and_reports_more_content() {

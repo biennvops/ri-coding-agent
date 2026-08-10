@@ -902,19 +902,27 @@ fn append_tool_entry(lines: &mut Vec<CachedRow>, tool: &ToolTranscriptEntry, wid
         }
         ToolStatus::Finished(_) => ("✗", Style::default().fg(Color::Red)),
     };
-    let title = if tool.arguments.is_empty() {
-        format!("{marker} {}", tool.name)
-    } else {
-        format!("{marker} {} {}", tool.name, tool.arguments)
-    };
-    lines.extend(layout_styled_lines(&title, style, width));
+    lines.extend(layout_styled_lines(
+        &format!("{marker} {}", tool.summary),
+        style,
+        width,
+    ));
+    if let Some(preview) = &tool.preview {
+        append_layout_content(lines, preview, Style::default(), width);
+    }
     if tool.output.is_empty() && matches!(tool.status, ToolStatus::Running) {
         lines.extend(layout_styled_lines(
             "  running...",
             Style::default().fg(Color::DarkGray),
             width,
         ));
-    } else {
+    } else if !tool.output.is_empty() {
+        if tool.preview.is_some() {
+            lines.push(CachedRow {
+                text: String::new(),
+                style: Style::default(),
+            });
+        }
         append_layout_content(lines, &tool.output, Style::default(), width);
     }
     if let ToolStatus::Finished(metadata) = &tool.status {
@@ -1045,9 +1053,9 @@ fn entry_render_bytes(entry: &TranscriptEntry) -> usize {
                 .unwrap_or_default(),
         ),
         TranscriptEntry::Tool(tool) => tool
-            .name
+            .summary
             .len()
-            .saturating_add(tool.arguments.len())
+            .saturating_add(tool.preview.as_deref().map(str::len).unwrap_or_default())
             .saturating_add(tool.output.len()),
     }
 }
@@ -1434,6 +1442,65 @@ mod tests {
             .draw(&mut terminal, &state, 0)
             .expect("edited editor draw should succeed");
         assert_eq!(renderer.stats().editor_cache_misses, 1);
+    }
+
+    #[test]
+    fn tool_layout_renders_cached_semantic_presentation_and_result() {
+        let cases = [
+            (
+                "read",
+                r#"{"path":"src/foo.rs","offset":10,"limit":20}"#,
+                "✓ read src/foo.rs · lines 10–29",
+                "",
+            ),
+            (
+                "write",
+                r#"{"path":"src/foo.rs","content":"one\ntwo"}"#,
+                "✓ write src/foo.rs",
+                "one\ntwo",
+            ),
+            (
+                "edit",
+                r#"{"path":"src/foo.rs","old_text":"old","new_text":"new"}"#,
+                "✓ edit src/foo.rs",
+                "-old\n+new",
+            ),
+            (
+                "bash",
+                r#"{"command":"cargo test -p ri-core"}"#,
+                "✓ bash",
+                "cargo test -p ri-core",
+            ),
+        ];
+
+        for (name, arguments, expected_title, expected_preview) in cases {
+            let mut state = AppState::new();
+            state.reduce(AgentEvent::ToolExecutionStarted {
+                call_id: name.to_owned(),
+                name: name.to_owned(),
+                arguments: arguments.to_owned(),
+            });
+            state.reduce(AgentEvent::ToolExecutionFinished {
+                call_id: name.to_owned(),
+                name: name.to_owned(),
+                result: ri_core::ToolExecutionResult::success("tool result"),
+            });
+            let rendered = layout_entry(&state.transcript_entries()[0].entry, 200)
+                .into_iter()
+                .map(|row| row.text)
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            assert!(rendered.contains(expected_title), "{rendered}");
+            assert!(
+                expected_preview
+                    .lines()
+                    .all(|line| rendered.contains(&format!("  {line}"))),
+                "{rendered}"
+            );
+            assert!(rendered.contains("tool result"), "{rendered}");
+            assert!(!rendered.contains("{\""), "{rendered}");
+        }
     }
 
     #[test]
