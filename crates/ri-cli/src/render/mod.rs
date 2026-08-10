@@ -9,14 +9,17 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 use ri_core::{
     AppState, MessageRole, ModelRef, StreamingAssistantState, ToolStatus, ToolTranscriptEntry,
     TranscriptEntry, TranscriptEntryId, TranscriptEntryState,
 };
 
+use crate::commands::{matching_commands, CommandSuggestions};
 use crate::input::VisualLayout;
+
+const MAX_VISIBLE_COMMAND_SUGGESTIONS: usize = 6;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RenderStats {
@@ -36,6 +39,60 @@ pub struct TuiRenderer {
     transcript: TranscriptLayoutCache,
     editor: EditorLayoutCache,
     last_stats: RenderStats,
+    transcript_viewport_rows: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranscriptScroll {
+    top_row: usize,
+    maximum_scroll: usize,
+    following_bottom: bool,
+}
+
+impl Default for TranscriptScroll {
+    fn default() -> Self {
+        Self {
+            top_row: 0,
+            maximum_scroll: 0,
+            following_bottom: true,
+        }
+    }
+}
+
+impl TranscriptScroll {
+    pub fn scroll_up(&mut self, rows: usize) {
+        self.top_row = self.top_row.saturating_sub(rows);
+        self.following_bottom = self.top_row == self.maximum_scroll;
+    }
+
+    pub fn scroll_down(&mut self, rows: usize) {
+        self.top_row = self.top_row.saturating_add(rows).min(self.maximum_scroll);
+        self.following_bottom = self.top_row == self.maximum_scroll;
+    }
+
+    pub fn follow_bottom(&mut self) {
+        self.top_row = self.maximum_scroll;
+        self.following_bottom = true;
+    }
+
+    pub fn from_bottom(&self) -> usize {
+        self.maximum_scroll.saturating_sub(self.top_row)
+    }
+
+    pub(crate) fn update_maximum(&mut self, maximum_scroll: usize) {
+        self.maximum_scroll = maximum_scroll;
+        if self.following_bottom {
+            self.top_row = maximum_scroll;
+        } else {
+            self.top_row = self.top_row.min(maximum_scroll);
+            self.following_bottom = self.top_row == maximum_scroll;
+        }
+    }
+}
+
+enum Viewport<'a> {
+    FromBottom(usize),
+    Interactive(&'a mut TranscriptScroll),
 }
 
 impl Default for TuiRenderer {
@@ -50,6 +107,7 @@ impl TuiRenderer {
             transcript: TranscriptLayoutCache::default(),
             editor: EditorLayoutCache::default(),
             last_stats: RenderStats::default(),
+            transcript_viewport_rows: 0,
         }
     }
 
@@ -67,6 +125,10 @@ impl TuiRenderer {
 
     pub fn transcript_total_rows(&self) -> usize {
         self.transcript.total_rows()
+    }
+
+    pub fn transcript_page_rows(&self) -> usize {
+        self.transcript_viewport_rows.max(1)
     }
 
     pub fn move_editor_vertical(
@@ -90,12 +152,37 @@ impl TuiRenderer {
     ) -> Result<(), B::Error> {
         self.last_stats = RenderStats::default();
         terminal.draw(|frame| {
-            self.render_frame(frame, state, scroll_from_bottom);
+            self.render_frame(frame, state, Viewport::FromBottom(scroll_from_bottom), None);
         })?;
         Ok(())
     }
 
-    fn render_frame(&mut self, frame: &mut Frame<'_>, state: &AppState, scroll_from_bottom: usize) {
+    pub(crate) fn draw_interactive<B: Backend>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+        state: &AppState,
+        scroll: &mut TranscriptScroll,
+        suggestions: &CommandSuggestions,
+    ) -> Result<(), B::Error> {
+        self.last_stats = RenderStats::default();
+        terminal.draw(|frame| {
+            self.render_frame(
+                frame,
+                state,
+                Viewport::Interactive(scroll),
+                Some(suggestions),
+            );
+        })?;
+        Ok(())
+    }
+
+    fn render_frame(
+        &mut self,
+        frame: &mut Frame<'_>,
+        state: &AppState,
+        viewport: Viewport<'_>,
+        suggestions: Option<&CommandSuggestions>,
+    ) {
         let area = frame.area();
         let editor_width = area.width.saturating_sub(2).max(1) as usize;
         let (editor_rows, editor_cursor_row) = {
@@ -124,8 +211,18 @@ impl TuiRenderer {
         self.transcript
             .prepare(state, transcript_width, &mut self.last_stats);
         let visible_lines = chunks[0].height.saturating_sub(2) as usize;
+        self.transcript_viewport_rows = visible_lines;
         let maximum_scroll = self.transcript.total_rows().saturating_sub(visible_lines);
-        let scroll = maximum_scroll.saturating_sub(scroll_from_bottom.min(maximum_scroll));
+        let (scroll, scroll_from_bottom) = match viewport {
+            Viewport::FromBottom(from_bottom) => (
+                maximum_scroll.saturating_sub(from_bottom.min(maximum_scroll)),
+                from_bottom.min(maximum_scroll),
+            ),
+            Viewport::Interactive(state) => {
+                state.update_maximum(maximum_scroll);
+                (state.top_row, state.from_bottom())
+            }
+        };
         let transcript_block = Block::default().borders(Borders::ALL).title(" transcript ");
         let transcript_inner = transcript_block.inner(chunks[0]);
         frame.render_widget(transcript_block, chunks[0]);
@@ -158,16 +255,19 @@ impl TuiRenderer {
             .row
             .saturating_sub(editor_visible_lines.saturating_sub(1));
         let editor_title = if state.is_busy() {
-            " input · Esc cancels "
+            " input · Esc cancels · PgUp scroll "
         } else {
-            " input · Enter submits · Shift+Enter newline "
+            " input · Enter submits · Shift+Enter newline · PgUp scroll "
         };
         let editor = Paragraph::new(editor_lines)
             .block(Block::default().borders(Borders::ALL).title(editor_title))
             .scroll((editor_scroll.min(u16::MAX as usize) as u16, 0));
         frame.render_widget(editor, chunks[1]);
+        if let Some(suggestions) = suggestions {
+            render_command_suggestions(frame, state, suggestions, chunks[1]);
+        }
 
-        let footer = footer_text(state, chunks[2].width);
+        let footer = footer_text(state, chunks[2].width, scroll_from_bottom);
         frame.render_widget(Paragraph::new(footer), chunks[2]);
 
         if !state.is_busy() && chunks[1].height > 2 {
@@ -188,6 +288,59 @@ impl TuiRenderer {
             frame.set_cursor_position((x.min(max_x), y.min(max_y)));
         }
     }
+}
+
+fn render_command_suggestions(
+    frame: &mut Frame<'_>,
+    state: &AppState,
+    suggestions: &CommandSuggestions,
+    editor_area: Rect,
+) {
+    if !suggestions.is_visible(state) {
+        return;
+    }
+    let total = matching_commands(state.input()).count();
+    let available_height = editor_area.y.saturating_sub(frame.area().y) as usize;
+    let width = editor_area.width.saturating_sub(2).min(64);
+    if total == 0 || available_height < 3 || width < 4 {
+        return;
+    }
+
+    let visible = total
+        .min(MAX_VISIBLE_COMMAND_SUGGESTIONS)
+        .min(available_height.saturating_sub(2));
+    if visible == 0 {
+        return;
+    }
+    let selected = suggestions.selected(state);
+    let start = selected
+        .saturating_sub(visible.saturating_sub(1))
+        .min(total.saturating_sub(visible));
+    let lines = matching_commands(state.input())
+        .skip(start)
+        .take(visible)
+        .enumerate()
+        .map(|(offset, spec)| {
+            let text = format!("/{:<10} {}", spec.name, spec.description);
+            if start + offset == selected {
+                Line::styled(text, Style::default().fg(Color::Black).bg(Color::Cyan))
+            } else {
+                Line::from(text)
+            }
+        })
+        .collect::<Vec<_>>();
+    let height = visible.saturating_add(2) as u16;
+    let area = Rect::new(
+        editor_area.x.saturating_add(1),
+        editor_area.y.saturating_sub(height),
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" commands ")),
+        area,
+    );
 }
 
 #[derive(Clone, Debug)]
@@ -899,7 +1052,7 @@ fn entry_render_bytes(entry: &TranscriptEntry) -> usize {
     }
 }
 
-fn footer_text(state: &AppState, width: u16) -> Line<'static> {
+fn footer_text(state: &AppState, width: u16, scroll_from_bottom: usize) -> Line<'static> {
     let model = state
         .active_model()
         .map(ModelRef::display_name)
@@ -920,12 +1073,19 @@ fn footer_text(state: &AppState, width: u16) -> Line<'static> {
         Some(window) => format!("ctx ~{current}/{}", format_token_count(window)),
         None => format!("ctx ~{current}"),
     };
-    let text = if let Some(error) = state.last_error() {
-        format!("{model} · {context} · {session} · error: {error}")
+    let status = if state.last_error().is_some() {
+        "error — see transcript"
     } else if state.is_busy() {
-        format!("{model} · {context} · {session} · busy · Esc cancel")
+        "busy · Esc cancel"
     } else {
-        format!("{model} · {context} · {session} · ready · Enter submit · Ctrl+C exit")
+        "ready · Enter submit · Ctrl+C exit"
+    };
+    let text = if scroll_from_bottom > 0 {
+        format!(
+            "{status} · ↑ {scroll_from_bottom} lines · PgDn latest · {model} · {context} · {session}"
+        )
+    } else {
+        format!("{model} · {context} · {session} · {status}")
     };
     let truncated: String = text
         .chars()
@@ -958,6 +1118,57 @@ mod tests {
 
     fn terminal() -> Terminal<TestBackend> {
         Terminal::new(TestBackend::new(20, 10)).expect("test terminal")
+    }
+
+    #[test]
+    fn transcript_scroll_follows_growth_only_at_the_bottom() {
+        let mut scroll = TranscriptScroll::default();
+        scroll.update_maximum(100);
+        assert_eq!(scroll.top_row, 100);
+        assert_eq!(scroll.from_bottom(), 0);
+
+        scroll.scroll_up(20);
+        assert_eq!(scroll.top_row, 80);
+        assert_eq!(scroll.from_bottom(), 20);
+        scroll.update_maximum(130);
+        assert_eq!(scroll.top_row, 80);
+        assert_eq!(scroll.from_bottom(), 50);
+
+        scroll.follow_bottom();
+        assert_eq!(scroll.from_bottom(), 0);
+        scroll.update_maximum(150);
+        assert_eq!(scroll.top_row, 150);
+        assert_eq!(scroll.from_bottom(), 0);
+    }
+
+    #[test]
+    fn resize_clamping_to_the_bottom_resumes_follow_mode() {
+        let mut scroll = TranscriptScroll::default();
+        scroll.update_maximum(100);
+        scroll.scroll_up(10);
+        assert_eq!(scroll.top_row, 90);
+        assert!(!scroll.following_bottom);
+
+        scroll.update_maximum(80);
+        assert_eq!(scroll.top_row, 80);
+        assert_eq!(scroll.from_bottom(), 0);
+        assert!(scroll.following_bottom);
+
+        scroll.update_maximum(81);
+        assert_eq!(scroll.top_row, 81);
+        assert_eq!(scroll.from_bottom(), 0);
+    }
+
+    #[test]
+    fn transcript_scroll_is_bounded_at_both_ends() {
+        let mut scroll = TranscriptScroll::default();
+        scroll.update_maximum(40);
+        scroll.scroll_up(usize::MAX);
+        assert_eq!(scroll.top_row, 0);
+        assert_eq!(scroll.from_bottom(), 40);
+        scroll.scroll_down(usize::MAX);
+        assert_eq!(scroll.top_row, 40);
+        assert_eq!(scroll.from_bottom(), 0);
     }
 
     #[test]
@@ -1190,6 +1401,20 @@ mod tests {
     }
 
     #[test]
+    fn command_suggestions_render_safely_in_a_narrow_terminal() {
+        let mut state = AppState::new();
+        state.insert_text("/");
+        let suggestions = CommandSuggestions::default();
+        let mut scroll = TranscriptScroll::default();
+        let mut renderer = TuiRenderer::new();
+        let mut terminal = Terminal::new(TestBackend::new(8, 5)).expect("test terminal");
+
+        renderer
+            .draw_interactive(&mut terminal, &state, &mut scroll, &suggestions)
+            .expect("narrow suggestion draw should succeed");
+    }
+
+    #[test]
     fn editor_layout_reuses_wrapping_for_cursor_motion() {
         let mut state = AppState::new();
         state.insert_text(&"line\n".repeat(200));
@@ -1301,6 +1526,44 @@ mod tests {
             .expect("append stream draw should succeed");
         assert_eq!(renderer.stats().entries_reflowed, 1);
         assert!(renderer.stats().bytes_reflowed < 500);
+    }
+
+    #[test]
+    fn scroll_indicator_only_appears_away_from_the_bottom() {
+        let state = AppState::new();
+        let at_bottom = footer_text(&state, 200, 0)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let scrolled = footer_text(&state, 200, 42)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(!at_bottom.contains("PgDn latest"));
+        assert!(scrolled.contains("↑ 42 lines · PgDn latest"));
+    }
+
+    #[test]
+    fn footer_reports_errors_without_embedding_the_provider_message() {
+        let mut state = AppState::new();
+        let provider_message = "provider returned HTTP 400: a very detailed response body";
+        state.reduce(AgentEvent::Error(ri_core::AgentError::new(
+            provider_message,
+        )));
+
+        let footer = footer_text(&state, 200, 0);
+        let text = footer
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.contains("error — see transcript"));
+        assert!(!text.contains(provider_message));
+        assert!(text.len() < 120);
     }
 
     fn buffer_contains(buffer: &Buffer, needle: &str) -> bool {

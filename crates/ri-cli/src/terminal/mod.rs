@@ -4,6 +4,7 @@ use std::sync::Once;
 
 use anyhow::Result;
 use crossterm::cursor::Show;
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -22,6 +23,8 @@ pub struct TerminalGuard {
 pub(crate) trait TerminalModeOps {
     fn enable_raw(&mut self) -> io::Result<()>;
     fn enter_alternate(&mut self) -> io::Result<()>;
+    fn enable_mouse_capture(&mut self) -> io::Result<()>;
+    fn disable_mouse_capture(&mut self) -> io::Result<()>;
     fn leave_alternate(&mut self) -> io::Result<()>;
     fn disable_raw(&mut self) -> io::Result<()>;
     fn show_cursor(&mut self) -> io::Result<()>;
@@ -38,6 +41,14 @@ impl TerminalModeOps for CrosstermModeOps {
 
     fn enter_alternate(&mut self) -> io::Result<()> {
         execute!(io::stdout(), EnterAlternateScreen)
+    }
+
+    fn enable_mouse_capture(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), EnableMouseCapture)
+    }
+
+    fn disable_mouse_capture(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), DisableMouseCapture)
     }
 
     fn leave_alternate(&mut self) -> io::Result<()> {
@@ -61,6 +72,7 @@ struct TerminalModeGuard<O: TerminalModeOps> {
     ops: O,
     raw_enabled: bool,
     alternate_screen: bool,
+    mouse_capture: bool,
 }
 
 impl<O> TerminalModeGuard<O>
@@ -72,6 +84,7 @@ where
             ops,
             raw_enabled: false,
             alternate_screen: false,
+            mouse_capture: false,
         }
     }
 
@@ -89,8 +102,14 @@ where
         Ok(())
     }
 
+    fn enable_mouse_capture(&mut self) -> io::Result<()> {
+        self.ops.enable_mouse_capture()?;
+        self.mouse_capture = true;
+        Ok(())
+    }
+
     fn restore(&mut self) -> io::Result<()> {
-        if !self.raw_enabled && !self.alternate_screen {
+        if !self.raw_enabled && !self.alternate_screen && !self.mouse_capture {
             return Ok(());
         }
 
@@ -99,11 +118,15 @@ where
         if !TERMINAL_MODE_ACTIVE.load(Ordering::Acquire) {
             self.raw_enabled = false;
             self.alternate_screen = false;
+            self.mouse_capture = false;
             return Ok(());
         }
 
         let mut first_error = None;
         record_cleanup(&mut first_error, self.ops.show_cursor());
+        if self.mouse_capture {
+            record_cleanup(&mut first_error, self.ops.disable_mouse_capture());
+        }
         if self.alternate_screen {
             record_cleanup(&mut first_error, self.ops.leave_alternate());
         }
@@ -114,6 +137,7 @@ where
 
         self.raw_enabled = false;
         self.alternate_screen = false;
+        self.mouse_capture = false;
         TERMINAL_MODE_ACTIVE.store(false, Ordering::Release);
         first_error.map_or(Ok(()), Err)
     }
@@ -160,6 +184,7 @@ fn emergency_restore_with<O: TerminalModeOps>(ops: &mut O) {
     // Each operation is independent so one failed terminal transition cannot
     // prevent the remaining emergency cleanup or the original panic report.
     let _ = ops.show_cursor();
+    let _ = ops.disable_mouse_capture();
     let _ = ops.leave_alternate();
     let _ = ops.disable_raw();
     let _ = ops.flush();
@@ -171,6 +196,7 @@ impl TerminalGuard {
         let mut mode = TerminalModeGuard::new(CrosstermModeOps);
         mode.enable_raw()?;
         mode.enter_alternate()?;
+        mode.enable_mouse_capture()?;
 
         let stdout = io::stdout();
         let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
@@ -241,6 +267,14 @@ mod tests {
             self.call("enter_alternate")
         }
 
+        fn enable_mouse_capture(&mut self) -> io::Result<()> {
+            self.call("enable_mouse_capture")
+        }
+
+        fn disable_mouse_capture(&mut self) -> io::Result<()> {
+            self.call("disable_mouse_capture")
+        }
+
         fn leave_alternate(&mut self) -> io::Result<()> {
             self.call("leave_alternate")
         }
@@ -262,6 +296,7 @@ mod tests {
         let mut guard = TerminalModeGuard::new(FakeModeOps::default());
         guard.enable_raw().unwrap();
         guard.enter_alternate().unwrap();
+        guard.enable_mouse_capture().unwrap();
         guard
     }
 
@@ -275,7 +310,9 @@ mod tests {
             vec![
                 "enable_raw",
                 "enter_alternate",
+                "enable_mouse_capture",
                 "show_cursor",
+                "disable_mouse_capture",
                 "leave_alternate",
                 "disable_raw",
                 "flush"
@@ -300,6 +337,7 @@ mod tests {
         let mut guard = TerminalModeGuard::new(FakeModeOps::default().fail_on("leave_alternate"));
         guard.enable_raw().unwrap();
         guard.enter_alternate().unwrap();
+        guard.enable_mouse_capture().unwrap();
 
         assert!(guard.restore().is_err());
         assert_eq!(
@@ -307,7 +345,9 @@ mod tests {
             vec![
                 "enable_raw",
                 "enter_alternate",
+                "enable_mouse_capture",
                 "show_cursor",
+                "disable_mouse_capture",
                 "leave_alternate",
                 "disable_raw",
                 "flush"
@@ -344,6 +384,29 @@ mod tests {
     }
 
     #[test]
+    fn failed_mouse_capture_restores_alternate_screen_and_raw_mode() {
+        let _lock = terminal_test_lock();
+        let mut guard =
+            TerminalModeGuard::new(FakeModeOps::default().fail_on("enable_mouse_capture"));
+        guard.enable_raw().unwrap();
+        guard.enter_alternate().unwrap();
+        assert!(guard.enable_mouse_capture().is_err());
+        assert!(guard.restore().is_ok());
+        assert_eq!(
+            guard.ops.calls,
+            vec![
+                "enable_raw",
+                "enter_alternate",
+                "enable_mouse_capture",
+                "show_cursor",
+                "leave_alternate",
+                "disable_raw",
+                "flush"
+            ]
+        );
+    }
+
+    #[test]
     fn panic_restore_attempts_all_steps_even_after_an_error() {
         let _lock = terminal_test_lock();
         TERMINAL_MODE_ACTIVE.store(true, Ordering::Release);
@@ -351,7 +414,13 @@ mod tests {
         emergency_restore_with(&mut ops);
         assert_eq!(
             ops.calls,
-            vec!["show_cursor", "leave_alternate", "disable_raw", "flush"]
+            vec![
+                "show_cursor",
+                "disable_mouse_capture",
+                "leave_alternate",
+                "disable_raw",
+                "flush"
+            ]
         );
         assert!(!TERMINAL_MODE_ACTIVE.load(Ordering::Acquire));
     }

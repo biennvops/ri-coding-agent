@@ -16,17 +16,21 @@ use ri_core::{
 };
 use tokio::sync::mpsc;
 
+use crate::commands::{
+    command_help, command_spec, CommandArgument, CommandKind, CommandSuggestions,
+};
 use crate::input::{self, Action};
 use crate::json_output::{JsonEmitter, RunStartedData};
 use crate::model_selection::resolve_model;
 use crate::redraw::{RedrawScheduler, RedrawUrgency};
-use crate::render::TuiRenderer;
+use crate::render::{TranscriptScroll, TuiRenderer};
 use crate::signals::ShutdownSignals;
 use crate::terminal::TerminalGuard;
 
 const COMMAND_CHANNEL_CAPACITY: usize = 16;
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 const MAX_AGENT_EVENTS_PER_FRAME: usize = 64;
+const MOUSE_SCROLL_ROWS: usize = 3;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Options {
@@ -131,8 +135,9 @@ impl Options {
              Model:\n  --provider <id>                 select a configured provider\n  --model <id>                   select a configured model\n\n\
              Sessions:\n  -c, --continue                 continue the newest saved session\n  -r, --resume                   choose a saved session interactively\n  --session <id-or-path>         resume one saved session\n  --no-session                   disable session persistence\n\n\
              Context and help:\n  --no-context                   disable AGENTS context loading\n  -h, --help                    show this help\n  -V, --version                 show the version\n\n\
-             Interactive commands:\n  /model                         open the model picker\n  /model <provider/model>        select a model directly\n  /new                           create a new session\n  /resume                        choose a saved session\n  /name [name]                   show or set the session name\n  /session                       show session details\n  /compact                       compact the current context\n  /quit                          exit the TUI\n\n\
-             Environment:\n  RI_LOG=error|warn|info|debug|trace  write private diagnostic logs"
+             Interactive commands:\n{}\n\n\
+             Environment:\n  RI_LOG=error|warn|info|debug|trace  write private diagnostic logs",
+            command_help()
         );
     }
 }
@@ -779,7 +784,7 @@ async fn run_tui_loop(
 ) -> Result<()> {
     let mut redraw = RedrawScheduler::new(Duration::from_millis(12));
     redraw.request(RedrawUrgency::Immediate, Instant::now());
-    let mut scroll_from_bottom = 0usize;
+    let mut scroll = TranscriptScroll::default();
     let mut editor_width = terminal
         .terminal_mut()
         .size()
@@ -788,22 +793,17 @@ async fn run_tui_loop(
         .saturating_sub(2)
         .max(1) as usize;
     let mut preferred_column = None;
+    let mut suggestions = CommandSuggestions::default();
     let mut terminal_events = EventStream::new();
     let mut exit = false;
     let mut shutdown_source_closed = false;
 
     while !exit {
         if redraw.take_ready(Instant::now()) {
-            drain_ready_agent_events(
-                state,
-                event_rx,
-                &setup.context,
-                &mut scroll_from_bottom,
-                &mut redraw,
-            )?;
+            drain_ready_agent_events(state, event_rx, &setup.context, &mut redraw)?;
             redraw.mark_drawn();
             renderer
-                .draw(terminal.terminal_mut(), state, scroll_from_bottom)
+                .draw_interactive(terminal.terminal_mut(), state, &mut scroll, &suggestions)
                 .context("could not render terminal")?;
             state.acknowledge_transcript_changes();
         }
@@ -831,6 +831,7 @@ async fn run_tui_loop(
                             }
                             match action {
                                 Action::Submit => {
+                                    suggestions.accept(state);
                                     if is_slash_input(state.input()) {
                                         if state.is_busy() {
                                             state.add_system_message("a turn or compaction is already active");
@@ -847,7 +848,7 @@ async fn run_tui_loop(
                                             if matches!(outcome, SlashCommandOutcome::Quit) {
                                                 exit = true;
                                             }
-                                            scroll_from_bottom = 0;
+                                            scroll.follow_bottom();
                                         } else {
                                             let command = unknown_command_name(state.input()).to_owned();
                                             state.take_input();
@@ -857,12 +858,17 @@ async fn run_tui_loop(
                                         command_tx
                                             .try_send(AgentCommand::Submit { text })
                                             .context("could not send prompt to the agent")?;
-                                        scroll_from_bottom = 0;
+                                        scroll.follow_bottom();
                                     }
                                 }
                                 Action::Newline => state.insert_newline(),
+                                Action::Complete => {
+                                    suggestions.complete(state);
+                                }
                                 Action::Escape => {
-                                    if state.is_busy() {
+                                    if suggestions.is_visible(state) {
+                                        suggestions.dismiss(state);
+                                    } else if state.is_busy() {
                                         command_tx
                                             .try_send(AgentCommand::Cancel)
                                             .context("could not cancel the active operation")?;
@@ -882,28 +888,35 @@ async fn run_tui_loop(
                                 Action::Delete => state.delete(),
                                 Action::Left => state.move_left(),
                                 Action::Right => state.move_right(),
-                                Action::Up | Action::Down => {
-                                    let direction = if matches!(action, Action::Up) { -1 } else { 1 };
-                                    if let Some((cursor, desired_column)) = renderer.move_editor_vertical(
-                                        state,
-                                        editor_width,
-                                        state.cursor(),
-                                        direction,
-                                        preferred_column,
-                                    ) {
-                                        state.set_cursor(cursor);
-                                        preferred_column = Some(desired_column);
-                                    }
-                                }
+                                Action::Up | Action::Down => move_editor_or_suggestion(
+                                    action,
+                                    state,
+                                    renderer,
+                                    editor_width,
+                                    &mut preferred_column,
+                                    &mut suggestions,
+                                ),
                                 Action::Home => state.move_home(),
                                 Action::End => state.move_end(),
                                 Action::PageUp => {
-                                    scroll_from_bottom = scroll_from_bottom.saturating_add(10)
+                                    scroll.scroll_up(renderer.transcript_page_rows())
                                 }
                                 Action::PageDown => {
-                                    scroll_from_bottom = scroll_from_bottom.saturating_sub(10)
+                                    scroll.scroll_down(renderer.transcript_page_rows())
                                 }
+                                Action::MouseScrollUp => scroll.scroll_up(MOUSE_SCROLL_ROWS),
+                                Action::MouseScrollDown => scroll.scroll_down(MOUSE_SCROLL_ROWS),
                             }
+                        }
+                    }
+                    Event::Mouse(mouse) => {
+                        if let Some(action) = input::action_for_mouse(mouse) {
+                            match action {
+                                Action::MouseScrollUp => scroll.scroll_up(MOUSE_SCROLL_ROWS),
+                                Action::MouseScrollDown => scroll.scroll_down(MOUSE_SCROLL_ROWS),
+                                _ => unreachable!("mouse input only maps to mouse actions"),
+                            }
+                            redraw.request(RedrawUrgency::Immediate, Instant::now());
                         }
                     }
                     Event::Resize(width, _) => {
@@ -917,12 +930,7 @@ async fn run_tui_loop(
             agent_event = event_rx.recv() => {
                 let event = agent_event
                     .ok_or_else(|| anyhow!("agent event stream disconnected"))?;
-                let urgency = apply_agent_event(
-                    event,
-                    state,
-                    &setup.context,
-                    &mut scroll_from_bottom,
-                );
+                let urgency = apply_agent_event(event, state, &setup.context);
                 redraw.request(urgency, Instant::now());
             }
         }
@@ -931,15 +939,42 @@ async fn run_tui_loop(
     Ok(())
 }
 
+fn move_editor_or_suggestion(
+    action: Action,
+    state: &mut AppState,
+    renderer: &mut TuiRenderer,
+    editor_width: usize,
+    preferred_column: &mut Option<usize>,
+    suggestions: &mut CommandSuggestions,
+) {
+    if suggestions.is_visible(state) {
+        if matches!(action, Action::Up) {
+            suggestions.move_up(state);
+        } else {
+            suggestions.move_down(state);
+        }
+        *preferred_column = None;
+        return;
+    }
+
+    let direction = if matches!(action, Action::Up) { -1 } else { 1 };
+    if let Some((cursor, desired_column)) = renderer.move_editor_vertical(
+        state,
+        editor_width,
+        state.cursor(),
+        direction,
+        *preferred_column,
+    ) {
+        state.set_cursor(cursor);
+        *preferred_column = Some(desired_column);
+    }
+}
+
 fn apply_agent_event(
     event: AgentEvent,
     state: &mut AppState,
     context: &ContextBundle,
-    scroll_from_bottom: &mut usize,
 ) -> RedrawUrgency {
-    if matches!(event, AgentEvent::TurnFinished { .. }) {
-        *scroll_from_bottom = 0;
-    }
     let urgency = redraw_urgency(&event);
     log_agent_event(&event);
     let session_loaded = matches!(event, AgentEvent::SessionLoaded { .. });
@@ -954,13 +989,12 @@ fn drain_ready_agent_events(
     state: &mut AppState,
     event_rx: &mut mpsc::Receiver<AgentEvent>,
     context: &ContextBundle,
-    scroll_from_bottom: &mut usize,
     redraw: &mut RedrawScheduler,
 ) -> Result<()> {
     for _ in 0..MAX_AGENT_EVENTS_PER_FRAME {
         match event_rx.try_recv() {
             Ok(event) => {
-                let urgency = apply_agent_event(event, state, context, scroll_from_bottom);
+                let urgency = apply_agent_event(event, state, context);
                 redraw.request(urgency, Instant::now());
             }
             Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
@@ -1061,33 +1095,25 @@ fn unknown_command_name(input: &str) -> &str {
 }
 
 fn slash_command(input: &str) -> Option<SlashCommand> {
-    let input = input.trim();
-    if input == "/model" {
-        return Some(SlashCommand::Model(None));
+    let mut parts = input.trim().splitn(2, char::is_whitespace);
+    let name = parts.next()?.strip_prefix('/')?;
+    let argument = parts
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let spec = command_spec(name)?;
+    if argument.is_some() && matches!(spec.argument, CommandArgument::None) {
+        return None;
     }
-    if let Some(argument) = input.strip_prefix("/model ") {
-        return argument
-            .trim()
-            .is_empty()
-            .then_some(SlashCommand::Model(None))
-            .or_else(|| Some(SlashCommand::Model(Some(argument.trim().to_owned()))));
-    }
-    if input == "/quit" {
-        Some(SlashCommand::Quit)
-    } else if input == "/compact" {
-        Some(SlashCommand::Compact)
-    } else if input == "/new" {
-        Some(SlashCommand::New)
-    } else if input == "/resume" {
-        Some(SlashCommand::Resume)
-    } else if input == "/session" {
-        Some(SlashCommand::Session)
-    } else if input == "/name" {
-        Some(SlashCommand::Name(None))
-    } else {
-        input
-            .strip_prefix("/name ")
-            .map(|argument| SlashCommand::Name(Some(argument.trim().to_owned())))
+
+    match spec.kind {
+        CommandKind::Model => Some(SlashCommand::Model(argument.map(str::to_owned))),
+        CommandKind::New => Some(SlashCommand::New),
+        CommandKind::Resume => Some(SlashCommand::Resume),
+        CommandKind::Name => Some(SlashCommand::Name(argument.map(str::to_owned))),
+        CommandKind::Session => Some(SlashCommand::Session),
+        CommandKind::Compact => Some(SlashCommand::Compact),
+        CommandKind::Quit => Some(SlashCommand::Quit),
     }
 }
 
@@ -1377,11 +1403,16 @@ fn log_agent_event(event: &AgentEvent) {
             reason = crate::json_output::stop_reason_name(reason),
             "turn finished"
         ),
-        AgentEvent::Error(error) => tracing::error!(
-            target: "ri",
-            message_bytes = error.message.len(),
-            "agent error"
-        ),
+        AgentEvent::Error(error) => {
+            let (error_kind, http_status) = agent_error_metadata(&error.message);
+            tracing::error!(
+                target: "ri",
+                error_kind,
+                http_status,
+                message_bytes = error.message.len(),
+                "agent error"
+            );
+        }
         AgentEvent::AssistantTextDelta { .. }
         | AgentEvent::AssistantTextItem { .. }
         | AgentEvent::AssistantRefusalDelta { .. }
@@ -1394,6 +1425,25 @@ fn log_agent_event(event: &AgentEvent) {
         | AgentEvent::ContextLimitsUpdated(_)
         | AgentEvent::SessionLoaded { .. } => {}
     }
+}
+
+fn agent_error_metadata(message: &str) -> (&'static str, Option<u16>) {
+    let http_status = message
+        .strip_prefix("provider returned HTTP ")
+        .and_then(|rest| rest.split_once(':').map(|(status, _)| status))
+        .and_then(|status| status.parse().ok());
+    let kind = if http_status.is_some() {
+        "provider_http"
+    } else if message.starts_with("provider context window exceeded") {
+        "context_overflow"
+    } else if message.starts_with("provider returned malformed streaming data") {
+        "provider_malformed"
+    } else if message.starts_with("provider request failed") {
+        "provider_failed"
+    } else {
+        "runtime"
+    };
+    (kind, http_status)
 }
 
 #[cfg(test)]
@@ -1613,6 +1663,18 @@ mod tests {
     }
 
     #[test]
+    fn agent_error_logging_metadata_identifies_provider_http_failures() {
+        assert_eq!(
+            agent_error_metadata("provider returned HTTP 400: {\"error\":\"bad\"}"),
+            ("provider_http", Some(400))
+        );
+        assert_eq!(
+            agent_error_metadata("provider request failed: connection refused"),
+            ("provider_failed", None)
+        );
+    }
+
+    #[test]
     fn recognizes_direct_model_quit_and_unknown_commands() {
         assert!(matches!(
             slash_command("/compact"),
@@ -1625,8 +1687,75 @@ mod tests {
             Some(Some("custom/coding".to_owned()))
         );
         assert_eq!(model_command("/modelish"), None);
+        assert!(matches!(
+            slash_command("/name dogfood session"),
+            Some(SlashCommand::Name(Some(name))) if name == "dogfood session"
+        ));
+        assert!(slash_command("/quit now").is_none());
         assert!(is_slash_input(" /compcat"));
         assert_eq!(unknown_command_name(" /compcat extra"), "/compcat");
+    }
+
+    #[test]
+    fn accepting_a_suggestion_produces_an_executable_slash_command() {
+        let mut state = AppState::new();
+        state.insert_text("/m");
+        let suggestions = CommandSuggestions::default();
+
+        assert!(suggestions.accept(&mut state));
+        assert_eq!(model_command(state.input()), Some(None));
+    }
+
+    #[test]
+    fn vertical_actions_navigate_suggestions_or_move_the_editor() {
+        let mut state = AppState::new();
+        state.insert_text("/");
+        let mut renderer = TuiRenderer::new();
+        let mut suggestions = CommandSuggestions::default();
+        let mut preferred_column = Some(3);
+        let cursor = state.cursor();
+
+        move_editor_or_suggestion(
+            Action::Down,
+            &mut state,
+            &mut renderer,
+            20,
+            &mut preferred_column,
+            &mut suggestions,
+        );
+        assert_eq!(suggestions.selected(&state), 1);
+        assert_eq!(state.cursor(), cursor);
+        assert_eq!(preferred_column, None);
+
+        state.set_input("one\ntwo".to_owned());
+        move_editor_or_suggestion(
+            Action::Up,
+            &mut state,
+            &mut renderer,
+            20,
+            &mut preferred_column,
+            &mut suggestions,
+        );
+        assert!(state.cursor() < state.input().len());
+    }
+
+    #[test]
+    fn turn_completion_does_not_reset_manual_scrollback() {
+        let mut state = AppState::new();
+        let context = ContextBundle::disabled(PathBuf::new(), PathBuf::new());
+        let mut scroll = TranscriptScroll::default();
+        scroll.update_maximum(100);
+        scroll.scroll_up(20);
+
+        apply_agent_event(
+            AgentEvent::TurnFinished {
+                reason: StopReason::Stop,
+            },
+            &mut state,
+            &context,
+        );
+
+        assert_eq!(scroll.from_bottom(), 20);
     }
 
     #[test]
@@ -1660,16 +1789,9 @@ mod tests {
 
         let mut state = AppState::new();
         let context = ContextBundle::disabled(PathBuf::new(), PathBuf::new());
-        let mut scroll_from_bottom = 0;
         let mut redraw = RedrawScheduler::new(Duration::from_millis(12));
-        drain_ready_agent_events(
-            &mut state,
-            &mut event_rx,
-            &context,
-            &mut scroll_from_bottom,
-            &mut redraw,
-        )
-        .expect("draining ready agent events should succeed");
+        drain_ready_agent_events(&mut state, &mut event_rx, &context, &mut redraw)
+            .expect("draining ready agent events should succeed");
 
         assert_eq!(
             state

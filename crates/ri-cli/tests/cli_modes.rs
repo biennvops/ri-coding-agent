@@ -347,6 +347,29 @@ fn json_logging_keeps_stdout_parseable_and_redacts_configured_secrets() {
 }
 
 #[test]
+fn provider_failure_logs_sanitized_http_diagnostics() {
+    let _lock = cli_test_lock();
+    let secret = "super-secret-api-key-123";
+    let body = r#"{"error":{"message":"invalid request for prompt hello and super-secret-api-key-123","api_key":"super-secret-api-key-123"},"prompt":"private prompt"}"#;
+    let fixture = Fixture::with_response_and_api_key("400 Bad Request", body, Some(secret));
+    let output = fixture.run_with_log(&["-p", "hello", "--no-session", "--no-context"], "debug");
+
+    assert_eq!(output.status.code(), Some(1));
+    let log = read_single_log(&fixture.home);
+    assert!(log.contains("provider HTTP request failed"));
+    assert!(log.contains("provider=test"));
+    assert!(log.contains("model=model"));
+    assert!(log.contains("api=openai-completions"));
+    assert!(log.contains("status=400"));
+    assert!(log.contains("error_body_truncated=false"));
+    assert!(log.contains("invalid request"));
+    assert!(!log.contains("hello"));
+    assert!(!log.contains(secret));
+    assert!(!log.contains("private prompt"));
+    fixture.finish();
+}
+
+#[test]
 fn malformed_models_and_settings_fail_before_runtime_setup() {
     let _lock = cli_test_lock();
     let home = unique_dir("cli-config-errors");

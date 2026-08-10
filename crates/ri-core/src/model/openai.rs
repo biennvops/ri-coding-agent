@@ -15,6 +15,26 @@ use super::{
     ModelResponse, ModelThinking, ModelToolCall, ProviderError, StopReason, ToolDefinition, Usage,
 };
 
+const MAX_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_ERROR_LOG_BYTES: usize = 2 * 1024;
+const ERROR_RESPONSE_TRUNCATED_MARKER: &str = "\n[… provider error body truncated …]";
+const REDACTED_DIAGNOSTIC_CONTENT: &str = "<redacted>";
+
+struct ProviderErrorBody {
+    content: String,
+    truncated: bool,
+}
+
+impl ProviderErrorBody {
+    fn user_message(&self) -> String {
+        let mut message = self.content.clone();
+        if self.truncated {
+            message.push_str(ERROR_RESPONSE_TRUNCATED_MARKER);
+        }
+        message
+    }
+}
+
 #[derive(Clone)]
 pub struct OpenAiProvider {
     selected: Arc<RwLock<ResolvedModel>>,
@@ -122,13 +142,30 @@ impl ModelProvider for OpenAiProvider {
             target: "ri_core::model",
             provider = %model.model_ref.provider,
             model = %model.model_ref.model,
+            api = %model.api,
             status = response.status().as_u16(),
             "provider response received"
         );
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let message = read_error_body(response, cancel.clone()).await?;
-            if is_context_overflow(status, &message) {
+            let error_body = read_error_body(response, cancel.clone()).await?;
+            if tracing::enabled!(target: "ri_core::model", tracing::Level::WARN) {
+                let diagnostic = provider_error_diagnostic(&error_body, &model, &request);
+                tracing::warn!(
+                    target: "ri_core::model",
+                    provider = %model.model_ref.provider,
+                    model = %model.model_ref.model,
+                    api = %model.api,
+                    status,
+                    error_body_bytes = error_body.content.len(),
+                    error_body_truncated = error_body.truncated,
+                    error_body = %diagnostic,
+                    "provider HTTP request failed"
+                );
+            }
+            let context_overflow = is_context_overflow(status, &error_body.content);
+            let message = error_body.user_message();
+            if context_overflow {
                 return Err(ProviderError::ContextOverflow { message });
             }
             return Err(ProviderError::Http { status, message });
@@ -244,10 +281,10 @@ fn is_context_overflow(status: u16, message: &str) -> bool {
 async fn read_error_body(
     response: reqwest::Response,
     cancel: CancellationToken,
-) -> Result<String, ProviderError> {
-    const MAX_ERROR_BYTES: usize = 64 * 1024;
+) -> Result<ProviderErrorBody, ProviderError> {
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
+    let mut truncated = false;
 
     while let Some(chunk) = tokio::select! {
         _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
@@ -256,14 +293,183 @@ async fn read_error_body(
         let chunk = chunk.map_err(|error| ProviderError::Failed {
             message: error.to_string(),
         })?;
-        let remaining = MAX_ERROR_BYTES.saturating_sub(bytes.len());
-        bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-        if bytes.len() == MAX_ERROR_BYTES {
+        let remaining = MAX_ERROR_RESPONSE_BYTES.saturating_sub(bytes.len());
+        if chunk.len() > remaining {
+            bytes.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
             break;
         }
+        bytes.extend_from_slice(&chunk);
     }
 
-    Ok(String::from_utf8_lossy(&bytes).trim().to_owned())
+    Ok(ProviderErrorBody {
+        content: String::from_utf8_lossy(&bytes).trim().to_owned(),
+        truncated,
+    })
+}
+
+fn provider_error_diagnostic(
+    error_body: &ProviderErrorBody,
+    model: &ResolvedModel,
+    request: &ModelRequest,
+) -> String {
+    let mut fragments = request_content_fragments(request);
+    fragments.extend(
+        model
+            .api_key
+            .iter()
+            .chain(model.headers.values())
+            .map(String::as_str),
+    );
+    fragments.retain(|fragment| !fragment.is_empty());
+    let diagnostic = match serde_json::from_str::<Value>(&error_body.content) {
+        Ok(mut value) => {
+            redact_json_strings(&mut value, &fragments);
+            redact_diagnostic_json(&mut value);
+            value.to_string()
+        }
+        Err(_) => escape_diagnostic_text(&redact_fragments(&error_body.content, &fragments)),
+    };
+
+    truncate_diagnostic(&diagnostic, error_body.content.len())
+}
+
+fn request_content_fragments(request: &ModelRequest) -> Vec<&str> {
+    let mut fragments = Vec::new();
+    for message in &request.messages {
+        match message {
+            ModelMessage::System { content }
+            | ModelMessage::Developer { content }
+            | ModelMessage::User { content }
+            | ModelMessage::ToolResult { content, .. } => fragments.push(content.as_str()),
+            ModelMessage::Assistant { items } => {
+                for item in items {
+                    match item {
+                        ModelAssistantItem::Text { content }
+                        | ModelAssistantItem::Refusal { content } => {
+                            fragments.push(content.as_str())
+                        }
+                        ModelAssistantItem::Reasoning(thinking) => {
+                            fragments.push(thinking.summary.as_str());
+                            fragments.push(thinking.content.as_str());
+                            if let Some(encrypted_content) = thinking.encrypted_content.as_deref() {
+                                fragments.push(encrypted_content);
+                            }
+                        }
+                        ModelAssistantItem::ToolCall(tool_call) => {
+                            fragments.push(tool_call.arguments.as_str());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for tool in &request.tools {
+        if let Some(description) = tool.description.as_deref() {
+            fragments.push(description);
+        }
+    }
+    fragments.retain(|fragment| !fragment.is_empty());
+    fragments
+}
+
+fn redact_json_strings(value: &mut Value, fragments: &[&str]) {
+    match value {
+        Value::Object(object) => {
+            for value in object.values_mut() {
+                redact_json_strings(value, fragments);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                redact_json_strings(value, fragments);
+            }
+        }
+        Value::String(text) => *text = redact_fragments(text, fragments),
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn redact_fragments(text: &str, fragments: &[&str]) -> String {
+    let mut redacted = String::with_capacity(text.len());
+    let mut start = 0;
+    while start < text.len() {
+        let next = fragments
+            .iter()
+            .filter_map(|fragment| {
+                text[start..]
+                    .find(fragment)
+                    .map(|offset| (start + offset, fragment.len()))
+            })
+            .min_by_key(|&(offset, length)| (offset, usize::MAX - length));
+        let Some((offset, length)) = next else {
+            redacted.push_str(&text[start..]);
+            break;
+        };
+        redacted.push_str(&text[start..offset]);
+        redacted.push_str(REDACTED_DIAGNOSTIC_CONTENT);
+        start = offset + length;
+    }
+    redacted
+}
+
+fn escape_diagnostic_text(text: &str) -> String {
+    text.chars()
+        .flat_map(|character| match character {
+            '\n' => "\\n".chars().collect::<Vec<_>>(),
+            '\r' => "\\r".chars().collect(),
+            character if character.is_control() => " ".chars().collect(),
+            character => vec![character],
+        })
+        .collect()
+}
+
+fn redact_diagnostic_json(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                if is_sensitive_diagnostic_key(key) {
+                    *value = Value::String("<redacted>".to_owned());
+                } else {
+                    redact_diagnostic_json(value);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                redact_diagnostic_json(value);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn is_sensitive_diagnostic_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase().replace('-', "_");
+    key.contains("api_key")
+        || key.contains("apikey")
+        || key.contains("authorization")
+        || key.contains("secret")
+        || key.contains("password")
+        || key.contains("credential")
+        || key.contains("access_token")
+        || key.contains("refresh_token")
+        || matches!(
+            key.as_str(),
+            "prompt" | "prompts" | "messages" | "input" | "tool_output" | "tool_outputs"
+        )
+}
+
+fn truncate_diagnostic(diagnostic: &str, original_bytes: usize) -> String {
+    if diagnostic.len() <= MAX_ERROR_LOG_BYTES {
+        return diagnostic.to_owned();
+    }
+    let marker = format!("… [diagnostic truncated; response {original_bytes} bytes]");
+    let mut end = MAX_ERROR_LOG_BYTES.saturating_sub(marker.len());
+    while end > 0 && !diagnostic.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &diagnostic[..end], marker)
 }
 
 #[derive(Default)]
@@ -2158,6 +2364,124 @@ mod tests {
             .expect_err("HTTP error should surface");
         assert!(matches!(error, ProviderError::Http { status: 401, .. }));
         assert!(error.to_string().contains("invalid API key"));
+        server.await.expect("test server should finish");
+    }
+
+    #[test]
+    fn provider_error_diagnostics_redact_credentials_and_prompt_fields() {
+        let mut model = test_model(ApiKind::OpenAiResponses, "https://example.test".to_owned());
+        model
+            .headers
+            .insert("X-Custom-Secret".to_owned(), "header-secret".to_owned());
+        let message = r#"{"error":{"message":"bad request for test-key and header-secret","api_key":"test-key"},"prompt":"private prompt"}"#;
+        let error_body = ProviderErrorBody {
+            content: message.to_owned(),
+            truncated: false,
+        };
+        let request = ModelRequest::single_user("unrelated request");
+
+        let diagnostic = provider_error_diagnostic(&error_body, &model, &request);
+
+        assert!(diagnostic.contains("bad request"));
+        assert!(!diagnostic.contains("test-key"));
+        assert!(!diagnostic.contains("header-secret"));
+        assert!(!diagnostic.contains("private prompt"));
+        assert!(diagnostic.contains("<redacted>"));
+    }
+
+    #[test]
+    fn provider_error_diagnostics_are_bounded_with_an_explicit_marker() {
+        let model = test_model(ApiKind::OpenAiResponses, "https://example.test".to_owned());
+        let message = format!(r#"{{"error":{{"message":"{}"}}}}"#, "x".repeat(8_000));
+        let error_body = ProviderErrorBody {
+            content: message.clone(),
+            truncated: false,
+        };
+        let request = ModelRequest::single_user("unrelated request");
+
+        let diagnostic = provider_error_diagnostic(&error_body, &model, &request);
+
+        assert!(diagnostic.len() <= MAX_ERROR_LOG_BYTES);
+        assert!(diagnostic.contains("diagnostic truncated"));
+        assert!(diagnostic.contains(&format!("response {} bytes", message.len())));
+    }
+
+    #[test]
+    fn provider_error_diagnostics_redact_request_content_in_json_and_plain_text() {
+        let model = test_model(ApiKind::OpenAiResponses, "https://example.test".to_owned());
+        let user_prompt = "full private user prompt";
+        let tool_output = "full private tool output";
+        let request = ModelRequest {
+            messages: vec![
+                ModelMessage::user(user_prompt),
+                ModelMessage::ToolResult {
+                    tool_call_id: "call-1".to_owned(),
+                    tool_name: "read".to_owned(),
+                    content: tool_output.to_owned(),
+                },
+            ],
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: None,
+            sampling_params: BTreeMap::new(),
+        };
+        for content in [
+            format!(
+                r#"{{"error":{{"message":"invalid prompt: {user_prompt}; output: {tool_output}"}}}}"#
+            ),
+            format!("invalid prompt: {user_prompt}; output: {tool_output}"),
+        ] {
+            let error_body = ProviderErrorBody {
+                content,
+                truncated: false,
+            };
+            let diagnostic = provider_error_diagnostic(&error_body, &model, &request);
+            assert!(!diagnostic.contains(user_prompt));
+            assert!(!diagnostic.contains(tool_output));
+            assert!(diagnostic.contains(REDACTED_DIAGNOSTIC_CONTENT));
+        }
+    }
+
+    #[test]
+    fn truncated_provider_error_keeps_metadata_outside_sanitized_json() {
+        let model = test_model(ApiKind::OpenAiResponses, "https://example.test".to_owned());
+        let error_body = ProviderErrorBody {
+            content: r#"{"error":{"message":"bad request"},"prompt":"private prompt"}"#.to_owned(),
+            truncated: true,
+        };
+        let request = ModelRequest::single_user("unrelated request");
+
+        let diagnostic = provider_error_diagnostic(&error_body, &model, &request);
+
+        assert!(diagnostic.contains("bad request"));
+        assert!(!diagnostic.contains("private prompt"));
+        assert!(error_body
+            .user_message()
+            .ends_with(ERROR_RESPONSE_TRUNCATED_MARKER));
+    }
+
+    #[tokio::test]
+    async fn provider_error_response_body_is_bounded_with_an_explicit_marker() {
+        let body = "x".repeat(MAX_ERROR_RESPONSE_BYTES + 1_024);
+        let (base_url, server) = spawn_sse_server("400 Bad Request", &body).await;
+        let provider = OpenAiProvider::new(test_model(ApiKind::OpenAiResponses, base_url))
+            .expect("provider should build");
+        let (tx, _rx) = mpsc::channel(4);
+
+        let error = provider
+            .stream(
+                ModelRequest::single_user("hello"),
+                tx,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("HTTP error should surface");
+
+        let ProviderError::Http { message, .. } = error else {
+            panic!("expected HTTP error");
+        };
+        assert!(message.len() <= MAX_ERROR_RESPONSE_BYTES + ERROR_RESPONSE_TRUNCATED_MARKER.len());
+        assert!(message.ends_with(ERROR_RESPONSE_TRUNCATED_MARKER));
         server.await.expect("test server should finish");
     }
 

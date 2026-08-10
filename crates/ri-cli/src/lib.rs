@@ -1,4 +1,5 @@
 pub mod app;
+mod commands;
 pub mod input;
 pub mod json_output;
 pub mod logging;
