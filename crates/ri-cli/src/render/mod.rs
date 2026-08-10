@@ -1065,7 +1065,6 @@ fn footer_text(state: &AppState, width: u16, scroll_from_bottom: usize) -> Line<
         .active_model()
         .map(ModelRef::display_name)
         .unwrap_or_else(|| "no model".to_owned());
-    let thinking = state.thinking_level().map(|level| format!("think {level}"));
     let session = state
         .session_info()
         .map(|info| format!("session: {}", info.display_name()))
