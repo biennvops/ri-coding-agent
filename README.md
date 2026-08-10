@@ -12,6 +12,7 @@ The current baseline is intended for dogfooding. It is not a hosted service and 
 - hierarchical `AGENTS.md` context
 - persistent JSONL sessions, resume, crash repair, and compaction
 - interactive model picker and recent-model state
+- anchored transcript scrollback and slash-command suggestions
 - plain print mode and versioned JSON streaming mode
 - private file logging through `RI_LOG`
 
@@ -80,7 +81,11 @@ The project file is relative to the discovered project root. CLI model selection
 ri
 ```
 
-Useful commands include `/model`, `/new`, `/resume`, `/name [name]`, `/session`, `/compact`, and `/quit`. `Esc` cancels an active operation; `Ctrl+C` cancels a busy turn and exits when the TUI is idle.
+Useful commands include `/model`, `/new`, `/resume`, `/name [name]`, `/session`, `/compact`, and `/quit`. Type `/` while the agent is idle to show command suggestions, use Up/Down to select one, Tab to complete it, or Esc to dismiss the suggestions without clearing the input.
+
+Use PgUp/PgDn or Ctrl+U/Ctrl+D to move through transcript scrollback; mouse-wheel and trackpad scrolling are also supported. The footer shows the distance from the latest output while scrolled upward. Streaming output follows the bottom only when the viewport is already at the bottom, so new output and turn completion do not interrupt reading older content. Submitting a new prompt resumes following the latest output.
+
+`Esc` cancels an active operation when command suggestions are not visible. `Ctrl+C` cancels a busy turn and exits when the TUI is idle.
 
 ## Sessions
 
@@ -120,7 +125,14 @@ JSON mode emits versioned NDJSON records on stdout. Every stdout line is JSON; d
 
 ## Logging
 
-Set `RI_LOG` to `error`, `warn`, `info`, `debug`, or `trace` (target filters are also supported) to write private diagnostics under `~/.ri/agent/logs`. Logs redact configured credentials and do not contain complete prompts or tool output. Logging failures are diagnostic warnings and do not change agent semantics.
+Enable diagnostic logging before starting the run:
+
+```bash
+RI_LOG=debug ri
+RI_LOG=trace ri
+```
+
+Logs are written under `~/.ri/agent/logs/`. They are not generated retroactively, so a run started without `RI_LOG` cannot be diagnosed from a later log. Target filters and the `error`, `warn`, and `info` levels are also supported. Logs redact configured credentials and do not contain complete prompts or tool output; provider error diagnostics are sanitized and bounded. Logging failures are diagnostic warnings and do not change agent semantics.
 
 ## Configuration paths
 
@@ -155,7 +167,9 @@ Run these checks with a real configured provider after installation:
 - Resume: use `ri -c` and confirm the transcript, current context, and tools still work.
 - Model switch: use `/model`, switch models, and verify footer limits, compaction, and recent-model persistence.
 - Machine modes: pipe `ri -p`, `ri --json -p`, and their `-c` variants into another program; stdout must remain within its documented contract.
-- Forced failures: try a bad command, a missing file, and an intentionally invalid temporary credential; failures should be understandable and recoverable where applicable.
+- Scrollback: generate more than one screen of output, then verify PgUp/PgDn, Ctrl+U/Ctrl+D, mouse/trackpad scrolling, the footer indicator, and stable anchoring while new output streams.
+- Command suggestions: type `/` and `/mo`, then verify Up/Down, Tab, Esc, exact-command Enter behavior, and `/model` and `/name` arguments.
+- Forced failures: start with `RI_LOG=debug ri`, try a bad command, a missing file, and an intentionally invalid temporary credential, then verify the full provider error is in the transcript and the sanitized status/body diagnostic is in `~/.ri/agent/logs/`.
 
 A live provider smoke is deliberately manual. It is not part of CI and must be reported as skipped when no usable credentials or endpoint are configured.
 
