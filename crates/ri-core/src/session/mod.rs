@@ -1840,7 +1840,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn semantic_message_round_trip_preserves_reasoning_and_distinct_ids() {
+    fn semantic_message_round_trip_preserves_empty_reasoning_and_distinct_ids() {
         let message = ModelMessage::Assistant {
             items: vec![
                 ModelAssistantItem::Text {
@@ -1848,7 +1848,7 @@ mod tests {
                 },
                 ModelAssistantItem::Reasoning(ModelThinking {
                     item_id: Some("rs_1".to_owned()),
-                    summary: "summary".to_owned(),
+                    summary: String::new(),
                     content: "private reasoning".to_owned(),
                     encrypted_content: Some("encrypted".to_owned()),
                 }),
@@ -1865,6 +1865,7 @@ mod tests {
         let encoded = serde_json::to_string(&durable).unwrap();
         let decoded: SessionMessage = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded.into_model(), message);
+        assert!(encoded.contains(r#""summary":"""#));
         assert!(encoded.contains("call_123"));
         assert!(encoded.contains("fc_456"));
     }
