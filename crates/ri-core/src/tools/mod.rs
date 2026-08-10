@@ -173,6 +173,20 @@ pub(crate) fn bounded_preview<'a>(
     lines: impl Iterator<Item = (Option<char>, &'a str)>,
     total_lines: usize,
 ) -> String {
+    bounded_preview_with_limits(
+        lines,
+        total_lines,
+        MAX_TOOL_PREVIEW_LINES,
+        MAX_TOOL_PREVIEW_BYTES,
+    )
+}
+
+pub(crate) fn bounded_preview_with_limits<'a>(
+    lines: impl Iterator<Item = (Option<char>, &'a str)>,
+    total_lines: usize,
+    max_lines: usize,
+    max_bytes: usize,
+) -> String {
     const TRUNCATED_MARKER: &str = "… content preview truncated …";
     const MARKER_RESERVE: usize = 64;
 
@@ -182,10 +196,10 @@ pub(crate) fn bounded_preview<'a>(
 
     let mut preview = String::new();
     let mut shown = 0usize;
-    for (prefix, line) in lines.take(MAX_TOOL_PREVIEW_LINES) {
+    for (prefix, line) in lines.take(max_lines) {
         let separator_bytes = usize::from(!preview.is_empty());
         let prefix_bytes = usize::from(prefix.is_some());
-        let content_limit = MAX_TOOL_PREVIEW_BYTES.saturating_sub(MARKER_RESERVE);
+        let content_limit = max_bytes.saturating_sub(MARKER_RESERVE);
         let available = content_limit
             .saturating_sub(preview.len())
             .saturating_sub(separator_bytes)
