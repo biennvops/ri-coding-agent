@@ -8,10 +8,7 @@ pub mod model;
 pub mod session;
 pub mod tools;
 
-pub use agent::{
-    AgentCommand, AgentError, AgentEvent, AgentRuntime, AgentRuntimeConfig,
-    MAX_TOOL_ROUNDS_PER_TURN,
-};
+pub use agent::{AgentCommand, AgentError, AgentEvent, AgentRuntime, AgentRuntimeConfig};
 pub use app::{
     AppState, MessageRole, StreamingAssistantState, ToolStatus, ToolTranscriptEntry,
     TranscriptEntry, TranscriptEntryId, TranscriptEntryState, TranscriptMessage,
