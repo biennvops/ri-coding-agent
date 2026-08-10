@@ -143,7 +143,7 @@ impl Options {
         println!(
             "ri — a small Rust coding agent\n\n\
              Usage:\n  ri                              start the interactive TUI\n  ri -p, --print <prompt>         run one prompt without the TUI\n  ri --json -p <prompt>           emit versioned NDJSON events\n\n\
-             Model:\n  --provider <id>                 select a configured provider\n  --model <id>                   select a configured model\n\n\
+             Model:\n  --provider <id>                 select a configured provider\n  --model <id>                   select a configured model\n  --thinking <level>              set reasoning level (off, minimal, low, medium, high, xhigh)\n\n\
              Sessions:\n  -c, --continue                 continue the newest saved session\n  -r, --resume                   choose a saved session interactively\n  --session <id-or-path>         resume one saved session\n  --no-session                   disable session persistence\n\n\
              Context and help:\n  --no-context                   disable AGENTS context loading\n  -h, --help                    show this help\n  -V, --version                 show the version\n\n\
              Interactive commands:\n{}\n\n\
@@ -222,6 +222,7 @@ struct AppSetup {
     initial_history: Vec<ModelMessage>,
     initial_transcript: Vec<ModelMessage>,
     compaction_enabled: bool,
+    reasoning_effort: Option<String>,
     resume_requested: bool,
     state_path: Option<std::path::PathBuf>,
     workspace_id: String,
@@ -272,6 +273,27 @@ impl AppSetup {
         }
         let selection_source = selection.source;
         let selected = selection.model;
+        let thinking_level = options
+            .thinking
+            .or(settings.settings.default_thinking_level);
+        if let Some(level) = thinking_level {
+            if level != ri_core::ThinkingLevel::Off
+                && selected.thinking_effort(level).is_none()
+                && options.thinking.is_some()
+            {
+                bail!(
+                    "{level} is not supported by {}; supported levels: {}",
+                    selected.model_ref.display_name(),
+                    selected
+                        .supported_thinking_levels()
+                        .into_iter()
+                        .map(|level| level.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
+        let reasoning_effort = thinking_level.and_then(|level| selected.thinking_effort(level));
         tracing::info!(
             target: "ri",
             provider = %selected.model_ref.provider,
@@ -374,6 +396,7 @@ impl AppSetup {
             initial_history,
             initial_transcript,
             compaction_enabled: settings.settings.compaction.enabled,
+            reasoning_effort,
             resume_requested,
             state_path,
             workspace_id,
@@ -406,6 +429,7 @@ impl AppSetup {
                 .as_ref()
                 .map(|session| SessionMode::Enabled(session.clone()))
                 .unwrap_or(SessionMode::Disabled),
+            reasoning_effort: self.reasoning_effort.clone(),
         }
     }
 
@@ -1483,6 +1507,7 @@ mod tests {
                 json: false,
                 provider: Some("custom".to_owned()),
                 model: Some("coding".to_owned()),
+                thinking: None,
                 no_context: false,
                 show_help: false,
                 continue_session: false,

@@ -105,6 +105,7 @@ impl ModelProvider for OpenAiProvider {
             api = %model.api,
             message_count = request.messages.len(),
             tool_count = request.tools.len(),
+            reasoning_effort = request.reasoning_effort.as_deref().unwrap_or("off"),
             "provider request started"
         );
         let (endpoint, body) = request_for(&model, &request)?;
@@ -2288,6 +2289,7 @@ mod tests {
                 ..Compatibility::default()
             },
             reasoning: false,
+            thinking_level_map: BTreeMap::new(),
             input: vec!["text".to_owned()],
             context_window: None,
             max_tokens: Some(123),
@@ -2350,6 +2352,7 @@ mod tests {
             auth_header: true,
             compatibility: Compatibility::default(),
             reasoning: false,
+            thinking_level_map: BTreeMap::new(),
             input: vec!["text".to_owned()],
             context_window: None,
             max_tokens: None,

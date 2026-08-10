@@ -156,6 +156,7 @@ pub struct AgentRuntimeConfig {
     pub base_messages: Vec<ModelMessage>,
     pub initial_history: Vec<ModelMessage>,
     pub session: SessionMode,
+    pub reasoning_effort: Option<String>,
 }
 
 impl AgentRuntimeConfig {
@@ -165,6 +166,7 @@ impl AgentRuntimeConfig {
             base_messages: Vec::new(),
             initial_history: Vec::new(),
             session: SessionMode::Disabled,
+            reasoning_effort: None,
         }
     }
 }
@@ -192,6 +194,7 @@ pub struct AgentRuntime<P> {
     base_messages: Vec<ModelMessage>,
     conversation: ConversationHistory,
     session: SessionMode,
+    reasoning_effort: Option<String>,
     compaction_enabled: bool,
 }
 
@@ -226,6 +229,7 @@ where
             base_messages: config.base_messages,
             conversation: ConversationHistory::from_provider_messages(config.initial_history),
             session: config.session,
+            reasoning_effort: config.reasoning_effort,
             compaction_enabled,
         }
     }
@@ -319,6 +323,7 @@ where
                             base_messages: self.base_messages.clone(),
                             initial_history: Vec::new(),
                             session: self.session.clone(),
+                            reasoning_effort: self.reasoning_effort.clone(),
                         };
                         let history = self.conversation.clone();
                         let turn_events = events.clone();
@@ -354,6 +359,7 @@ where
                             base_messages: self.base_messages.clone(),
                             initial_history: Vec::new(),
                             session: self.session.clone(),
+                            reasoning_effort: None,
                         };
                         let history = self.conversation.clone();
                         let compaction_events = events.clone();
@@ -602,7 +608,12 @@ where
             if cancel.is_cancelled() {
                 return turn_outcome(history, StopReason::Cancelled);
             }
-            let request = normal_request(&config.base_messages, &history, &tools);
+            let request = normal_request_with_effort(
+                &config.base_messages,
+                &history,
+                &tools,
+                config.reasoning_effort.clone(),
+            );
             let estimate = ConservativeTokenEstimator.estimate_request(&request);
             let _ = events.send(AgentEvent::ContextLimitsUpdated(limits)).await;
             let _ = events
@@ -826,6 +837,17 @@ where
             }
         }
     }
+}
+
+fn normal_request_with_effort(
+    base_messages: &[ModelMessage],
+    history: &ConversationHistory,
+    tools: &[crate::model::ToolDefinition],
+    reasoning_effort: Option<String>,
+) -> ModelRequest {
+    let mut request = normal_request(base_messages, history, tools);
+    request.reasoning_effort = reasoning_effort;
+    request
 }
 
 const COMPACTION_SYSTEM_INSTRUCTION: &str = "Summarize the earlier coding-agent conversation for future continuation.\n\nPreserve concrete technical state:\n- user goals and constraints\n- decisions and rationale that affect future work\n- files inspected or modified and important changes\n- important code architecture and interfaces\n- commands/tests and their significant results\n- important errors and attempted fixes\n- unresolved work and next steps\n- current task state\n- exact identifiers or values when they matter\n\nDo not invent work that did not happen.\nDo not copy large tool outputs verbatim.\nReturn only the continuation summary.";
@@ -1739,6 +1761,7 @@ mod tests {
                 base_messages: Vec::new(),
                 initial_history,
                 session: SessionMode::Enabled(handle.clone()),
+                reasoning_effort: None,
             },
         );
         let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
@@ -2333,6 +2356,7 @@ mod tests {
                 }],
                 initial_history: Vec::new(),
                 session: SessionMode::Enabled(handle.clone()),
+                reasoning_effort: None,
             },
         );
         let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
@@ -2385,6 +2409,7 @@ mod tests {
                 base_messages: Vec::new(),
                 initial_history: Vec::new(),
                 session: SessionMode::Enabled(handle),
+                reasoning_effort: None,
             },
         );
         let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
@@ -2430,6 +2455,7 @@ mod tests {
                 base_messages: Vec::new(),
                 initial_history: Vec::new(),
                 session: SessionMode::Enabled(handle.clone()),
+                reasoning_effort: None,
             },
         );
         let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
@@ -2536,6 +2562,7 @@ mod tests {
                 base_messages: vec![base.clone()],
                 initial_history: Vec::new(),
                 session: SessionMode::Disabled,
+                reasoning_effort: None,
             },
         );
         let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
@@ -2691,6 +2718,7 @@ mod tests {
                 base_messages: Vec::new(),
                 initial_history,
                 session: SessionMode::Disabled,
+                reasoning_effort: None,
             },
         );
         let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
@@ -2778,6 +2806,7 @@ mod tests {
                 base_messages: Vec::new(),
                 initial_history: initial_history.clone(),
                 session: SessionMode::Enabled(handle.clone()),
+                reasoning_effort: None,
             },
         );
         let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
@@ -2856,6 +2885,7 @@ mod tests {
                 base_messages: Vec::new(),
                 initial_history,
                 session: SessionMode::Enabled(handle.clone()),
+                reasoning_effort: None,
             },
         );
         let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
@@ -2909,6 +2939,7 @@ mod tests {
                 base_messages: Vec::new(),
                 initial_history,
                 session: SessionMode::Disabled,
+                reasoning_effort: None,
             },
         );
         let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
@@ -2971,6 +3002,7 @@ mod tests {
                 base_messages: Vec::new(),
                 initial_history,
                 session: SessionMode::Disabled,
+                reasoning_effort: None,
             },
         );
         let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
@@ -3055,6 +3087,7 @@ mod tests {
                 base_messages: Vec::new(),
                 initial_history,
                 session: SessionMode::Disabled,
+                reasoning_effort: None,
             },
         );
         let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
@@ -3133,6 +3166,7 @@ mod tests {
                 base_messages: Vec::new(),
                 initial_history,
                 session: SessionMode::Disabled,
+                reasoning_effort: None,
             },
         );
         let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
