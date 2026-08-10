@@ -12,6 +12,9 @@ use thiserror::Error;
 
 pub mod settings;
 mod state;
+mod thinking;
+
+pub use thinking::{ThinkingLevel, ThinkingLevelError};
 
 pub use settings::{
     default_settings_path, load_default_settings, load_settings_from_paths, project_settings_path,
@@ -104,11 +107,37 @@ pub struct ResolvedModel {
     pub auth_header: bool,
     pub compatibility: Compatibility,
     pub reasoning: bool,
+    pub thinking_level_map: BTreeMap<ThinkingLevel, Option<String>>,
     pub input: Vec<String>,
     pub context_window: Option<u64>,
     pub max_tokens: Option<u64>,
     pub cost: CostMetadata,
     pub sampling_params: BTreeMap<String, Value>,
+}
+
+impl ResolvedModel {
+    pub fn supported_thinking_levels(&self) -> Vec<ThinkingLevel> {
+        if !self.reasoning || !self.compatibility.supports_reasoning_effort {
+            return vec![ThinkingLevel::Off];
+        }
+        ThinkingLevel::ALL
+            .into_iter()
+            .filter(|level| self.thinking_effort(*level).is_some() || *level == ThinkingLevel::Off)
+            .collect()
+    }
+
+    pub fn thinking_effort(&self, level: ThinkingLevel) -> Option<String> {
+        if level == ThinkingLevel::Off
+            || !self.reasoning
+            || !self.compatibility.supports_reasoning_effort
+        {
+            return None;
+        }
+        self.thinking_level_map
+            .get(&level)
+            .cloned()
+            .unwrap_or_else(|| Some(level.to_string()))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -326,6 +355,11 @@ impl ModelCatalog {
                         .unwrap_or(provider_compat.supports_reasoning_effort),
                 };
                 let cost = model.cost.map(CostMetadata::from).unwrap_or_default();
+                let thinking_level_map = model
+                    .thinking_level_map
+                    .map(|map| parse_thinking_level_map(&provider_id, &model_id, map))
+                    .transpose()?
+                    .unwrap_or_default();
 
                 models.push(ResolvedModel {
                     model_ref: ModelRef::new(&provider_id, &model_id),
@@ -337,6 +371,7 @@ impl ModelCatalog {
                     auth_header: provider.auth_header.unwrap_or(true),
                     compatibility,
                     reasoning: model.reasoning,
+                    thinking_level_map,
                     input: model.input,
                     context_window: model.context_window,
                     max_tokens: model.max_tokens,
@@ -355,6 +390,28 @@ impl ModelCatalog {
 
         Ok(Self { models, warnings })
     }
+}
+
+fn parse_thinking_level_map(
+    provider: &str,
+    model: &str,
+    raw: BTreeMap<String, Option<String>>,
+) -> Result<BTreeMap<ThinkingLevel, Option<String>>, ConfigError> {
+    raw.into_iter()
+        .map(|(key, value)| {
+            let level = key.parse::<ThinkingLevel>().map_err(|_| {
+                ConfigError::Invalid(format!(
+                    "model {provider}/{model} thinkingLevelMap key {key:?} is invalid; expected off, minimal, low, medium, high, or xhigh"
+                ))
+            })?;
+            if value.as_deref().is_some_and(|value| value.trim().is_empty()) {
+                return Err(ConfigError::Invalid(format!(
+                    "model {provider}/{model} thinkingLevelMap.{key} must be a non-empty string or null"
+                )));
+            }
+            Ok((level, value))
+        })
+        .collect()
 }
 
 pub fn default_models_path() -> Option<PathBuf> {
@@ -503,6 +560,8 @@ struct RawModel {
     api: Option<String>,
     #[serde(default)]
     reasoning: bool,
+    #[serde(rename = "thinkingLevelMap", default)]
+    thinking_level_map: Option<BTreeMap<String, Option<String>>>,
     #[serde(default)]
     input: Vec<String>,
     #[serde(rename = "contextWindow", default)]
