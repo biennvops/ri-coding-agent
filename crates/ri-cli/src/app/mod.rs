@@ -484,6 +484,7 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
     state.replace_history(&setup.initial_transcript);
     state.set_session_info(session_info);
     state.reduce(AgentEvent::ModelChanged(setup.model_ref()));
+    state.set_thinking_level(setup.thinking_level);
     state.reduce(AgentEvent::ContextLimitsUpdated(setup.provider.limits()));
     let mut turn_reason = None;
     let mut output = io::stdout();
@@ -780,6 +781,7 @@ async fn run_tui(mut setup: AppSetup) -> Result<()> {
     }
     state.set_session_info(session_info);
     state.reduce(AgentEvent::ModelChanged(setup.model_ref()));
+    state.set_thinking_level(setup.thinking_level);
     state.reduce(AgentEvent::ContextLimitsUpdated(setup.provider.limits()));
     let mut renderer = TuiRenderer::new();
     let tui_result = run_tui_loop(
@@ -1328,6 +1330,7 @@ async fn handle_thinking_command(
     let effort = model.thinking_effort(level);
     setup.reasoning_effort = effort.clone();
     setup.thinking_level = Some(level);
+    state.set_thinking_level(Some(level));
     command_tx
         .send(AgentCommand::SetReasoningEffort { effort })
         .await
@@ -1394,6 +1397,7 @@ async fn handle_model_command(
                 setup.thinking_level = effective_level;
                 setup.reasoning_effort =
                     effective_level.and_then(|level| selected.thinking_effort(level));
+                state.set_thinking_level(effective_level);
                 setup.selected = Some(selected);
                 if let Some(previous_level) = previous_level {
                     if Some(previous_level) != effective_level {
