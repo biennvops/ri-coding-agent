@@ -1420,12 +1420,14 @@ fn responses_reasoning_item(thinking: &ModelThinking) -> Value {
     if let Some(item_id) = &thinking.item_id {
         value.insert("id".to_owned(), Value::String(item_id.clone()));
     }
-    if !thinking.summary.is_empty() {
-        value.insert(
-            "summary".to_owned(),
-            json!([{"type": "summary_text", "text": thinking.summary}]),
-        );
-    }
+    value.insert(
+        "summary".to_owned(),
+        if thinking.summary.is_empty() {
+            json!([])
+        } else {
+            json!([{"type": "summary_text", "text": thinking.summary}])
+        },
+    );
     if !thinking.content.is_empty() {
         value.insert(
             "content".to_owned(),
@@ -1534,9 +1536,10 @@ impl SseParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::{AgentCommand, AgentEvent, AgentRuntime};
     use crate::config::{Compatibility, CostMetadata, ModelRef};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
 
     #[test]
     fn sse_parser_handles_fragmented_events_and_multiline_data() {
@@ -1833,6 +1836,75 @@ mod tests {
                 arguments: "{}".to_owned(),
                 arguments_complete: false,
             }]
+        );
+    }
+
+    #[test]
+    fn responses_reasoning_item_includes_empty_summary_and_opaque_state() {
+        let value = responses_reasoning_item(&ModelThinking {
+            item_id: Some("rs_test".to_owned()),
+            summary: String::new(),
+            content: String::new(),
+            encrypted_content: Some("encrypted".to_owned()),
+        });
+
+        assert!(value.get("summary").is_some());
+        assert_eq!(value["summary"], json!([]));
+        assert_eq!(
+            value,
+            json!({
+                "type": "reasoning",
+                "id": "rs_test",
+                "summary": [],
+                "encrypted_content": "encrypted"
+            })
+        );
+    }
+
+    #[test]
+    fn responses_reasoning_item_preserves_non_empty_summary() {
+        let value = responses_reasoning_item(&ModelThinking {
+            summary: "Inspecting repository state".to_owned(),
+            ..ModelThinking::default()
+        });
+
+        assert_eq!(
+            value["summary"],
+            json!([{
+                "type": "summary_text",
+                "text": "Inspecting repository state"
+            }])
+        );
+    }
+
+    #[test]
+    fn responses_reasoning_item_preserves_content_with_empty_summary() {
+        let value = responses_reasoning_item(&ModelThinking {
+            content: "private reasoning".to_owned(),
+            ..ModelThinking::default()
+        });
+
+        assert_eq!(
+            value,
+            json!({
+                "type": "reasoning",
+                "summary": [],
+                "content": [{
+                    "type": "reasoning_text",
+                    "text": "private reasoning"
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn responses_reasoning_item_default_still_includes_summary() {
+        assert_eq!(
+            responses_reasoning_item(&ModelThinking::default()),
+            json!({
+                "type": "reasoning",
+                "summary": []
+            })
         );
     }
 
@@ -2286,6 +2358,124 @@ mod tests {
         }
     }
 
+    async fn read_json_request(socket: &mut TcpStream) -> Value {
+        let mut request = Vec::new();
+        let header_end = loop {
+            if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+            let mut chunk = [0_u8; 4096];
+            let read = socket.read(&mut chunk).await.expect("request should read");
+            assert!(read > 0, "request ended before headers completed");
+            request.extend_from_slice(&chunk[..read]);
+        };
+        let headers =
+            std::str::from_utf8(&request[..header_end]).expect("request headers should be UTF-8");
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().expect("valid content length"))
+            })
+            .expect("request should include content length");
+        while request.len() < header_end + content_length {
+            let mut chunk = [0_u8; 4096];
+            let read = socket
+                .read(&mut chunk)
+                .await
+                .expect("request body should read");
+            assert!(read > 0, "request ended before body completed");
+            request.extend_from_slice(&chunk[..read]);
+        }
+        serde_json::from_slice(&request[header_end..header_end + content_length])
+            .expect("request body should be JSON")
+    }
+
+    async fn write_http_response(
+        socket: &mut TcpStream,
+        status: &str,
+        content_type: &str,
+        body: &str,
+    ) {
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket
+            .write_all(response.as_bytes())
+            .await
+            .expect("response should write");
+    }
+
+    async fn spawn_responses_tool_round_server() -> (
+        String,
+        Arc<std::sync::Mutex<Vec<Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let address = listener
+            .local_addr()
+            .expect("test server should have address");
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+        let task = tokio::spawn(async move {
+            let first_body = concat!(
+                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_tool\",\"summary\":[],\"content\":[],\"encrypted_content\":\"enc_tool\"}}\n\n",
+                "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_tool\",\"call_id\":\"call_tool\",\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"printf tool-ok\\\"}\"}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+            );
+            let (mut first_socket, _) = listener
+                .accept()
+                .await
+                .expect("first request should arrive");
+            let first_request = read_json_request(&mut first_socket).await;
+            captured.lock().unwrap().push(first_request);
+            write_http_response(&mut first_socket, "200 OK", "text/event-stream", first_body).await;
+
+            let (mut second_socket, _) = listener
+                .accept()
+                .await
+                .expect("second request should arrive");
+            let second_request = read_json_request(&mut second_socket).await;
+            let has_empty_summary = second_request["input"]
+                .as_array()
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .find(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
+                })
+                .and_then(|item| item.get("summary"))
+                .is_some_and(|summary| summary == &json!([]));
+            captured.lock().unwrap().push(second_request);
+
+            if has_empty_summary {
+                let second_body = concat!(
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"tool round complete\"}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+                );
+                write_http_response(
+                    &mut second_socket,
+                    "200 OK",
+                    "text/event-stream",
+                    second_body,
+                )
+                .await;
+            } else {
+                write_http_response(
+                    &mut second_socket,
+                    "400 Bad Request",
+                    "application/json",
+                    r#"{"error":{"message":"Missing required parameter: 'input[2].summary'.","type":"invalid_request_error"}}"#,
+                )
+                .await;
+            }
+        });
+        (format!("http://{address}"), requests, task)
+    }
+
     async fn spawn_sse_server(status: &str, body: &str) -> (String, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -2342,6 +2532,102 @@ mod tests {
         assert_eq!(response.stop_reason, StopReason::Stop);
         assert_eq!(usage.and_then(|value| value.total_tokens), Some(3));
         server.await.expect("test server should finish");
+    }
+
+    #[tokio::test]
+    async fn responses_agent_replays_empty_reasoning_summary_after_tool_call() {
+        let root = std::env::temp_dir().join(format!(
+            "ri-responses-reasoning-replay-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let (base_url, requests, server) = spawn_responses_tool_round_server().await;
+        let provider = OpenAiProvider::new(test_model(ApiKind::OpenAiResponses, base_url))
+            .expect("provider should build");
+        let runtime = AgentRuntime::with_workspace_root(provider, &root).unwrap();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "run the tool".to_owned(),
+            })
+            .await
+            .unwrap();
+        let mut events = Vec::new();
+        loop {
+            let event = event_rx.recv().await.expect("turn event should arrive");
+            let finished = matches!(event, AgentEvent::TurnFinished { .. });
+            events.push(event);
+            if finished {
+                break;
+            }
+        }
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+        server.await.expect("test server should finish");
+        std::fs::remove_dir_all(root).unwrap();
+
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::ToolExecutionFinished { result, .. }
+                    if result.metadata.success && result.model_content.contains("tool-ok")
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::AssistantTextDelta { text, .. } if text == "tool round complete"
+            )
+        }));
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, AgentEvent::Error(_))));
+        assert_eq!(
+            events.last(),
+            Some(&AgentEvent::TurnFinished {
+                reason: StopReason::Stop
+            })
+        );
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let input = requests[1]["input"]
+            .as_array()
+            .expect("second request should contain input items");
+        let reasoning_index = input
+            .iter()
+            .position(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
+            .expect("reasoning item should be replayed");
+        let function_call_index = input
+            .iter()
+            .position(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+            .expect("function call should be replayed");
+        let tool_result_index = input
+            .iter()
+            .position(|item| {
+                item.get("type").and_then(Value::as_str) == Some("function_call_output")
+            })
+            .expect("tool result should be included");
+        assert_eq!(
+            input[reasoning_index],
+            json!({
+                "type": "reasoning",
+                "id": "rs_tool",
+                "summary": [],
+                "encrypted_content": "enc_tool"
+            })
+        );
+        assert!(reasoning_index < function_call_index);
+        assert!(function_call_index < tool_result_index);
+        assert_eq!(input[function_call_index]["call_id"], "call_tool");
+        assert_eq!(input[tool_result_index]["call_id"], "call_tool");
     }
 
     #[tokio::test]
