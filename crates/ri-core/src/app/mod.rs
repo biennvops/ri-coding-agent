@@ -22,11 +22,19 @@ pub enum MessageRole {
     Assistant,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UserMessageStatus {
+    Delivered,
+    Queued,
+    Recovered,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TranscriptMessage {
     pub role: MessageRole,
     pub content: String,
     pub thinking: Option<String>,
+    pub user_status: UserMessageStatus,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -359,6 +367,7 @@ impl AppState {
             role: MessageRole::System,
             content: content.into(),
             thinking: None,
+            user_status: UserMessageStatus::Delivered,
         });
     }
 
@@ -372,10 +381,25 @@ impl AppState {
             role: MessageRole::User,
             content: text.clone(),
             thinking: None,
+            user_status: UserMessageStatus::Delivered,
         });
         self.turn_active = true;
         self.last_error = None;
         self.last_stop_reason = None;
+        Some(text)
+    }
+
+    pub fn queue_input(&mut self) -> Option<String> {
+        if !self.turn_active || self.compaction_active {
+            return None;
+        }
+        let text = self.take_input()?;
+        self.push_message(TranscriptMessage {
+            role: MessageRole::User,
+            content: text.clone(),
+            thinking: None,
+            user_status: UserMessageStatus::Queued,
+        });
         Some(text)
     }
 
@@ -385,6 +409,28 @@ impl AppState {
                 self.turn_active = true;
                 self.last_error = None;
                 self.last_stop_reason = None;
+            }
+            AgentEvent::SteeringMessageDelivered { text } => {
+                if !self.update_oldest_queued_message(UserMessageStatus::Delivered) {
+                    self.push_message(TranscriptMessage {
+                        role: MessageRole::User,
+                        content: text,
+                        thinking: None,
+                        user_status: UserMessageStatus::Delivered,
+                    });
+                }
+            }
+            AgentEvent::SteeringMessagesRecovered { messages } => {
+                for text in messages {
+                    if !self.update_oldest_queued_message(UserMessageStatus::Recovered) {
+                        self.push_message(TranscriptMessage {
+                            role: MessageRole::User,
+                            content: text,
+                            thinking: None,
+                            user_status: UserMessageStatus::Recovered,
+                        });
+                    }
+                }
             }
             AgentEvent::AssistantMessageStarted => {
                 self.finalize_streaming_assistant();
@@ -539,6 +585,7 @@ impl AppState {
                         compact_token_count(after_tokens)
                     ),
                     thinking: None,
+                    user_status: UserMessageStatus::Delivered,
                 });
             }
             AgentEvent::CompactionFailed { message } => {
@@ -548,6 +595,7 @@ impl AppState {
                     role: MessageRole::System,
                     content: message,
                     thinking: None,
+                    user_status: UserMessageStatus::Delivered,
                 });
             }
             AgentEvent::AssistantTextItem { .. }
@@ -585,9 +633,30 @@ impl AppState {
                     role: MessageRole::System,
                     content: format!("error: {message}"),
                     thinking: None,
+                    user_status: UserMessageStatus::Delivered,
                 });
             }
         }
+    }
+
+    fn update_oldest_queued_message(&mut self, status: UserMessageStatus) -> bool {
+        let Some(index) = self.entries.iter().position(|entry| {
+            matches!(
+                &entry.entry,
+                TranscriptEntry::Message(TranscriptMessage {
+                    role: MessageRole::User,
+                    user_status: UserMessageStatus::Queued,
+                    ..
+                })
+            )
+        }) else {
+            return false;
+        };
+        if let TranscriptEntry::Message(message) = &mut self.entries[index].entry {
+            message.user_status = status;
+        }
+        self.mark_entry_changed(index);
+        true
     }
 
     fn push_message(&mut self, message: TranscriptMessage) {
@@ -708,6 +777,7 @@ impl AppState {
                 role: MessageRole::User,
                 content: content.clone(),
                 thinking: None,
+                user_status: UserMessageStatus::Delivered,
             }),
             ModelMessage::Assistant { items } => {
                 let content = items
@@ -738,6 +808,7 @@ impl AppState {
                         role: MessageRole::Assistant,
                         content,
                         thinking: (!thinking.is_empty()).then_some(thinking),
+                        user_status: UserMessageStatus::Delivered,
                     });
                 }
                 for item in items {
@@ -810,6 +881,7 @@ impl AppState {
                     role: MessageRole::Assistant,
                     content: assistant.content,
                     thinking: (!assistant.thinking.is_empty()).then_some(assistant.thinking),
+                    user_status: UserMessageStatus::Delivered,
                 },
                 assistant.id,
                 assistant.revision.wrapping_add(1),
@@ -1490,6 +1562,43 @@ mod tests {
         assert_eq!(messages[0].content, "system");
         assert_eq!(messages[1].content, "later");
         assert_eq!(messages.iter().count(), 2);
+    }
+
+    #[test]
+    fn queued_user_messages_transition_without_duplicate_transcript_entries() {
+        let mut state = AppState::new();
+        state.reduce(AgentEvent::TurnStarted);
+        state.insert_text("A");
+        assert_eq!(state.queue_input().as_deref(), Some("A"));
+        state.insert_text("B");
+        assert_eq!(state.queue_input().as_deref(), Some("B"));
+        assert_eq!(state.messages().len(), 2);
+        assert!(state
+            .messages()
+            .iter()
+            .all(|message| message.user_status == UserMessageStatus::Queued));
+
+        state.reduce(AgentEvent::SteeringMessageDelivered {
+            text: "A".to_owned(),
+        });
+        assert_eq!(state.messages().len(), 2);
+        assert_eq!(
+            state
+                .messages()
+                .iter()
+                .map(|message| message.user_status)
+                .collect::<Vec<_>>(),
+            [UserMessageStatus::Delivered, UserMessageStatus::Queued]
+        );
+
+        state.reduce(AgentEvent::SteeringMessagesRecovered {
+            messages: vec!["B".to_owned()],
+        });
+        assert_eq!(state.messages().len(), 2);
+        assert_eq!(
+            state.messages()[1].user_status,
+            UserMessageStatus::Recovered
+        );
     }
 
     #[test]

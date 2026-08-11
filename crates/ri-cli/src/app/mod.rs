@@ -569,6 +569,8 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
                     } => eprintln!("ri: context compacted · ~{before_tokens} → ~{after_tokens} tokens"),
                     AgentEvent::CompactionFailed { message } => eprintln!("ri: {message}"),
                     AgentEvent::TurnStarted
+                    | AgentEvent::SteeringMessageDelivered { .. }
+                    | AgentEvent::SteeringMessagesRecovered { .. }
                     | AgentEvent::AssistantMessageStarted
                     | AgentEvent::AssistantMessageFinished { .. }
                     | AgentEvent::AssistantTextItem { .. }
@@ -924,6 +926,13 @@ async fn run_tui_loop(
                                             let command = unknown_command_name(state.input()).to_owned();
                                             state.take_input();
                                             state.add_system_message(format!("unknown command: {command}"));
+                                        }
+                                    } else if state.is_turn_active() {
+                                        if let Some(text) = state.queue_input() {
+                                            command_tx
+                                                .try_send(AgentCommand::Steer { text })
+                                                .context("could not queue steering for the agent")?;
+                                            scroll.follow_bottom();
                                         }
                                     } else if let Some(text) = state.submit_input() {
                                         command_tx
@@ -1566,6 +1575,16 @@ fn print_and_flush(output: &mut impl Write, text: &str) -> Result<()> {
 fn log_agent_event(event: &AgentEvent) {
     match event {
         AgentEvent::TurnStarted => tracing::info!(target: "ri", "turn started"),
+        AgentEvent::SteeringMessageDelivered { text } => tracing::debug!(
+            target: "ri",
+            message_bytes = text.len(),
+            "steering message delivered"
+        ),
+        AgentEvent::SteeringMessagesRecovered { messages } => tracing::debug!(
+            target: "ri",
+            message_count = messages.len(),
+            "steering messages recovered"
+        ),
         AgentEvent::AssistantMessageStarted => {
             tracing::debug!(target: "ri", "assistant message started")
         }

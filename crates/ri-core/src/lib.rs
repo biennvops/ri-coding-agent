@@ -12,7 +12,7 @@ pub use agent::{AgentCommand, AgentError, AgentEvent, AgentRuntime, AgentRuntime
 pub use app::{
     AppState, MessageRole, StreamingAssistantState, ToolOutputChunk, ToolStatus,
     ToolTranscriptEntry, TranscriptEntry, TranscriptEntryId, TranscriptEntryState,
-    TranscriptMessage, TranscriptMessages,
+    TranscriptMessage, TranscriptMessages, UserMessageStatus,
 };
 pub use config::{
     default_state_path, load_state, persist_recent_model, ApiKind, CompactionSettings,

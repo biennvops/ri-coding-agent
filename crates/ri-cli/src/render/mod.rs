@@ -14,6 +14,7 @@ use ratatui::{Frame, Terminal};
 use ri_core::{
     AppState, MessageRole, ModelRef, StreamingAssistantState, ToolOutputStream, ToolPreviewKind,
     ToolStatus, ToolTranscriptEntry, TranscriptEntry, TranscriptEntryId, TranscriptEntryState,
+    UserMessageStatus,
 };
 
 use crate::commands::{matching_commands, CommandSuggestions};
@@ -843,7 +844,11 @@ fn layout_entry(entry: &TranscriptEntry, width: usize) -> Vec<CachedRow> {
             width,
             match message.role {
                 MessageRole::System => "system",
-                MessageRole::User => "you",
+                MessageRole::User => match message.user_status {
+                    UserMessageStatus::Delivered => "you",
+                    UserMessageStatus::Queued => "you · queued",
+                    UserMessageStatus::Recovered => "you · not sent",
+                },
                 MessageRole::Assistant => "assistant",
             },
         ),
@@ -1529,6 +1534,26 @@ mod tests {
             .draw(&mut terminal, &state, 0)
             .expect("edited editor draw should succeed");
         assert_eq!(renderer.stats().editor_cache_misses, 1);
+    }
+
+    #[test]
+    fn queued_message_label_transitions_in_place_when_delivered() {
+        let mut state = AppState::new();
+        state.reduce(AgentEvent::TurnStarted);
+        state.insert_text("also add tests");
+        state.queue_input().expect("queued input");
+        let entry_id = state.transcript_entries()[0].id;
+        let queued = layout_entry(&state.transcript_entries()[0].entry, 80);
+        assert!(queued.iter().any(|row| row.text == "▶ you · queued"));
+
+        state.reduce(AgentEvent::SteeringMessageDelivered {
+            text: "also add tests".to_owned(),
+        });
+        assert_eq!(state.transcript_entries().len(), 1);
+        assert_eq!(state.transcript_entries()[0].id, entry_id);
+        let delivered = layout_entry(&state.transcript_entries()[0].entry, 80);
+        assert!(delivered.iter().any(|row| row.text == "▶ you"));
+        assert!(!delivered.iter().any(|row| row.text.contains("queued")));
     }
 
     #[test]

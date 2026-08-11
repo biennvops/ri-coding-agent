@@ -1,5 +1,6 @@
+use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -30,6 +31,9 @@ const TOOL_EVENT_CHANNEL_CAPACITY: usize = 64;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentCommand {
     Submit {
+        text: String,
+    },
+    Steer {
         text: String,
     },
     Compact,
@@ -67,6 +71,12 @@ impl AgentError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentEvent {
     TurnStarted,
+    SteeringMessageDelivered {
+        text: String,
+    },
+    SteeringMessagesRecovered {
+        messages: Vec<String>,
+    },
     AssistantMessageStarted,
     AssistantTextDelta {
         index: Option<usize>,
@@ -174,10 +184,13 @@ impl AgentRuntimeConfig {
     }
 }
 
+type SteeringQueue = Arc<Mutex<VecDeque<String>>>;
+
 struct ActiveTurn {
     cancel: CancellationToken,
     task: JoinHandle<RuntimeTaskOutcome>,
     compaction: bool,
+    steering: Option<SteeringQueue>,
 }
 
 enum RuntimeTaskOutcome {
@@ -279,11 +292,24 @@ where
                                 &events,
                             )
                             .await;
+                            recover_pending_steering(&active_task.steering, &events).await;
                         }
                         command = commands.recv() => {
                             match command {
                                 Some(AgentCommand::Cancel) => active_task.cancel.cancel(),
+                                Some(AgentCommand::Steer { text }) if !active_task.compaction => {
+                                    if !text.trim().is_empty() {
+                                        active_task
+                                            .steering
+                                            .as_ref()
+                                            .expect("active turns have a steering queue")
+                                            .lock()
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                            .push_back(text);
+                                    }
+                                }
                                 Some(AgentCommand::Submit { .. })
+                                | Some(AgentCommand::Steer { .. })
                                 | Some(AgentCommand::Compact)
                                 | Some(AgentCommand::NewSession { .. })
                                 | Some(AgentCommand::LoadSession { .. })
@@ -307,6 +333,7 @@ where
                                         &events,
                                     )
                                     .await;
+                                    recover_pending_steering(&active_task.steering, &events).await;
                                     return;
                                 }
                             }
@@ -333,6 +360,8 @@ where
                         let turn_events = events.clone();
                         let turn_cancel = cancel.clone();
                         let compaction_enabled = self.compaction_enabled;
+                        let steering = Arc::new(Mutex::new(VecDeque::new()));
+                        let turn_steering = Arc::clone(&steering);
                         let task = tokio::spawn(async move {
                             RuntimeTaskOutcome::Turn(
                                 run_turn(
@@ -344,6 +373,7 @@ where
                                     turn_events,
                                     turn_cancel,
                                     compaction_enabled,
+                                    turn_steering,
                                 )
                                 .await,
                             )
@@ -352,7 +382,13 @@ where
                             cancel,
                             task,
                             compaction: false,
+                            steering: Some(steering),
                         });
+                    }
+                    Some(AgentCommand::Steer { .. }) => {
+                        let _ = events
+                            .send(AgentEvent::Error(AgentError::new("no turn is active")))
+                            .await;
                     }
                     Some(AgentCommand::Compact) => {
                         let cancel = CancellationToken::new();
@@ -388,6 +424,7 @@ where
                             cancel,
                             task,
                             compaction: true,
+                            steering: None,
                         });
                     }
                     Some(AgentCommand::NewSession { session }) => {
@@ -516,6 +553,26 @@ async fn emit_session_loaded(
     }
 }
 
+async fn recover_pending_steering(
+    steering: &Option<SteeringQueue>,
+    events: &mpsc::Sender<AgentEvent>,
+) {
+    let Some(steering) = steering else {
+        return;
+    };
+    let messages = {
+        let mut queue = steering
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        queue.drain(..).collect::<Vec<_>>()
+    };
+    if !messages.is_empty() {
+        let _ = events
+            .send(AgentEvent::SteeringMessagesRecovered { messages })
+            .await;
+    }
+}
+
 async fn apply_task_result<P>(
     result: Result<RuntimeTaskOutcome, tokio::task::JoinError>,
     compaction: bool,
@@ -588,6 +645,7 @@ async fn run_turn<P>(
     events: mpsc::Sender<AgentEvent>,
     cancel: CancellationToken,
     compaction_enabled: bool,
+    steering: SteeringQueue,
 ) -> TurnOutcome
 where
     P: ModelProvider,
@@ -768,7 +826,14 @@ where
                 fail_turn(&events, "provider returned an error stop reason").await;
                 return turn_outcome(history, StopReason::Error);
             }
-            return turn_outcome(history, response.stop_reason);
+            match inject_next_steering(&steering, &mut history, &config.session, &events).await {
+                Ok(true) => continue,
+                Ok(false) => return turn_outcome(history, response.stop_reason),
+                Err(error) => {
+                    fail_turn(&events, error).await;
+                    return turn_outcome(history, StopReason::Error);
+                }
+            }
         }
 
         tool_rounds += 1;
@@ -843,7 +908,34 @@ where
                 return turn_outcome(history, StopReason::Cancelled);
             }
         }
+
+        if let Err(error) =
+            inject_next_steering(&steering, &mut history, &config.session, &events).await
+        {
+            fail_turn(&events, error).await;
+            return turn_outcome(history, StopReason::Error);
+        }
     }
+}
+
+async fn inject_next_steering(
+    steering: &SteeringQueue,
+    history: &mut ConversationHistory,
+    session: &SessionMode,
+    events: &mpsc::Sender<AgentEvent>,
+) -> Result<bool, String> {
+    let text = steering
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .pop_front();
+    let Some(text) = text else {
+        return Ok(false);
+    };
+    commit_message(history, session, ModelMessage::user(text.clone()), events).await?;
+    let _ = events
+        .send(AgentEvent::SteeringMessageDelivered { text })
+        .await;
+    Ok(true)
 }
 
 fn normal_request_with_effort(
@@ -2565,6 +2657,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn steering_near_completion_is_delivered_fifo_one_per_continuation() {
+        let provider = ScriptedProvider::new(vec![
+            final_step("initial answer"),
+            final_step("after A"),
+            final_step("after B"),
+            final_step("after C"),
+        ])
+        .with_delay(Duration::from_millis(25));
+        let requests = Arc::clone(&provider.requests);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let runtime_task = tokio::spawn(AgentRuntime::new(provider).run(command_rx, event_tx));
+
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "initial".to_owned(),
+            })
+            .await
+            .unwrap();
+        while !matches!(event_rx.recv().await, Some(AgentEvent::TurnStarted)) {}
+        for text in ["A", "B", "C"] {
+            command_tx
+                .send(AgentCommand::Steer {
+                    text: text.to_owned(),
+                })
+                .await
+                .unwrap();
+        }
+        let events = collect_turn(&mut event_rx).await;
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    AgentEvent::SteeringMessageDelivered { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            ["A", "B", "C"]
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        for (request, expected) in requests.iter().skip(1).zip(["A", "B", "C"]) {
+            assert_eq!(request.messages.last(), Some(&ModelMessage::user(expected)));
+        }
+        for text in ["A", "B", "C"] {
+            assert_eq!(
+                requests[3]
+                    .messages
+                    .iter()
+                    .filter(|message| **message == ModelMessage::user(text))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn steering_waits_for_an_entire_tool_batch() {
+        let root = unique_test_dir("steering-tool-batch");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("note.txt"), "content").unwrap();
+        let calls = ["call-a", "call-b", "call-c"]
+            .into_iter()
+            .map(|id| tool_call(id, "read", r#"{"path":"note.txt"}"#))
+            .collect::<Vec<_>>();
+        let provider = ScriptedProvider::new(vec![
+            ScriptedStep {
+                events: Vec::new(),
+                response: ModelResponse {
+                    items: calls
+                        .iter()
+                        .cloned()
+                        .map(ModelAssistantItem::ToolCall)
+                        .collect(),
+                    stop_reason: StopReason::ToolCalls,
+                    usage: None,
+                },
+            },
+            final_step("finished"),
+        ])
+        .with_delay(Duration::from_millis(25));
+        let requests = Arc::clone(&provider.requests);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let runtime = AgentRuntime::with_context(provider, ToolContext::new(&root).unwrap());
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "inspect".to_owned(),
+            })
+            .await
+            .unwrap();
+        while !matches!(event_rx.recv().await, Some(AgentEvent::TurnStarted)) {}
+        command_tx
+            .send(AgentCommand::Steer {
+                text: "also add tests".to_owned(),
+            })
+            .await
+            .unwrap();
+        let _ = collect_turn(&mut event_rx).await;
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+
+        let requests = requests.lock().unwrap();
+        let continuation = &requests[1].messages;
+        let steering_index = continuation
+            .iter()
+            .position(|message| *message == ModelMessage::user("also add tests"))
+            .unwrap();
+        let tool_result_indices = continuation
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| {
+                matches!(message, ModelMessage::ToolResult { .. }).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_result_indices.len(), 3);
+        assert!(tool_result_indices
+            .iter()
+            .all(|index| *index < steering_index));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_recovers_pending_steering_messages() {
+        let provider = BlockingProvider::default();
+        let calls = Arc::clone(&provider.calls);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let runtime_task = tokio::spawn(AgentRuntime::new(provider).run(command_rx, event_tx));
+
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "initial".to_owned(),
+            })
+            .await
+            .unwrap();
+        while !matches!(event_rx.recv().await, Some(AgentEvent::TurnStarted)) {}
+        wait_for_call(&calls).await;
+        command_tx
+            .send(AgentCommand::Steer {
+                text: "do not lose this".to_owned(),
+            })
+            .await
+            .unwrap();
+        command_tx.send(AgentCommand::Cancel).await.unwrap();
+        let _ = collect_turn(&mut event_rx).await;
+        let recovered = event_rx.recv().await.unwrap();
+        assert_eq!(
+            recovered,
+            AgentEvent::SteeringMessagesRecovered {
+                messages: vec!["do not lose this".to_owned()]
+            }
+        );
+
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn conversation_history_survives_the_next_user_turn() {
         let provider = ScriptedProvider::new(vec![final_step("alpha"), final_step("remembered")]);
         let requests = Arc::clone(&provider.requests);
@@ -3317,6 +3574,7 @@ mod tests {
         steps: Arc<Mutex<VecDeque<ScriptedStep>>>,
         requests: Arc<Mutex<Vec<ModelRequest>>>,
         limits: ModelLimits,
+        delay: Duration,
         overflow_once: Arc<Mutex<bool>>,
         overflow_after_tool_result_once: Arc<Mutex<bool>>,
     }
@@ -3332,9 +3590,15 @@ mod tests {
                 steps: Arc::new(Mutex::new(steps.into_iter().collect())),
                 requests: Arc::new(Mutex::new(Vec::new())),
                 limits: ModelLimits::default(),
+                delay: Duration::ZERO,
                 overflow_once: Arc::new(Mutex::new(false)),
                 overflow_after_tool_result_once: Arc::new(Mutex::new(false)),
             }
+        }
+
+        fn with_delay(mut self, delay: Duration) -> Self {
+            self.delay = delay;
+            self
         }
 
         fn with_limits(mut self, limits: ModelLimits) -> Self {
@@ -3371,6 +3635,12 @@ mod tests {
                 .iter()
                 .any(|message| matches!(message, ModelMessage::ToolResult { .. }));
             self.requests.lock().unwrap().push(request);
+            if !self.delay.is_zero() {
+                tokio::select! {
+                    _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
+                    _ = tokio::time::sleep(self.delay) => {}
+                }
+            }
             let overflow = (has_tools && *self.overflow_once.lock().unwrap())
                 || (has_tool_result && *self.overflow_after_tool_result_once.lock().unwrap());
             if overflow {

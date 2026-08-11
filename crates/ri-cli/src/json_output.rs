@@ -49,6 +49,12 @@ impl<W: Write> JsonEmitter<W> {
     pub(crate) fn emit_agent_event(&mut self, event: &AgentEvent) -> Result<()> {
         match event {
             AgentEvent::TurnStarted => self.emit("turn_started", json!({})),
+            AgentEvent::SteeringMessageDelivered { text } => {
+                self.emit("steering_delivered", TextData { text })
+            }
+            AgentEvent::SteeringMessagesRecovered { messages } => {
+                self.emit("steering_recovered", json!({ "messages": messages }))
+            }
             AgentEvent::AssistantMessageStarted => {
                 self.emit("assistant_message_started", json!({}))
             }
