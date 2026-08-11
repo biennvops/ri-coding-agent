@@ -76,7 +76,7 @@ impl Tool for ReadTool {
         }
         ToolCallPresentation {
             summary,
-            preview: None,
+            preview: Vec::new(),
         }
     }
 
@@ -206,7 +206,7 @@ mod tests {
         }));
 
         assert_eq!(presentation.summary, "read src/foo.rs · lines 10–29");
-        assert_eq!(presentation.preview, None);
+        assert!(presentation.preview.is_empty());
         assert!(!presentation.summary.contains("{\"path\":"));
     }
 

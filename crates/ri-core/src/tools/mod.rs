@@ -50,7 +50,7 @@ impl ToolContext {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolOutputStream {
     Stdout,
     Stderr,
@@ -120,10 +120,25 @@ impl ToolExecutionResult {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolPreviewKind {
+    Normal,
+    Added,
+    Removed,
+    Dim,
+    Command,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolPreviewLine {
+    pub kind: ToolPreviewKind,
+    pub text: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolCallPresentation {
     pub summary: String,
-    pub preview: Option<String>,
+    pub preview: Vec<ToolPreviewLine>,
 }
 
 impl ToolCallPresentation {
@@ -132,12 +147,28 @@ impl ToolCallPresentation {
             .unwrap_or_else(|_| "<arguments unavailable>".to_owned());
         Self {
             summary: name.to_owned(),
-            preview: Some(bounded_preview(
-                arguments.lines().map(|line| (None, line)),
-                arguments.lines().count(),
-            )),
+            preview: preview_lines(
+                bounded_preview(
+                    arguments.lines().map(|line| (None, line)),
+                    arguments.lines().count(),
+                ),
+                ToolPreviewKind::Normal,
+            ),
         }
     }
+}
+
+pub(crate) fn preview_lines(text: String, kind: ToolPreviewKind) -> Vec<ToolPreviewLine> {
+    text.lines()
+        .map(|text| ToolPreviewLine {
+            kind: if text.starts_with('…') {
+                ToolPreviewKind::Dim
+            } else {
+                kind
+            },
+            text: text.to_owned(),
+        })
+        .collect()
 }
 
 #[derive(Debug, Error)]

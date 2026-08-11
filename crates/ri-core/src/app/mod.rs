@@ -8,8 +8,8 @@ use crate::context::ContextUsage;
 use crate::model::{ModelAssistantItem, ModelLimits, ModelMessage, StopReason, Usage};
 use crate::session::SessionInfo;
 use crate::tools::{
-    ToolCallPresentation, ToolExecutionMetadata, ToolOutputStream, ToolRegistry,
-    MAX_TOOL_PREVIEW_BYTES,
+    ToolCallPresentation, ToolExecutionMetadata, ToolOutputStream, ToolPreviewKind,
+    ToolPreviewLine, ToolRegistry, MAX_TOOL_PREVIEW_BYTES,
 };
 
 const MAX_TOOL_TRANSCRIPT_OUTPUT_BYTES: usize = 256 * 1024;
@@ -97,12 +97,19 @@ pub enum ToolStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolOutputChunk {
+    pub stream: Option<ToolOutputStream>,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolTranscriptEntry {
     pub call_id: String,
     pub name: String,
     pub summary: String,
-    pub preview: Option<String>,
+    pub preview: Vec<ToolPreviewLine>,
     pub output: String,
+    pub output_chunks: Vec<ToolOutputChunk>,
     pub output_truncated: bool,
     pub status: ToolStatus,
 }
@@ -470,6 +477,7 @@ impl AppState {
                     summary: presentation.summary,
                     preview: presentation.preview,
                     output: String::new(),
+                    output_chunks: Vec::new(),
                     output_truncated: false,
                     status: ToolStatus::Running,
                 }));
@@ -482,13 +490,10 @@ impl AppState {
                 if let Some(index) = self.entries.iter().rposition(
                     |entry| matches!(&entry.entry, TranscriptEntry::Tool(tool) if tool.call_id == call_id),
                 ) {
-                    let mut changed = !chunk.is_empty();
+                    let changed = !chunk.is_empty();
                     if let TranscriptEntry::Tool(tool) = &mut self.entries[index].entry {
-                        if matches!(stream, ToolOutputStream::Stderr) && tool.output.is_empty() {
-                            append_tool_output(tool, "[stderr]\n");
-                            changed = true;
-                        }
                         append_tool_output(tool, &chunk);
+                        append_tool_output_chunk(tool, Some(stream), &chunk);
                     }
                     if changed {
                         self.mark_entry_changed(index);
@@ -508,6 +513,9 @@ impl AppState {
                         tool.output.clear();
                         tool.output_truncated = false;
                         append_tool_output(tool, &result.model_content);
+                        if tool.output_chunks.is_empty() {
+                            append_tool_output_chunk(tool, None, &result.model_content);
+                        }
                         tool.output_truncated |= live_output_truncated || result.metadata.truncated;
                         tool.status = ToolStatus::Finished(result.metadata);
                     }
@@ -752,6 +760,7 @@ impl AppState {
                         summary: presentation.summary,
                         preview: presentation.preview,
                         output: String::new(),
+                        output_chunks: Vec::new(),
                         output_truncated: false,
                         status: ToolStatus::Running,
                     }));
@@ -768,8 +777,10 @@ impl AppState {
                 if let Some(index) = found {
                     if let TranscriptEntry::Tool(tool) = &mut self.entries[index].entry {
                         tool.output.clear();
+                        tool.output_chunks.clear();
                         tool.output_truncated = false;
                         append_tool_output(tool, content);
+                        append_tool_output_chunk(tool, None, content);
                         tool.status = ToolStatus::Finished(ToolExecutionMetadata::success());
                     }
                     self.mark_entry_changed(index);
@@ -778,12 +789,14 @@ impl AppState {
                         call_id: tool_call_id.clone(),
                         name: tool_name.clone(),
                         summary: tool_name.clone(),
-                        preview: None,
+                        preview: Vec::new(),
                         output: String::new(),
+                        output_chunks: Vec::new(),
                         output_truncated: false,
                         status: ToolStatus::Finished(ToolExecutionMetadata::success()),
                     };
                     append_tool_output(&mut tool, content);
+                    append_tool_output_chunk(&mut tool, None, content);
                     self.push_entry(TranscriptEntry::Tool(tool));
                 }
             }
@@ -808,6 +821,96 @@ impl AppState {
             );
         }
     }
+}
+
+fn append_tool_output_chunk(
+    tool: &mut ToolTranscriptEntry,
+    stream: Option<ToolOutputStream>,
+    text: &str,
+) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(last) = tool.output_chunks.last_mut() {
+        if last.stream == stream {
+            last.text.push_str(text);
+        } else {
+            tool.output_chunks.push(ToolOutputChunk {
+                stream,
+                text: text.to_owned(),
+            });
+        }
+    } else {
+        tool.output_chunks.push(ToolOutputChunk {
+            stream,
+            text: text.to_owned(),
+        });
+    }
+
+    let total = tool
+        .output_chunks
+        .iter()
+        .map(|chunk| chunk.text.len())
+        .sum::<usize>();
+    if total <= MAX_TOOL_TRANSCRIPT_OUTPUT_BYTES {
+        return;
+    }
+
+    let retained = MAX_TOOL_TRANSCRIPT_OUTPUT_BYTES.saturating_sub(TOOL_OUTPUT_MARKER.len());
+    let head_limit = retained / 2;
+    let tail_limit = retained - head_limit;
+    let mut bounded = tool_output_prefix(&tool.output_chunks, head_limit);
+    bounded.push(ToolOutputChunk {
+        stream: None,
+        text: TOOL_OUTPUT_MARKER.to_owned(),
+    });
+    bounded.extend(tool_output_suffix(&tool.output_chunks, tail_limit));
+    tool.output_chunks = bounded;
+}
+
+fn tool_output_prefix(chunks: &[ToolOutputChunk], limit: usize) -> Vec<ToolOutputChunk> {
+    let mut remaining = limit;
+    let mut result = Vec::new();
+    for chunk in chunks {
+        if remaining == 0 {
+            break;
+        }
+        let text = prefix_at_boundary(&chunk.text, remaining.min(chunk.text.len()));
+        if !text.is_empty() {
+            result.push(ToolOutputChunk {
+                stream: chunk.stream,
+                text: text.to_owned(),
+            });
+            remaining = remaining.saturating_sub(text.len());
+        }
+        if text.len() < chunk.text.len() {
+            break;
+        }
+    }
+    result
+}
+
+fn tool_output_suffix(chunks: &[ToolOutputChunk], limit: usize) -> Vec<ToolOutputChunk> {
+    let mut remaining = limit;
+    let mut result = Vec::new();
+    for chunk in chunks.iter().rev() {
+        if remaining == 0 {
+            break;
+        }
+        let text = suffix_at_boundary(&chunk.text, remaining.min(chunk.text.len()));
+        if !text.is_empty() {
+            result.push(ToolOutputChunk {
+                stream: chunk.stream,
+                text: text.to_owned(),
+            });
+            remaining = remaining.saturating_sub(text.len());
+        }
+        if text.len() < chunk.text.len() {
+            break;
+        }
+    }
+    result.reverse();
+    result
 }
 
 fn compact_token_count(value: u64) -> String {
@@ -873,7 +976,17 @@ fn tool_call_presentation(name: &str, arguments: &str) -> ToolCallPresentation {
         Ok(arguments) => ToolRegistry::new().presentation(name, &arguments),
         Err(_) => ToolCallPresentation {
             summary: name.to_owned(),
-            preview: Some(truncate_text(arguments, MAX_TOOL_PREVIEW_BYTES)),
+            preview: truncate_text(arguments, MAX_TOOL_PREVIEW_BYTES)
+                .lines()
+                .map(|text| ToolPreviewLine {
+                    kind: if text.starts_with('…') || text.starts_with("[…") {
+                        ToolPreviewKind::Dim
+                    } else {
+                        ToolPreviewKind::Normal
+                    },
+                    text: text.to_owned(),
+                })
+                .collect(),
         },
     }
 }
@@ -1046,6 +1159,54 @@ mod tests {
     }
 
     #[test]
+    fn live_tool_output_preserves_bounded_stream_order_after_completion() {
+        let mut state = AppState::new();
+        state.reduce(AgentEvent::ToolExecutionStarted {
+            call_id: "call-1".to_owned(),
+            name: "bash".to_owned(),
+            arguments: r#"{"command":"test"}"#.to_owned(),
+        });
+        for (stream, chunk) in [
+            (ToolOutputStream::Stdout, "out 1\n"),
+            (ToolOutputStream::Stderr, "err\n"),
+            (ToolOutputStream::Stdout, "out 2\n"),
+        ] {
+            state.reduce(AgentEvent::ToolExecutionOutput {
+                call_id: "call-1".to_owned(),
+                stream,
+                chunk: chunk.to_owned(),
+            });
+        }
+        state.reduce(AgentEvent::ToolExecutionFinished {
+            call_id: "call-1".to_owned(),
+            name: "bash".to_owned(),
+            result: ToolExecutionResultForTest::result_with_content("authoritative result"),
+        });
+
+        let TranscriptEntry::Tool(tool) = &state.transcript_entries()[0].entry else {
+            panic!("expected tool entry");
+        };
+        assert_eq!(
+            tool.output_chunks
+                .iter()
+                .map(|chunk| (chunk.stream, chunk.text.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (Some(ToolOutputStream::Stdout), "out 1\n"),
+                (Some(ToolOutputStream::Stderr), "err\n"),
+                (Some(ToolOutputStream::Stdout), "out 2\n"),
+            ]
+        );
+        assert!(
+            tool.output_chunks
+                .iter()
+                .map(|chunk| chunk.text.len())
+                .sum::<usize>()
+                <= MAX_TOOL_TRANSCRIPT_OUTPUT_BYTES
+        );
+    }
+
+    #[test]
     fn write_and_edit_previews_survive_tool_completion() {
         let cases = [
             (
@@ -1079,7 +1240,14 @@ mod tests {
                 panic!("expected tool entry");
             };
             assert_eq!(tool.summary, summary);
-            assert_eq!(tool.preview.as_deref(), Some(preview));
+            assert_eq!(
+                tool.preview
+                    .iter()
+                    .map(|line| line.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                preview
+            );
             assert_eq!(tool.output, "completed result");
             assert!(matches!(tool.status, ToolStatus::Finished(_)));
         }
@@ -1104,7 +1272,14 @@ mod tests {
         let TranscriptEntry::Tool(tool) = &state.transcript_entries()[0].entry else {
             panic!("expected tool entry");
         };
-        assert_eq!(tool.preview.as_deref(), Some("-old\n+new"));
+        assert_eq!(
+            tool.preview
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            "-old\n+new"
+        );
         assert!(tool.output.contains("matched 3 locations"));
         assert!(matches!(
             tool.status,
@@ -1124,7 +1299,12 @@ mod tests {
         let TranscriptEntry::Tool(tool) = &state.transcript_entries()[0].entry else {
             panic!("expected tool entry");
         };
-        let preview = tool.preview.as_deref().expect("fallback preview");
+        let preview = tool
+            .preview
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert_eq!(tool.summary, "write");
         assert!(preview.contains("[… text truncated …]"));
         assert!(preview.len() <= MAX_TOOL_PREVIEW_BYTES);
@@ -1155,6 +1335,17 @@ mod tests {
         assert!(tool.output_truncated);
         assert!(matches!(tool.status, ToolStatus::Finished(_)));
         assert!(tool.output.len() <= MAX_TOOL_TRANSCRIPT_OUTPUT_BYTES + TOOL_OUTPUT_MARKER.len());
+        assert!(
+            tool.output_chunks
+                .iter()
+                .map(|chunk| chunk.text.len())
+                .sum::<usize>()
+                <= MAX_TOOL_TRANSCRIPT_OUTPUT_BYTES
+        );
+        assert!(tool
+            .output_chunks
+            .iter()
+            .any(|chunk| chunk.text == TOOL_OUTPUT_MARKER));
     }
 
     struct ToolExecutionResultForTest;
@@ -1222,7 +1413,7 @@ mod tests {
         };
         assert_eq!(tool.call_id, "call-1");
         assert_eq!(tool.summary, "read note.txt");
-        assert_eq!(tool.preview, None);
+        assert!(tool.preview.is_empty());
         assert_eq!(tool.output, "1 | note");
         assert!(matches!(tool.status, ToolStatus::Finished(_)));
     }

@@ -12,8 +12,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 use ri_core::{
-    AppState, MessageRole, ModelRef, StreamingAssistantState, ToolStatus, ToolTranscriptEntry,
-    TranscriptEntry, TranscriptEntryId, TranscriptEntryState,
+    AppState, MessageRole, ModelRef, StreamingAssistantState, ToolOutputStream, ToolPreviewKind,
+    ToolStatus, ToolTranscriptEntry, TranscriptEntry, TranscriptEntryId, TranscriptEntryState,
 };
 
 use crate::commands::{matching_commands, CommandSuggestions};
@@ -908,8 +908,15 @@ fn append_tool_entry(lines: &mut Vec<CachedRow>, tool: &ToolTranscriptEntry, wid
         style,
         width,
     ));
-    if let Some(preview) = &tool.preview {
-        append_layout_content(lines, preview, Style::default(), width);
+    for preview in &tool.preview {
+        let style = match preview.kind {
+            ToolPreviewKind::Normal => Style::default(),
+            ToolPreviewKind::Added => Style::default().fg(Color::Green),
+            ToolPreviewKind::Removed => Style::default().fg(Color::Red),
+            ToolPreviewKind::Dim => Style::default().fg(Color::DarkGray),
+            ToolPreviewKind::Command => Style::default().fg(Color::Cyan),
+        };
+        append_layout_content(lines, &preview.text, style, width);
     }
     if tool.output.is_empty() && matches!(tool.status, ToolStatus::Running) {
         lines.extend(layout_styled_lines(
@@ -918,13 +925,23 @@ fn append_tool_entry(lines: &mut Vec<CachedRow>, tool: &ToolTranscriptEntry, wid
             width,
         ));
     } else if !tool.output.is_empty() {
-        if tool.preview.is_some() {
+        if !tool.preview.is_empty() {
             lines.push(CachedRow {
                 text: String::new(),
                 style: Style::default(),
             });
         }
-        append_layout_content(lines, &tool.output, Style::default(), width);
+        if tool.output_chunks.is_empty() {
+            append_layout_content(lines, &tool.output, Style::default(), width);
+        } else {
+            for chunk in &tool.output_chunks {
+                let style = match chunk.stream {
+                    Some(ToolOutputStream::Stderr) => Style::default().fg(Color::Red),
+                    Some(ToolOutputStream::Stdout) | None => Style::default(),
+                };
+                append_layout_content(lines, &chunk.text, style, width);
+            }
+        }
     }
     if let ToolStatus::Finished(metadata) = &tool.status {
         let status = if metadata.cancelled {
@@ -1056,7 +1073,12 @@ fn entry_render_bytes(entry: &TranscriptEntry) -> usize {
         TranscriptEntry::Tool(tool) => tool
             .summary
             .len()
-            .saturating_add(tool.preview.as_deref().map(str::len).unwrap_or_default())
+            .saturating_add(
+                tool.preview
+                    .iter()
+                    .map(|line| line.text.len())
+                    .sum::<usize>(),
+            )
             .saturating_add(tool.output.len()),
     }
 }
@@ -1571,6 +1593,79 @@ mod tests {
             assert!(rendered.contains("tool result"), "{rendered}");
             assert!(!rendered.contains("{\""), "{rendered}");
         }
+    }
+
+    #[test]
+    fn semantic_tool_lines_map_to_terminal_colors() {
+        let mut state = AppState::new();
+        state.reduce(AgentEvent::ToolExecutionStarted {
+            call_id: "edit".to_owned(),
+            name: "edit".to_owned(),
+            arguments: r#"{"path":"src/foo.rs","old_text":"old","new_text":"new"}"#.to_owned(),
+        });
+        let edit_rows = layout_entry(&state.transcript_entries()[0].entry, 200);
+        assert_eq!(
+            edit_rows
+                .iter()
+                .find(|row| row.text == "  -old")
+                .expect("removed line")
+                .style
+                .fg,
+            Some(Color::Red)
+        );
+        assert_eq!(
+            edit_rows
+                .iter()
+                .find(|row| row.text == "  +new")
+                .expect("added line")
+                .style
+                .fg,
+            Some(Color::Green)
+        );
+
+        state.reduce(AgentEvent::ToolExecutionStarted {
+            call_id: "bash".to_owned(),
+            name: "bash".to_owned(),
+            arguments: r#"{"command":"run tests"}"#.to_owned(),
+        });
+        state.reduce(AgentEvent::ToolExecutionOutput {
+            call_id: "bash".to_owned(),
+            stream: ToolOutputStream::Stdout,
+            chunk: "normal output".to_owned(),
+        });
+        state.reduce(AgentEvent::ToolExecutionOutput {
+            call_id: "bash".to_owned(),
+            stream: ToolOutputStream::Stderr,
+            chunk: "error output".to_owned(),
+        });
+        let bash_rows = layout_entry(&state.transcript_entries()[1].entry, 200);
+        assert_eq!(
+            bash_rows
+                .iter()
+                .find(|row| row.text == "  run tests")
+                .expect("command")
+                .style
+                .fg,
+            Some(Color::Cyan)
+        );
+        assert_eq!(
+            bash_rows
+                .iter()
+                .find(|row| row.text == "  normal output")
+                .expect("stdout")
+                .style
+                .fg,
+            None
+        );
+        assert_eq!(
+            bash_rows
+                .iter()
+                .find(|row| row.text == "  error output")
+                .expect("stderr")
+                .style
+                .fg,
+            Some(Color::Red)
+        );
     }
 
     #[test]

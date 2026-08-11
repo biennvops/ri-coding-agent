@@ -16,9 +16,9 @@ use crate::model::ToolDefinition;
 
 use super::write::temporary_path;
 use super::{
-    bounded_preview, BoundedText, Tool, ToolCallPresentation, ToolContext, ToolError, ToolEvent,
-    ToolEventSender, ToolExecutionMetadata, ToolExecutionResult, ToolOutputStream,
-    MAX_TOOL_OUTPUT_BYTES,
+    bounded_preview, preview_lines, BoundedText, Tool, ToolCallPresentation, ToolContext,
+    ToolError, ToolEvent, ToolEventSender, ToolExecutionMetadata, ToolExecutionResult,
+    ToolOutputStream, ToolPreviewKind, MAX_TOOL_OUTPUT_BYTES,
 };
 
 pub const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
@@ -88,10 +88,13 @@ impl Tool for BashTool {
         };
         ToolCallPresentation {
             summary: "bash".to_owned(),
-            preview: Some(bounded_preview(
-                arguments.command.lines().map(|line| (None, line)),
-                arguments.command.lines().count(),
-            )),
+            preview: preview_lines(
+                bounded_preview(
+                    arguments.command.lines().map(|line| (None, line)),
+                    arguments.command.lines().count(),
+                ),
+                ToolPreviewKind::Command,
+            ),
         }
     }
 
@@ -185,7 +188,7 @@ impl Tool for BashTool {
                 stream_event = stream_rx.recv(), if active_readers > 0 => {
                     match stream_event {
                         Some(BashStreamEvent::Chunk { stream, text }) => {
-                            if let Err(error) = output.push(stream.clone(), &text) {
+                            if let Err(error) = output.push(stream, &text) {
                                 process_error.get_or_insert(error);
                             }
                             if !event_stream_closed {
@@ -356,10 +359,7 @@ async fn read_stream<R>(
                     continue;
                 }
                 if events
-                    .send(BashStreamEvent::Chunk {
-                        stream: stream.clone(),
-                        text,
-                    })
+                    .send(BashStreamEvent::Chunk { stream, text })
                     .await
                     .is_err()
                 {
@@ -369,7 +369,7 @@ async fn read_stream<R>(
             Err(error) => {
                 let _ = events
                     .send(BashStreamEvent::Error {
-                        stream: stream.clone(),
+                        stream,
                         message: error.to_string(),
                     })
                     .await;
@@ -1003,11 +1003,10 @@ mod tests {
         }));
 
         assert_eq!(presentation.summary, "bash");
-        assert_eq!(
-            presentation.preview.as_deref(),
-            Some("cargo test -p ri-core")
-        );
-        assert!(!presentation.preview.unwrap().contains("\"command\":"));
+        assert_eq!(presentation.preview.len(), 1);
+        assert_eq!(presentation.preview[0].text, "cargo test -p ri-core");
+        assert_eq!(presentation.preview[0].kind, ToolPreviewKind::Command);
+        assert!(!presentation.preview[0].text.contains("\"command\":"));
     }
 
     #[test]
