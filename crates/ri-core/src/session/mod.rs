@@ -896,7 +896,10 @@ impl SessionWriter {
         if self.info.thinking_level == Some(level) {
             return Ok(self.info.clone());
         }
-        self.materialize()?;
+        if self.file.is_none() {
+            self.info.thinking_level = Some(level);
+            return Ok(self.info.clone());
+        }
         let timestamp = now_timestamp();
         let record = SessionRecord::Thinking {
             timestamp: timestamp.clone(),
@@ -941,6 +944,18 @@ impl SessionWriter {
             },
             &self.info.path,
         )?;
+        if let Some(level) = self.info.thinking_level {
+            let timestamp = now_timestamp();
+            append_record(
+                &mut file,
+                &SessionRecord::Thinking {
+                    timestamp: timestamp.clone(),
+                    level,
+                },
+                &self.info.path,
+            )?;
+            self.info.updated_at = timestamp;
+        }
         self.file = Some(file);
         self._lock = Some(lock);
         self.info.path = fs::canonicalize(&self.info.path)
@@ -1962,12 +1977,39 @@ mod tests {
     }
 
     #[test]
-    fn thinking_level_metadata_round_trips_and_latest_value_wins() {
-        let workspace = test_dir("thinking");
+    fn pending_thinking_level_preserves_lazy_session_and_materializes_with_first_message() {
+        let workspace = test_dir("thinking-lazy");
         fs::create_dir_all(&workspace).unwrap();
         let repository =
             SessionRepository::new(workspace.join("sessions"), &workspace, &workspace).unwrap();
         let handle = repository.create().unwrap();
+
+        handle.set_thinking_level(ThinkingLevel::High).unwrap();
+        assert!(!handle.info().unwrap().materialized);
+        assert!(repository.list().unwrap().is_empty());
+
+        handle
+            .append_message(&ModelMessage::user("first message"))
+            .unwrap();
+        let info = handle.info().unwrap();
+        assert!(info.materialized);
+        let path = info.path;
+        drop(handle);
+
+        let opened = repository.open_path(path).unwrap();
+        assert_eq!(opened.info.thinking_level, Some(ThinkingLevel::High));
+        assert_eq!(opened.history, [ModelMessage::user("first message")]);
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn thinking_level_metadata_round_trips_and_latest_value_wins() {
+        let workspace = test_dir("thinking-latest");
+        fs::create_dir_all(&workspace).unwrap();
+        let repository =
+            SessionRepository::new(workspace.join("sessions"), &workspace, &workspace).unwrap();
+        let handle = repository.create().unwrap();
+        handle.append_message(&ModelMessage::user("hello")).unwrap();
         handle.set_thinking_level(ThinkingLevel::High).unwrap();
         handle.set_thinking_level(ThinkingLevel::Low).unwrap();
         let path = handle.info().unwrap().path;
