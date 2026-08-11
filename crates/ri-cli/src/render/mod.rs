@@ -408,6 +408,7 @@ struct TranscriptLayoutCache {
     indices: Vec<EntryLayoutIndex>,
     positions: HashMap<TranscriptEntryId, usize>,
     static_total_rows: usize,
+    deferred_start_row: usize,
     streaming_id: Option<TranscriptEntryId>,
     streaming_row_count: usize,
     streaming_layout: Option<StreamingCachedLayout>,
@@ -454,6 +455,7 @@ impl TranscriptLayoutCache {
             for entry in state.transcript_entries() {
                 self.append_static_entry(entry, width, stats);
             }
+            self.update_deferred_start(state);
             self.update_streaming(state.streaming_assistant_state(), width, stats);
             self.update_fallback(width, stats);
             return;
@@ -480,6 +482,7 @@ impl TranscriptLayoutCache {
                 self.refresh_static_entry(index, state, width, stats);
             }
         }
+        self.update_deferred_start(state);
         self.update_streaming(state.streaming_assistant_state(), width, stats);
         self.update_fallback(width, stats);
     }
@@ -491,6 +494,7 @@ impl TranscriptLayoutCache {
         self.indices = Vec::new();
         self.positions = HashMap::new();
         self.static_total_rows = 0;
+        self.deferred_start_row = 0;
         self.streaming_id = None;
         self.streaming_row_count = 0;
         self.streaming_layout = None;
@@ -518,6 +522,22 @@ impl TranscriptLayoutCache {
         });
         self.positions.insert(entry.id, index);
         self.static_total_rows = self.static_total_rows.saturating_add(row_count);
+    }
+
+    fn update_deferred_start(&mut self, state: &AppState) {
+        self.deferred_start_row = state
+            .transcript_entries()
+            .iter()
+            .position(|entry| {
+                matches!(
+                    &entry.entry,
+                    TranscriptEntry::Message(message)
+                        if message.role == MessageRole::User
+                            && message.user_status != UserMessageStatus::Delivered
+                )
+            })
+            .and_then(|index| self.indices.get(index).map(|entry| entry.start))
+            .unwrap_or(self.static_total_rows);
     }
 
     fn refresh_static_entry(
@@ -782,32 +802,43 @@ impl TranscriptLayoutCache {
 
     fn row_at(&self, row: usize, stats: &mut RenderStats) -> Option<&CachedRow> {
         stats.index_lookups = stats.index_lookups.saturating_add(1);
-        if self.static_total_rows > 0 && row < self.static_total_rows {
-            let mut low = 0;
-            let mut high = self.indices.len();
-            while low < high {
-                let middle = low + (high - low) / 2;
-                if self.indices[middle].start <= row {
-                    low = middle + 1;
-                } else {
-                    high = middle;
-                }
-            }
-            let index = low.checked_sub(1)?;
-            let entry = self.indices.get(index)?;
-            let local = row.saturating_sub(entry.start);
-            stats.cache_hits = stats.cache_hits.saturating_add(1);
-            return self.layouts.get(&entry.id)?.rows.get(local);
+        if row < self.deferred_start_row {
+            return self.static_row_at(row, stats);
         }
 
-        if self.streaming_id.is_some() {
-            let local = row.saturating_sub(self.static_total_rows);
+        let after_static = row.saturating_sub(self.deferred_start_row);
+        if self.streaming_id.is_some() && after_static < self.streaming_row_count {
             stats.cache_hits = stats.cache_hits.saturating_add(1);
-            return self.streaming_layout.as_ref()?.row_at(local);
+            return self.streaming_layout.as_ref()?.row_at(after_static);
+        }
+
+        let source_row = self
+            .deferred_start_row
+            .saturating_add(after_static.saturating_sub(self.streaming_row_count));
+        if source_row < self.static_total_rows {
+            return self.static_row_at(source_row, stats);
         }
 
         stats.cache_hits = stats.cache_hits.saturating_add(1);
         self.fallback.as_ref()?.rows.get(row)
+    }
+
+    fn static_row_at(&self, row: usize, stats: &mut RenderStats) -> Option<&CachedRow> {
+        let mut low = 0;
+        let mut high = self.indices.len();
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.indices[middle].start <= row {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        let index = low.checked_sub(1)?;
+        let entry = self.indices.get(index)?;
+        let local = row.saturating_sub(entry.start);
+        stats.cache_hits = stats.cache_hits.saturating_add(1);
+        self.layouts.get(&entry.id)?.rows.get(local)
     }
 }
 
@@ -1576,6 +1607,56 @@ mod tests {
             .draw(&mut terminal, &state, 0)
             .expect("edited editor draw should succeed");
         assert_eq!(renderer.stats().editor_cache_misses, 1);
+    }
+
+    #[test]
+    fn queued_messages_stay_after_live_output_and_safe_boundary_entries() {
+        let mut state = AppState::new();
+        state.reduce(AgentEvent::TurnStarted);
+        state.reduce(AgentEvent::AssistantMessageStarted);
+        state.reduce(AgentEvent::AssistantTextDelta {
+            index: None,
+            text: "working".to_owned(),
+        });
+        state.insert_text("also add tests");
+        state.queue_input().expect("queued input");
+
+        let mut renderer = TuiRenderer::new();
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("test terminal");
+        renderer.draw(&mut terminal, &state, 0).unwrap();
+        let mut stats = RenderStats::default();
+        let rows = (0..renderer.transcript.total_rows())
+            .filter_map(|row| renderer.transcript.row_at(row, &mut stats))
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>();
+        let live = rows.iter().position(|row| *row == "  working").unwrap();
+        let queued = rows
+            .iter()
+            .position(|row| *row == "▶ you · queued")
+            .unwrap();
+        assert!(live < queued);
+
+        state.reduce(AgentEvent::AssistantMessageFinished { items: Vec::new() });
+        state.reduce(AgentEvent::ToolExecutionStarted {
+            call_id: "tool".to_owned(),
+            name: "read".to_owned(),
+            arguments: r#"{"path":"file"}"#.to_owned(),
+        });
+        state.reduce(AgentEvent::SteeringMessageDelivered {
+            text: "also add tests".to_owned(),
+        });
+        assert!(matches!(
+            state.transcript_entries()[0].entry,
+            TranscriptEntry::Message(_)
+        ));
+        assert!(matches!(
+            state.transcript_entries()[1].entry,
+            TranscriptEntry::Tool(_)
+        ));
+        assert!(matches!(
+            state.transcript_entries()[2].entry,
+            TranscriptEntry::Message(_)
+        ));
     }
 
     #[test]

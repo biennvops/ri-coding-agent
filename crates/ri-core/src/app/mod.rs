@@ -679,9 +679,11 @@ impl AppState {
         id: TranscriptEntryId,
         revision: u64,
     ) {
-        let entry_index = self.entries.len();
-        self.push_entry_with_identity(TranscriptEntry::Message(message), id, revision);
-        self.message_entry_indices.push(entry_index);
+        let entry_index =
+            self.push_entry_with_identity(TranscriptEntry::Message(message), id, revision);
+        if entry_index + 1 == self.entries.len() {
+            self.message_entry_indices.push(entry_index);
+        }
     }
 
     fn push_entry(&mut self, entry: TranscriptEntry) -> TranscriptEntryId {
@@ -695,13 +697,37 @@ impl AppState {
         entry: TranscriptEntry,
         id: TranscriptEntryId,
         revision: u64,
-    ) {
-        self.entries.push(TranscriptEntryState {
-            id,
-            revision,
-            entry,
-        });
+    ) -> usize {
+        let entry_index = if is_deferred_user_entry(&entry) {
+            self.entries.len()
+        } else {
+            self.entries
+                .iter()
+                .position(|entry| is_deferred_user_entry(&entry.entry))
+                .unwrap_or(self.entries.len())
+        };
+        let inserted = entry_index < self.entries.len();
+        self.entries.insert(
+            entry_index,
+            TranscriptEntryState {
+                id,
+                revision,
+                entry,
+            },
+        );
+        if inserted {
+            self.transcript_epoch = self.transcript_epoch.wrapping_add(1);
+            self.message_entry_indices = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| {
+                    matches!(entry.entry, TranscriptEntry::Message(_)).then_some(index)
+                })
+                .collect();
+        }
         self.mark_transcript_changed(id);
+        entry_index
     }
 
     fn allocate_transcript_entry_id(&mut self) -> TranscriptEntryId {
@@ -897,6 +923,17 @@ impl AppState {
             );
         }
     }
+}
+
+fn is_deferred_user_entry(entry: &TranscriptEntry) -> bool {
+    matches!(
+        entry,
+        TranscriptEntry::Message(TranscriptMessage {
+            role: MessageRole::User,
+            user_status: UserMessageStatus::Queued | UserMessageStatus::Recovered,
+            ..
+        })
+    )
 }
 
 fn append_tool_output_chunk(
