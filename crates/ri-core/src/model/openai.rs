@@ -2353,7 +2353,7 @@ mod tests {
                         "models": [{
                             "id": "m",
                             "reasoning": true,
-                            "thinkingLevelMap": {"high": "max"}
+                            "thinkingLevelMap": {"max": "max"}
                         }]
                     }
                 }
@@ -2362,7 +2362,7 @@ mod tests {
         .unwrap();
         let responses_model = catalog.resolve(None, None).unwrap();
         let mut request = ModelRequest::single_user("hello");
-        request.reasoning_effort = responses_model.thinking_effort(ThinkingLevel::High);
+        request.reasoning_effort = responses_model.thinking_effort(ThinkingLevel::Max);
 
         let (_, responses) = request_for(&responses_model, &request).unwrap();
         assert_eq!(responses["reasoning"], json!({"effort": "max"}));

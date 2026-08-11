@@ -1984,7 +1984,7 @@ mod tests {
             SessionRepository::new(workspace.join("sessions"), &workspace, &workspace).unwrap();
         let handle = repository.create().unwrap();
 
-        handle.set_thinking_level(ThinkingLevel::High).unwrap();
+        handle.set_thinking_level(ThinkingLevel::Max).unwrap();
         assert!(!handle.info().unwrap().materialized);
         assert!(repository.list().unwrap().is_empty());
 
@@ -1997,7 +1997,7 @@ mod tests {
         drop(handle);
 
         let opened = repository.open_path(path).unwrap();
-        assert_eq!(opened.info.thinking_level, Some(ThinkingLevel::High));
+        assert_eq!(opened.info.thinking_level, Some(ThinkingLevel::Max));
         assert_eq!(opened.history, [ModelMessage::user("first message")]);
         fs::remove_dir_all(workspace).unwrap();
     }

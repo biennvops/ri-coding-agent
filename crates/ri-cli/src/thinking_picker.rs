@@ -57,11 +57,16 @@ mod tests {
     #[test]
     fn rows_mark_only_the_selected_level() {
         let rows = rows(
-            &[ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::High],
+            &[
+                ThinkingLevel::Off,
+                ThinkingLevel::Low,
+                ThinkingLevel::High,
+                ThinkingLevel::Max,
+            ],
             1,
         );
         let rendered = rows.iter().map(|line| line.to_string()).collect::<Vec<_>>();
 
-        assert_eq!(rendered, ["  off", "> low", "  high"]);
+        assert_eq!(rendered, ["  off", "> low", "  high", "  max"]);
     }
 }

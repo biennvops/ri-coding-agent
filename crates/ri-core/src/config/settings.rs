@@ -380,6 +380,22 @@ mod tests {
     }
 
     #[test]
+    fn max_default_thinking_level_is_accepted() {
+        let root = unique_test_dir("settings-thinking-max");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("settings.json");
+        fs::write(&path, r#"{"defaultThinkingLevel":"max"}"#).unwrap();
+
+        let load = load_settings_from_paths(Some(&path), None).unwrap();
+
+        assert_eq!(
+            load.settings.default_thinking_level,
+            Some(ThinkingLevel::Max)
+        );
+        remove_test_dir(root);
+    }
+
+    #[test]
     fn unknown_fields_are_warnings_with_stable_paths() {
         let root = unique_test_dir("settings-warning");
         fs::create_dir_all(&root).unwrap();

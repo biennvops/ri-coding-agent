@@ -401,7 +401,7 @@ fn parse_thinking_level_map(
         .map(|(key, value)| {
             let level = key.parse::<ThinkingLevel>().map_err(|_| {
                 ConfigError::Invalid(format!(
-                    "model {provider}/{model} thinkingLevelMap key {key:?} is invalid; expected off, minimal, low, medium, high, or xhigh"
+                    "model {provider}/{model} thinkingLevelMap key {key:?} is invalid; expected off, minimal, low, medium, high, xhigh, or max"
                 ))
             })?;
             if value.as_deref().is_some_and(|value| value.trim().is_empty()) {
@@ -681,6 +681,41 @@ mod tests {
                 .model_ref
                 .model,
             "second"
+        );
+    }
+
+    #[test]
+    fn max_thinking_level_map_key_resolves_to_native_effort() {
+        let catalog = ModelCatalog::from_json(
+            "models.json",
+            r#"{
+                "providers": {
+                    "p": {
+                        "baseUrl": "https://example.test",
+                        "api": "openai-responses",
+                        "models": [{
+                            "id": "m",
+                            "reasoning": true,
+                            "thinkingLevelMap": {"xhigh": "xhigh-native", "max": "max"}
+                        }]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let model = catalog.resolve(None, None).unwrap();
+
+        assert_eq!(
+            model.thinking_effort(ThinkingLevel::XHigh).as_deref(),
+            Some("xhigh-native")
+        );
+        assert_eq!(
+            model.thinking_effort(ThinkingLevel::Max).as_deref(),
+            Some("max")
+        );
+        assert_eq!(
+            model.supported_thinking_levels().last(),
+            Some(&ThinkingLevel::Max)
         );
     }
 

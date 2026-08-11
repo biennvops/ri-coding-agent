@@ -143,7 +143,7 @@ impl Options {
         println!(
             "ri — a small Rust coding agent\n\n\
              Usage:\n  ri                              start the interactive TUI\n  ri -p, --print <prompt>         run one prompt without the TUI\n  ri --json -p <prompt>           emit versioned NDJSON events\n\n\
-             Model:\n  --provider <id>                 select a configured provider\n  --model <id>                   select a configured model\n  --thinking <level>              set reasoning level (off, minimal, low, medium, high, xhigh)\n\n\
+             Model:\n  --provider <id>                 select a configured provider\n  --model <id>                   select a configured model\n  --thinking <level>              set reasoning level (off, minimal, low, medium, high, xhigh, max)\n\n\
              Sessions:\n  -c, --continue                 continue the newest saved session\n  -r, --resume                   choose a saved session interactively\n  --session <id-or-path>         resume one saved session\n  --no-session                   disable session persistence\n\n\
              Context and help:\n  --no-context                   disable AGENTS context loading\n  -h, --help                    show this help\n  -V, --version                 show the version\n\n\
              Interactive commands:\n{}\n\n\
@@ -1701,6 +1701,8 @@ mod tests {
                 "custom".to_owned(),
                 "--model".to_owned(),
                 "coding".to_owned(),
+                "--thinking".to_owned(),
+                "max".to_owned(),
             ])
             .unwrap(),
             Options {
@@ -1708,7 +1710,7 @@ mod tests {
                 json: false,
                 provider: Some("custom".to_owned()),
                 model: Some("coding".to_owned()),
-                thinking: None,
+                thinking: Some(ri_core::ThinkingLevel::Max),
                 no_context: false,
                 show_help: false,
                 continue_session: false,
@@ -1874,7 +1876,11 @@ mod tests {
                             {
                                 "id": "mapped",
                                 "reasoning": true,
-                                "thinkingLevelMap": {"high": "max"}
+                                "thinkingLevelMap": {
+                                    "high": "high-native",
+                                    "xhigh": "xhigh-native",
+                                    "max": "max"
+                                }
                             },
                             {
                                 "id": "clamped",
@@ -1884,7 +1890,8 @@ mod tests {
                                     "low": "low-native",
                                     "medium": null,
                                     "high": null,
-                                    "xhigh": null
+                                    "xhigh": null,
+                                    "max": null
                                 }
                             }
                         ]
@@ -1898,18 +1905,18 @@ mod tests {
         assert_eq!(
             resolve_thinking_level(
                 &mapped,
-                Some(ri_core::ThinkingLevel::High),
+                Some(ri_core::ThinkingLevel::Max),
                 UnsupportedThinkingPolicy::AdjustDown,
             )
             .unwrap(),
-            (Some(ri_core::ThinkingLevel::High), Some("max".to_owned()))
+            (Some(ri_core::ThinkingLevel::Max), Some("max".to_owned()))
         );
 
         let clamped = catalog.resolve(None, Some("clamped")).unwrap();
         assert_eq!(
             resolve_thinking_level(
                 &clamped,
-                Some(ri_core::ThinkingLevel::High),
+                Some(ri_core::ThinkingLevel::Max),
                 UnsupportedThinkingPolicy::AdjustDown,
             )
             .unwrap(),
@@ -1921,11 +1928,11 @@ mod tests {
         assert_eq!(
             resolve_thinking_level(
                 &clamped,
-                Some(ri_core::ThinkingLevel::High),
+                Some(ri_core::ThinkingLevel::Max),
                 UnsupportedThinkingPolicy::Reject,
             )
             .unwrap_err(),
-            "high is not supported by provider/clamped; supported levels: off, low"
+            "max is not supported by provider/clamped; supported levels: off, low"
         );
     }
 
