@@ -1623,6 +1623,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reasoning_effort_updates_next_turn_and_stays_stable_across_tool_rounds() {
+        let root = unique_test_dir("reasoning-effort");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("note.txt"), "hello\n").unwrap();
+        let provider = ScriptedProvider::new(vec![
+            ScriptedStep {
+                events: Vec::new(),
+                response: ModelResponse {
+                    items: vec![ModelAssistantItem::ToolCall(tool_call(
+                        "read-call",
+                        "read",
+                        r#"{"path":"note.txt"}"#,
+                    ))],
+                    stop_reason: StopReason::ToolCalls,
+                    usage: None,
+                },
+            },
+            final_step("first done"),
+            final_step("second done"),
+        ]);
+        let requests = Arc::clone(&provider.requests);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let runtime = AgentRuntime::with_config(
+            provider,
+            AgentRuntimeConfig {
+                tool_context: ToolContext::new(&root).unwrap(),
+                base_messages: Vec::new(),
+                initial_history: Vec::new(),
+                session: SessionMode::Disabled,
+                reasoning_effort: Some("old-native".to_owned()),
+            },
+        );
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "read note".to_owned(),
+            })
+            .await
+            .unwrap();
+        collect_turn(&mut event_rx).await;
+        command_tx
+            .send(AgentCommand::SetReasoningEffort {
+                effort: Some("new-native".to_owned()),
+            })
+            .await
+            .unwrap();
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "continue".to_owned(),
+            })
+            .await
+            .unwrap();
+        collect_turn(&mut event_rx).await;
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].reasoning_effort.as_deref(), Some("old-native"));
+        assert_eq!(requests[1].reasoning_effort.as_deref(), Some("old-native"));
+        assert_eq!(requests[2].reasoning_effort.as_deref(), Some("new-native"));
+        drop(requests);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn runtime_cancels_active_turn() {
         let (command_tx, command_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(32);
@@ -2946,7 +3014,7 @@ mod tests {
                 base_messages: Vec::new(),
                 initial_history,
                 session: SessionMode::Disabled,
-                reasoning_effort: None,
+                reasoning_effort: Some("high-native".to_owned()),
             },
         );
         let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
@@ -2969,6 +3037,7 @@ mod tests {
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert!(requests[0].tools.is_empty());
+        assert_eq!(requests[0].reasoning_effort, None);
     }
 
     #[tokio::test]

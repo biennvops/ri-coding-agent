@@ -1538,7 +1538,7 @@ impl SseParser {
 mod tests {
     use super::*;
     use crate::agent::{AgentCommand, AgentEvent, AgentRuntime};
-    use crate::config::{Compatibility, CostMetadata, ModelRef};
+    use crate::config::{Compatibility, CostMetadata, ModelCatalog, ModelRef, ThinkingLevel};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -2339,6 +2339,46 @@ mod tests {
                 max_output_tokens: None,
             }
         );
+    }
+
+    #[test]
+    fn reasoning_effort_uses_api_shape_native_mapping_and_omits_off() {
+        let catalog = ModelCatalog::from_json(
+            "models.json",
+            r#"{
+                "providers": {
+                    "p": {
+                        "baseUrl": "https://example.test/v1",
+                        "api": "openai-responses",
+                        "models": [{
+                            "id": "m",
+                            "reasoning": true,
+                            "thinkingLevelMap": {"high": "max"}
+                        }]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let responses_model = catalog.resolve(None, None).unwrap();
+        let mut request = ModelRequest::single_user("hello");
+        request.reasoning_effort = responses_model.thinking_effort(ThinkingLevel::High);
+
+        let (_, responses) = request_for(&responses_model, &request).unwrap();
+        assert_eq!(responses["reasoning"], json!({"effort": "max"}));
+        assert!(responses.get("reasoning_effort").is_none());
+
+        let mut completions_model = responses_model.clone();
+        completions_model.api = ApiKind::OpenAiCompletions;
+        let (_, completions) = request_for(&completions_model, &request).unwrap();
+        assert_eq!(completions["reasoning_effort"], "max");
+        assert!(completions.get("reasoning").is_none());
+
+        request.reasoning_effort = responses_model.thinking_effort(ThinkingLevel::Off);
+        let (_, responses_off) = request_for(&responses_model, &request).unwrap();
+        let (_, completions_off) = request_for(&completions_model, &request).unwrap();
+        assert!(responses_off.get("reasoning").is_none());
+        assert!(completions_off.get("reasoning_effort").is_none());
     }
 
     fn test_model(api: ApiKind, base_url: String) -> ResolvedModel {
