@@ -371,9 +371,9 @@ struct StreamingCachedLayout {
 impl StreamingCachedLayout {
     fn row_count(&self) -> usize {
         1usize
-            .saturating_add(self.content_rows.len())
             .saturating_add((!self.thinking_rows.is_empty()) as usize)
             .saturating_add(self.thinking_rows.len())
+            .saturating_add(self.content_rows.len())
     }
 
     fn row_at(&self, row: usize) -> Option<&CachedRow> {
@@ -381,17 +381,18 @@ impl StreamingCachedLayout {
             return Some(&self.header);
         }
         let row = row - 1;
-        if row < self.content_rows.len() {
-            return self.content_rows.get(row);
+        let thinking_section_rows = if self.thinking_rows.is_empty() {
+            0
+        } else {
+            self.thinking_rows.len().saturating_add(1)
+        };
+        if row < thinking_section_rows {
+            if row == 0 {
+                return Some(&self.thinking_header);
+            }
+            return self.thinking_rows.get(row - 1);
         }
-        let row = row - self.content_rows.len();
-        if self.thinking_rows.is_empty() {
-            return None;
-        }
-        if row == 0 {
-            return Some(&self.thinking_header);
-        }
-        self.thinking_rows.get(row - 1)
+        self.content_rows.get(row - thinking_section_rows)
     }
 }
 
@@ -877,7 +878,6 @@ fn layout_message(
         MessageRole::Assistant => Style::default().fg(Color::Green),
     };
     let mut rows = layout_styled_lines(&format!("▶ {label}"), style, width);
-    append_layout_content(&mut rows, content, Style::default(), width);
     if let Some(thinking) = thinking {
         rows.extend(layout_styled_lines(
             "  thinking:",
@@ -891,6 +891,7 @@ fn layout_message(
             width,
         );
     }
+    append_layout_content(&mut rows, content, Style::default(), width);
     rows
 }
 
@@ -1297,6 +1298,71 @@ mod tests {
                 .iter()
                 .map(|row| row.text.as_str())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn thinking_precedes_answer_before_and_after_finalization() {
+        let mut state = AppState::new();
+        state.reduce(AgentEvent::AssistantMessageStarted);
+        for text in ["thinking A", "\nthinking B"] {
+            state.reduce(AgentEvent::AssistantThinkingDelta {
+                item_id: None,
+                text: text.to_owned(),
+            });
+        }
+        for text in ["answer A", "\nanswer B"] {
+            state.reduce(AgentEvent::AssistantTextDelta {
+                index: None,
+                text: text.to_owned(),
+            });
+        }
+
+        let mut renderer = TuiRenderer::new();
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("test terminal");
+        renderer
+            .draw(&mut terminal, &state, 0)
+            .expect("streaming draw should succeed");
+        let streaming_layout = renderer
+            .transcript
+            .streaming_layout
+            .as_ref()
+            .expect("streaming layout");
+        let before = (1..streaming_layout.row_count())
+            .filter_map(|row| streaming_layout.row_at(row))
+            .map(|row| row.text.clone())
+            .collect::<Vec<_>>();
+
+        state.reduce(AgentEvent::AssistantMessageFinished { items: Vec::new() });
+        renderer
+            .draw(&mut terminal, &state, 0)
+            .expect("finalized draw should succeed");
+        let entry = state
+            .transcript_entries()
+            .last()
+            .expect("finalized transcript entry");
+        let after = renderer
+            .transcript
+            .layouts
+            .get(&entry.id)
+            .expect("finalized layout")
+            .rows
+            .iter()
+            .skip(1)
+            .take(before.len())
+            .map(|row| row.text.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(before, after);
+        assert_eq!(
+            before,
+            [
+                "  thinking:",
+                "  thinking A",
+                "  thinking B",
+                "  answer A",
+                "  answer B",
+            ]
         );
     }
 
