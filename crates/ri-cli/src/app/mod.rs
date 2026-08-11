@@ -899,6 +899,7 @@ async fn run_tui_loop(
                             if !matches!(action, Action::Up | Action::Down) {
                                 preferred_column = None;
                             }
+                            let input_revision = state.input_revision();
                             match action {
                                 Action::Submit => {
                                     suggestions.accept(state);
@@ -977,7 +978,14 @@ async fn run_tui_loop(
                                 Action::MouseScrollUp => scroll.scroll_up(MOUSE_SCROLL_ROWS),
                                 Action::MouseScrollDown => scroll.scroll_down(MOUSE_SCROLL_ROWS),
                             }
+                            resume_live_after_editor_mutation(input_revision, state, &mut scroll);
                         }
+                    }
+                    Event::Paste(text) => {
+                        let input_revision = state.input_revision();
+                        state.insert_text(&text);
+                        resume_live_after_editor_mutation(input_revision, state, &mut scroll);
+                        redraw.request(RedrawUrgency::Immediate, Instant::now());
                     }
                     Event::Mouse(mouse) => {
                         if let Some(action) = input::action_for_mouse(mouse) {
@@ -1007,6 +1015,16 @@ async fn run_tui_loop(
     }
 
     Ok(())
+}
+
+fn resume_live_after_editor_mutation(
+    input_revision: u64,
+    state: &AppState,
+    scroll: &mut TranscriptScroll,
+) {
+    if state.input_revision() != input_revision {
+        scroll.follow_bottom();
+    }
 }
 
 fn move_editor_or_suggestion(
@@ -2071,6 +2089,26 @@ mod tests {
             &mut suggestions,
         );
         assert!(state.cursor() < state.input().len());
+    }
+
+    #[test]
+    fn editor_mutations_resume_live_following_but_cursor_motion_does_not() {
+        let mut state = AppState::new();
+        state.insert_text("abc");
+        let mut scroll = TranscriptScroll::default();
+        scroll.update_maximum(100);
+        scroll.scroll_up(20);
+
+        let revision = state.input_revision();
+        state.move_left();
+        resume_live_after_editor_mutation(revision, &state, &mut scroll);
+        assert_eq!(scroll.from_bottom(), 20);
+
+        let revision = state.input_revision();
+        state.insert_text("x\ny");
+        resume_live_after_editor_mutation(revision, &state, &mut scroll);
+        assert_eq!(scroll.from_bottom(), 0);
+        assert_eq!(state.input(), "abx\nyc");
     }
 
     #[test]

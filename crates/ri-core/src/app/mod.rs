@@ -198,7 +198,7 @@ impl AppState {
     }
 
     pub fn set_cursor(&mut self, cursor: usize) {
-        if !self.is_busy() && cursor <= self.input.len() && self.input.is_char_boundary(cursor) {
+        if cursor <= self.input.len() && self.input.is_char_boundary(cursor) {
             self.cursor = cursor;
         }
     }
@@ -288,7 +288,7 @@ impl AppState {
     }
 
     pub fn insert_text(&mut self, text: &str) {
-        if self.is_busy() || text.is_empty() {
+        if text.is_empty() {
             return;
         }
         self.input.insert_str(self.cursor, text);
@@ -297,7 +297,7 @@ impl AppState {
     }
 
     pub fn set_input(&mut self, text: String) {
-        if self.is_busy() || self.input == text {
+        if self.input == text {
             return;
         }
         self.input = text;
@@ -310,7 +310,7 @@ impl AppState {
     }
 
     pub fn backspace(&mut self) {
-        if self.is_busy() || self.cursor == 0 {
+        if self.cursor == 0 {
             return;
         }
         let previous = previous_grapheme_boundary(&self.input, self.cursor);
@@ -320,7 +320,7 @@ impl AppState {
     }
 
     pub fn delete(&mut self) {
-        if self.is_busy() || self.cursor == self.input.len() {
+        if self.cursor == self.input.len() {
             return;
         }
         let next = next_grapheme_boundary(&self.input, self.cursor);
@@ -329,31 +329,23 @@ impl AppState {
     }
 
     pub fn move_left(&mut self) {
-        if !self.is_busy() {
-            self.cursor = previous_grapheme_boundary(&self.input, self.cursor);
-        }
+        self.cursor = previous_grapheme_boundary(&self.input, self.cursor);
     }
 
     pub fn move_right(&mut self) {
-        if !self.is_busy() {
-            self.cursor = next_grapheme_boundary(&self.input, self.cursor);
-        }
+        self.cursor = next_grapheme_boundary(&self.input, self.cursor);
     }
 
     pub fn move_home(&mut self) {
-        if !self.is_busy() {
-            self.cursor = line_start(&self.input, self.cursor);
-        }
+        self.cursor = line_start(&self.input, self.cursor);
     }
 
     pub fn move_end(&mut self) {
-        if !self.is_busy() {
-            self.cursor = line_end(&self.input, self.cursor);
-        }
+        self.cursor = line_end(&self.input, self.cursor);
     }
 
     pub fn take_input(&mut self) -> Option<String> {
-        if self.is_busy() || self.input.trim().is_empty() {
+        if self.input.trim().is_empty() {
             return None;
         }
         let text = std::mem::take(&mut self.input);
@@ -371,6 +363,9 @@ impl AppState {
     }
 
     pub fn submit_input(&mut self) -> Option<String> {
+        if self.is_busy() {
+            return None;
+        }
         let text = self.take_input()?;
         self.finalize_streaming_assistant();
         self.push_message(TranscriptMessage {
@@ -1538,12 +1533,24 @@ mod tests {
     }
 
     #[test]
-    fn compaction_busy_state_disables_editor_until_finished() {
+    fn editor_remains_usable_during_turns_and_compaction() {
         let mut state = AppState::new();
-        state.insert_text("/compact");
+        state.insert_text("abc");
+        state.reduce(AgentEvent::TurnStarted);
+        state.insert_text("d");
+        state.move_left();
+        state.backspace();
+        state.insert_newline();
+        state.delete();
+        assert_eq!(state.input(), "ab\n");
+        assert_eq!(state.take_input().as_deref(), Some("ab\n"));
+
+        state.reduce(AgentEvent::TurnFinished {
+            reason: StopReason::Stop,
+        });
         state.set_compaction_active(true);
-        assert!(state.is_busy());
-        assert_eq!(state.take_input(), None);
+        state.insert_text("during compaction");
+        assert_eq!(state.input(), "during compaction");
         state.reduce(AgentEvent::CompactionFinished {
             automatic: false,
             before_tokens: 142_000,

@@ -254,13 +254,8 @@ impl TuiRenderer {
         let editor_scroll = cursor
             .row
             .saturating_sub(editor_visible_lines.saturating_sub(1));
-        let editor_title = if state.is_busy() {
-            " input · Esc cancels · PgUp scroll "
-        } else {
-            " input · Enter submits · Shift+Enter newline · PgUp scroll "
-        };
         let editor = Paragraph::new(editor_lines)
-            .block(Block::default().borders(Borders::ALL).title(editor_title))
+            .block(Block::default().borders(Borders::ALL).title(" input "))
             .scroll((editor_scroll.min(u16::MAX as usize) as u16, 0));
         frame.render_widget(editor, chunks[1]);
         if let Some(suggestions) = suggestions {
@@ -270,7 +265,7 @@ impl TuiRenderer {
         let footer = footer_text(state, chunks[2].width, scroll_from_bottom);
         frame.render_widget(Paragraph::new(footer), chunks[2]);
 
-        if !state.is_busy() && chunks[1].height > 2 {
+        if chunks[1].height > 2 {
             let x = chunks[1]
                 .x
                 .saturating_add(1)
