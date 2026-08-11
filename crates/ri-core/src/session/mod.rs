@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::config::ThinkingLevel;
 use crate::conversation::{CompactionSummary, ConversationHistory};
 use crate::model::{ModelAssistantItem, ModelMessage, ModelThinking, ModelToolCall};
 
@@ -338,6 +339,11 @@ pub enum SessionRecord {
     },
     #[serde(rename = "metadata")]
     Metadata { timestamp: String, name: String },
+    #[serde(rename = "thinking")]
+    Thinking {
+        timestamp: String,
+        level: ThinkingLevel,
+    },
     #[serde(rename = "compaction")]
     Compaction {
         id: MessageId,
@@ -367,7 +373,10 @@ impl SessionRecord {
                 workspace_root: workspace_root.clone(),
                 project_root: project_root.clone(),
             }),
-            Self::Message { .. } | Self::Metadata { .. } | Self::Compaction { .. } => None,
+            Self::Message { .. }
+            | Self::Metadata { .. }
+            | Self::Thinking { .. }
+            | Self::Compaction { .. } => None,
         }
     }
 
@@ -376,6 +385,7 @@ impl SessionRecord {
             Self::Session { created_at, .. } => Some(created_at),
             Self::Message { timestamp, .. }
             | Self::Metadata { timestamp, .. }
+            | Self::Thinking { timestamp, .. }
             | Self::Compaction { timestamp, .. } => Some(timestamp),
         }
     }
@@ -386,6 +396,7 @@ pub struct SessionInfo {
     pub id: SessionId,
     pub path: PathBuf,
     pub name: Option<String>,
+    pub thinking_level: Option<ThinkingLevel>,
     pub created_at: String,
     pub updated_at: String,
     pub workspace_root: PathBuf,
@@ -568,6 +579,13 @@ impl SessionHandle {
             .map_err(|_| SessionError::WriterPoisoned)?
             .rename(&name)
     }
+
+    pub fn set_thinking_level(&self, level: ThinkingLevel) -> Result<SessionInfo, SessionError> {
+        self.inner
+            .lock()
+            .map_err(|_| SessionError::WriterPoisoned)?
+            .set_thinking_level(level)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -672,6 +690,7 @@ impl SessionWriter {
             id,
             path,
             name: None,
+            thinking_level: None,
             created_at: created_at.clone(),
             updated_at: created_at,
             workspace_root,
@@ -873,6 +892,29 @@ impl SessionWriter {
         Ok(self.info.clone())
     }
 
+    fn set_thinking_level(&mut self, level: ThinkingLevel) -> Result<SessionInfo, SessionError> {
+        if self.info.thinking_level == Some(level) {
+            return Ok(self.info.clone());
+        }
+        if self.file.is_none() {
+            self.info.thinking_level = Some(level);
+            return Ok(self.info.clone());
+        }
+        let timestamp = now_timestamp();
+        let record = SessionRecord::Thinking {
+            timestamp: timestamp.clone(),
+            level,
+        };
+        append_record(
+            self.file.as_mut().expect("materialized session"),
+            &record,
+            &self.info.path,
+        )?;
+        self.info.thinking_level = Some(level);
+        self.info.updated_at = timestamp;
+        Ok(self.info.clone())
+    }
+
     fn materialize(&mut self) -> Result<(), SessionError> {
         if self.file.is_some() {
             debug_assert!(self._lock.is_some());
@@ -902,6 +944,18 @@ impl SessionWriter {
             },
             &self.info.path,
         )?;
+        if let Some(level) = self.info.thinking_level {
+            let timestamp = now_timestamp();
+            append_record(
+                &mut file,
+                &SessionRecord::Thinking {
+                    timestamp: timestamp.clone(),
+                    level,
+                },
+                &self.info.path,
+            )?;
+            self.info.updated_at = timestamp;
+        }
         self.file = Some(file);
         self._lock = Some(lock);
         self.info.path = fs::canonicalize(&self.info.path)
@@ -1153,6 +1207,7 @@ fn read_session_from_file(
     let mut message_ids = HashSet::new();
     let mut entry_ids = HashSet::new();
     let mut name = None;
+    let mut thinking_level = None;
     let mut updated_at = None;
 
     loop {
@@ -1332,6 +1387,10 @@ fn read_session_from_file(
                 name = Some(normalized_name);
                 updated_at = Some(timestamp.clone());
             }
+            SessionRecord::Thinking { timestamp, level } => {
+                thinking_level = Some(*level);
+                updated_at = Some(timestamp.clone());
+            }
             SessionRecord::Session { .. } => {}
         }
         if let Some(timestamp) = record.timestamp() {
@@ -1371,6 +1430,7 @@ fn read_session_from_file(
         id: header.id.clone(),
         path: path.to_path_buf(),
         name,
+        thinking_level,
         created_at: header.created_at.clone(),
         updated_at: updated_at.unwrap_or_else(|| header.created_at.clone()),
         workspace_root: header.workspace_root.clone(),
@@ -1913,6 +1973,54 @@ mod tests {
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[1]["parentId"], serde_json::Value::Null);
         assert_eq!(lines[2]["parentId"], lines[1]["id"]);
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn pending_thinking_level_preserves_lazy_session_and_materializes_with_first_message() {
+        let workspace = test_dir("thinking-lazy");
+        fs::create_dir_all(&workspace).unwrap();
+        let repository =
+            SessionRepository::new(workspace.join("sessions"), &workspace, &workspace).unwrap();
+        let handle = repository.create().unwrap();
+
+        handle.set_thinking_level(ThinkingLevel::Max).unwrap();
+        assert!(!handle.info().unwrap().materialized);
+        assert!(repository.list().unwrap().is_empty());
+
+        handle
+            .append_message(&ModelMessage::user("first message"))
+            .unwrap();
+        let info = handle.info().unwrap();
+        assert!(info.materialized);
+        let path = info.path;
+        drop(handle);
+
+        let opened = repository.open_path(path).unwrap();
+        assert_eq!(opened.info.thinking_level, Some(ThinkingLevel::Max));
+        assert_eq!(opened.history, [ModelMessage::user("first message")]);
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn thinking_level_metadata_round_trips_and_latest_value_wins() {
+        let workspace = test_dir("thinking-latest");
+        fs::create_dir_all(&workspace).unwrap();
+        let repository =
+            SessionRepository::new(workspace.join("sessions"), &workspace, &workspace).unwrap();
+        let handle = repository.create().unwrap();
+        handle.append_message(&ModelMessage::user("hello")).unwrap();
+        handle.set_thinking_level(ThinkingLevel::High).unwrap();
+        handle.set_thinking_level(ThinkingLevel::Low).unwrap();
+        let path = handle.info().unwrap().path;
+        drop(handle);
+
+        let opened = repository.open_path(path).unwrap();
+        assert_eq!(opened.info.thinking_level, Some(ThinkingLevel::Low));
+        assert_eq!(
+            opened.handle.info().unwrap().thinking_level,
+            Some(ThinkingLevel::Low)
+        );
         fs::remove_dir_all(workspace).unwrap();
     }
 

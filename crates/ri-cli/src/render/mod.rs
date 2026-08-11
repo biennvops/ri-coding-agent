@@ -1088,12 +1088,16 @@ fn footer_text(state: &AppState, width: u16, scroll_from_bottom: usize) -> Line<
     } else {
         "ready · Enter submit · Ctrl+C exit"
     };
+    let thinking = state
+        .thinking_level()
+        .map(|level| format!(" · think {level}"))
+        .unwrap_or_default();
     let text = if scroll_from_bottom > 0 {
         format!(
-            "{status} · ↑ {scroll_from_bottom} lines · PgDn latest · {model} · {context} · {session}"
+            "{status} · ↑ {scroll_from_bottom} lines · PgDn latest · {model}{thinking} · {context} · {session}"
         )
     } else {
-        format!("{model} · {context} · {session} · {status}")
+        format!("{model}{thinking} · {context} · {session} · {status}")
     };
     let truncated: String = text
         .chars()

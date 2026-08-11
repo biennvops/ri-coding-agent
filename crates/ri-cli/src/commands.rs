@@ -3,6 +3,7 @@ use ri_core::AppState;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CommandKind {
     Model,
+    Thinking,
     New,
     Resume,
     Name,
@@ -31,6 +32,12 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         name: "model",
         description: "Select model",
         argument: CommandArgument::Optional("provider/model"),
+    },
+    CommandSpec {
+        kind: CommandKind::Thinking,
+        name: "thinking",
+        description: "Show or set thinking level",
+        argument: CommandArgument::Optional("level"),
     },
     CommandSpec {
         kind: CommandKind::New,
@@ -180,7 +187,7 @@ mod tests {
     fn registry_contains_every_supported_command() {
         assert_eq!(
             COMMANDS.iter().map(|spec| spec.name).collect::<Vec<_>>(),
-            ["model", "new", "resume", "name", "session", "compact", "quit"]
+            ["model", "thinking", "new", "resume", "name", "session", "compact", "quit"]
         );
     }
 
@@ -220,7 +227,7 @@ mod tests {
         suggestions.move_down(&state);
 
         assert!(suggestions.accept(&mut state));
-        assert_eq!(state.input(), "/new");
+        assert_eq!(state.input(), "/thinking");
     }
 
     #[test]

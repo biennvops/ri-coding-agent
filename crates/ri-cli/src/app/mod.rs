@@ -38,6 +38,7 @@ pub struct Options {
     pub json: bool,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub thinking: Option<ri_core::ThinkingLevel>,
     pub no_context: bool,
     pub show_help: bool,
     pub continue_session: bool,
@@ -83,6 +84,16 @@ impl Options {
                     options.model = Some(
                         args.next()
                             .ok_or_else(|| anyhow!("--model requires a model id"))?,
+                    );
+                }
+                "--thinking" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--thinking requires a level"))?;
+                    options.thinking = Some(
+                        value
+                            .parse()
+                            .map_err(|error: ri_core::ThinkingLevelError| anyhow!(error))?,
                     );
                 }
                 "--no-context" => options.no_context = true,
@@ -132,7 +143,7 @@ impl Options {
         println!(
             "ri — a small Rust coding agent\n\n\
              Usage:\n  ri                              start the interactive TUI\n  ri -p, --print <prompt>         run one prompt without the TUI\n  ri --json -p <prompt>           emit versioned NDJSON events\n\n\
-             Model:\n  --provider <id>                 select a configured provider\n  --model <id>                   select a configured model\n\n\
+             Model:\n  --provider <id>                 select a configured provider\n  --model <id>                   select a configured model\n  --thinking <level>              set reasoning level (off, minimal, low, medium, high, xhigh, max)\n\n\
              Sessions:\n  -c, --continue                 continue the newest saved session\n  -r, --resume                   choose a saved session interactively\n  --session <id-or-path>         resume one saved session\n  --no-session                   disable session persistence\n\n\
              Context and help:\n  --no-context                   disable AGENTS context loading\n  -h, --help                    show this help\n  -V, --version                 show the version\n\n\
              Interactive commands:\n{}\n\n\
@@ -174,7 +185,7 @@ pub async fn run(options: Options) -> Result<(), RunError> {
         let opened = crate::session_picker::pick(repository)
             .map_err(RunError::Setup)?
             .ok_or_else(|| RunError::Setup(anyhow!("session picker cancelled")))?;
-        setup.apply_opened(opened);
+        setup.apply_opened(opened).map_err(RunError::Setup)?;
     }
     if let Some(prompt) = options.print_prompt {
         if options.json {
@@ -211,6 +222,10 @@ struct AppSetup {
     initial_history: Vec<ModelMessage>,
     initial_transcript: Vec<ModelMessage>,
     compaction_enabled: bool,
+    thinking_level: Option<ri_core::ThinkingLevel>,
+    reasoning_effort: Option<String>,
+    cli_thinking_level: Option<ri_core::ThinkingLevel>,
+    default_thinking_level: Option<ri_core::ThinkingLevel>,
     resume_requested: bool,
     state_path: Option<std::path::PathBuf>,
     workspace_id: String,
@@ -291,65 +306,93 @@ impl AppSetup {
         let tool_context =
             ToolContext::new(&project.launch_cwd).map_err(|error| anyhow!(error.to_string()))?;
 
-        let (repository, session, initial_history, initial_transcript, resume_requested) =
-            if options.no_session {
-                (None, None, Vec::new(), Vec::new(), false)
-            } else {
-                let repository =
-                    SessionRepository::for_workspace(&project.launch_cwd, &project.project_root)
-                        .map_err(|error| anyhow!(error.to_string()))?;
-                if options.resume_session {
-                    (Some(repository), None, Vec::new(), Vec::new(), true)
-                } else if options.continue_session {
-                    let summary = repository
-                        .latest()
-                        .map_err(|error| anyhow!(error.to_string()))?
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "no saved sessions found for {}",
-                                project.launch_cwd.display()
-                            )
-                        })?;
-                    let opened = repository
-                        .open_path(&summary.path)
-                        .map_err(|error| anyhow!(error.to_string()))?;
-                    for warning in &opened.warnings {
-                        eprintln!("{warning}");
-                    }
-                    (
-                        Some(repository),
-                        Some(opened.handle),
-                        opened.history,
-                        opened.transcript,
-                        false,
-                    )
-                } else if let Some(selector) = options.session.as_deref() {
-                    let opened = repository
-                        .open_selector(selector)
-                        .map_err(|error| anyhow!(error.to_string()))?;
-                    for warning in &opened.warnings {
-                        eprintln!("{warning}");
-                    }
-                    (
-                        Some(repository),
-                        Some(opened.handle),
-                        opened.history,
-                        opened.transcript,
-                        false,
-                    )
-                } else {
-                    let session = repository
-                        .create()
-                        .map_err(|error| anyhow!(error.to_string()))?;
-                    (
-                        Some(repository),
-                        Some(session),
-                        Vec::new(),
-                        Vec::new(),
-                        false,
-                    )
+        let (
+            repository,
+            session,
+            initial_history,
+            initial_transcript,
+            session_thinking_level,
+            resume_requested,
+        ) = if options.no_session {
+            (None, None, Vec::new(), Vec::new(), None, false)
+        } else {
+            let repository =
+                SessionRepository::for_workspace(&project.launch_cwd, &project.project_root)
+                    .map_err(|error| anyhow!(error.to_string()))?;
+            if options.resume_session {
+                (Some(repository), None, Vec::new(), Vec::new(), None, true)
+            } else if options.continue_session {
+                let summary = repository
+                    .latest()
+                    .map_err(|error| anyhow!(error.to_string()))?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "no saved sessions found for {}",
+                            project.launch_cwd.display()
+                        )
+                    })?;
+                let opened = repository
+                    .open_path(&summary.path)
+                    .map_err(|error| anyhow!(error.to_string()))?;
+                for warning in &opened.warnings {
+                    eprintln!("{warning}");
                 }
-            };
+                let thinking_level = opened.info.thinking_level;
+                (
+                    Some(repository),
+                    Some(opened.handle),
+                    opened.history,
+                    opened.transcript,
+                    thinking_level,
+                    false,
+                )
+            } else if let Some(selector) = options.session.as_deref() {
+                let opened = repository
+                    .open_selector(selector)
+                    .map_err(|error| anyhow!(error.to_string()))?;
+                for warning in &opened.warnings {
+                    eprintln!("{warning}");
+                }
+                let thinking_level = opened.info.thinking_level;
+                (
+                    Some(repository),
+                    Some(opened.handle),
+                    opened.history,
+                    opened.transcript,
+                    thinking_level,
+                    false,
+                )
+            } else {
+                let session = repository
+                    .create()
+                    .map_err(|error| anyhow!(error.to_string()))?;
+                (
+                    Some(repository),
+                    Some(session),
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    false,
+                )
+            }
+        };
+
+        let (requested_thinking_level, unsupported_policy) = select_thinking_level(
+            options.thinking,
+            session_thinking_level,
+            settings.settings.default_thinking_level,
+        );
+        let (thinking_level, reasoning_effort) = resolve_thinking_level(
+            selected.as_ref().expect("selected model is available"),
+            requested_thinking_level,
+            unsupported_policy,
+        )
+        .map_err(anyhow::Error::msg)?;
+        if let (Some(session), Some(level)) = (&session, thinking_level) {
+            session
+                .set_thinking_level(level)
+                .map_err(|error| anyhow!(error.to_string()))?;
+        }
 
         Ok(Self {
             provider,
@@ -363,6 +406,10 @@ impl AppSetup {
             initial_history,
             initial_transcript,
             compaction_enabled: settings.settings.compaction.enabled,
+            thinking_level,
+            reasoning_effort,
+            cli_thinking_level: options.thinking,
+            default_thinking_level: settings.settings.default_thinking_level,
             resume_requested,
             state_path,
             workspace_id,
@@ -395,10 +442,12 @@ impl AppSetup {
                 .as_ref()
                 .map(|session| SessionMode::Enabled(session.clone()))
                 .unwrap_or(SessionMode::Disabled),
+            reasoning_effort: self.reasoning_effort.clone(),
         }
     }
 
-    fn apply_opened(&mut self, opened: OpenedSession) {
+    fn apply_opened(&mut self, opened: OpenedSession) -> Result<()> {
+        let session_thinking_level = opened.info.thinking_level;
         self.session = Some(opened.handle);
         self.initial_history = opened.history;
         self.initial_transcript = opened.transcript;
@@ -406,6 +455,25 @@ impl AppSetup {
         for warning in opened.warnings {
             eprintln!("{warning}");
         }
+        let (requested, policy) = select_thinking_level(
+            self.cli_thinking_level,
+            session_thinking_level,
+            self.default_thinking_level,
+        );
+        let (level, effort) = resolve_thinking_level(
+            self.selected.as_ref().expect("selected model is available"),
+            requested,
+            policy,
+        )
+        .map_err(anyhow::Error::msg)?;
+        self.thinking_level = level;
+        self.reasoning_effort = effort;
+        if let (Some(session), Some(level)) = (&self.session, level) {
+            session
+                .set_thinking_level(level)
+                .map_err(|error| anyhow!(error.to_string()))?;
+        }
+        Ok(())
     }
 
     fn session_info(&self) -> Result<Option<SessionInfo>> {
@@ -447,6 +515,7 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
     state.replace_history(&setup.initial_transcript);
     state.set_session_info(session_info);
     state.reduce(AgentEvent::ModelChanged(setup.model_ref()));
+    state.set_thinking_level(setup.thinking_level);
     state.reduce(AgentEvent::ContextLimitsUpdated(setup.provider.limits()));
     let mut turn_reason = None;
     let mut output = io::stdout();
@@ -743,6 +812,7 @@ async fn run_tui(mut setup: AppSetup) -> Result<()> {
     }
     state.set_session_info(session_info);
     state.reduce(AgentEvent::ModelChanged(setup.model_ref()));
+    state.set_thinking_level(setup.thinking_level);
     state.reduce(AgentEvent::ContextLimitsUpdated(setup.provider.limits()));
     let mut renderer = TuiRenderer::new();
     let tui_result = run_tui_loop(
@@ -1072,6 +1142,7 @@ fn settings_selection_description(settings: &ri_core::ResolvedSettings) -> Strin
 
 enum SlashCommand {
     Model(Option<String>),
+    Thinking(Option<String>),
     Quit,
     Compact,
     New,
@@ -1108,6 +1179,7 @@ fn slash_command(input: &str) -> Option<SlashCommand> {
 
     match spec.kind {
         CommandKind::Model => Some(SlashCommand::Model(argument.map(str::to_owned))),
+        CommandKind::Thinking => Some(SlashCommand::Thinking(argument.map(str::to_owned))),
         CommandKind::New => Some(SlashCommand::New),
         CommandKind::Resume => Some(SlashCommand::Resume),
         CommandKind::Name => Some(SlashCommand::Name(argument.map(str::to_owned))),
@@ -1127,6 +1199,11 @@ async fn handle_slash_command(
     match command {
         SlashCommand::Model(argument) => {
             handle_model_command(terminal, state, setup, command_tx, argument.as_deref()).await?;
+            Ok(SlashCommandOutcome::Continue)
+        }
+        SlashCommand::Thinking(argument) => {
+            handle_thinking_command(terminal, state, setup, command_tx, argument.as_deref())
+                .await?;
             Ok(SlashCommandOutcome::Continue)
         }
         SlashCommand::Quit => Ok(SlashCommandOutcome::Quit),
@@ -1165,6 +1242,11 @@ async fn handle_slash_command(
             let session = repository
                 .create()
                 .map_err(|error| anyhow!(error.to_string()))?;
+            if let Some(level) = setup.thinking_level {
+                session
+                    .set_thinking_level(level)
+                    .map_err(|error| anyhow!(error.to_string()))?;
+            }
             let handle = session.clone();
             setup.session = Some(session);
             setup.initial_history.clear();
@@ -1200,7 +1282,7 @@ async fn handle_slash_command(
                 .map_err(|error| anyhow!(error.to_string()))?;
             let handle = opened.handle.clone();
             let history = opened.history.clone();
-            setup.apply_opened(opened);
+            setup.apply_opened(opened)?;
             command_tx
                 .send(AgentCommand::LoadSession {
                     session: handle,
@@ -1208,8 +1290,15 @@ async fn handle_slash_command(
                 })
                 .await
                 .context("could not resume the session")?;
+            command_tx
+                .send(AgentCommand::SetReasoningEffort {
+                    effort: setup.reasoning_effort.clone(),
+                })
+                .await
+                .context("could not restore the session thinking level")?;
             state.replace_history(&setup.initial_transcript);
             state.set_session_info(setup.session_info()?);
+            state.set_thinking_level(setup.thinking_level);
             state.add_system_message(setup.context.diagnostic());
             Ok(SlashCommandOutcome::Continue)
         }
@@ -1240,6 +1329,62 @@ fn model_command(input: &str) -> Option<Option<String>> {
         Some(SlashCommand::Model(argument)) => Some(argument),
         _ => None,
     }
+}
+
+async fn handle_thinking_command(
+    terminal: &mut TerminalGuard,
+    state: &mut AppState,
+    setup: &mut AppSetup,
+    command_tx: &mpsc::Sender<AgentCommand>,
+    argument: Option<&str>,
+) -> Result<()> {
+    let Some(model) = setup.selected.as_ref() else {
+        state.add_system_message("no model is selected");
+        return Ok(());
+    };
+    let level = if let Some(argument) = argument {
+        match argument.parse::<ri_core::ThinkingLevel>() {
+            Ok(level) => level,
+            Err(error) => {
+                state.add_system_message(error.to_string());
+                return Ok(());
+            }
+        }
+    } else {
+        match crate::thinking_picker::pick_thinking_level_in_terminal(
+            terminal,
+            model,
+            setup.thinking_level,
+        )? {
+            Some(level) => level,
+            None => return Ok(()),
+        }
+    };
+    let (thinking_level, effort) =
+        match resolve_thinking_level(model, Some(level), UnsupportedThinkingPolicy::Reject) {
+            Ok(resolved) => resolved,
+            Err(message) => {
+                state.add_system_message(message);
+                return Ok(());
+            }
+        };
+    setup.reasoning_effort = effort.clone();
+    setup.thinking_level = thinking_level;
+    state.set_thinking_level(thinking_level);
+    command_tx
+        .send(AgentCommand::SetReasoningEffort { effort })
+        .await
+        .context("could not set thinking level")?;
+    if let Some(session) = setup.session.as_ref() {
+        match session.set_thinking_level(level) {
+            Ok(info) => state.set_session_info(Some(info)),
+            Err(error) => state.add_system_message(format!(
+                "could not persist thinking level for this session: {error}"
+            )),
+        }
+    }
+    state.add_system_message(format!("thinking level: {level}"));
+    Ok(())
 }
 
 async fn handle_model_command(
@@ -1281,7 +1426,33 @@ async fn handle_model_command(
                     model = %model_ref.model,
                     "model switched"
                 );
+                let previous_level = setup.thinking_level;
+                let (effective_level, reasoning_effort) = resolve_thinking_level(
+                    &selected,
+                    previous_level,
+                    UnsupportedThinkingPolicy::AdjustDown,
+                )
+                .expect("adjusting an unsupported thinking level cannot fail");
+                setup.thinking_level = effective_level;
+                setup.reasoning_effort = reasoning_effort;
+                state.set_thinking_level(effective_level);
                 setup.selected = Some(selected);
+                if let (Some(session), Some(level)) = (&setup.session, effective_level) {
+                    match session.set_thinking_level(level) {
+                        Ok(info) => state.set_session_info(Some(info)),
+                        Err(error) => state.add_system_message(format!(
+                            "could not persist adjusted thinking level for this session: {error}"
+                        )),
+                    }
+                }
+                if let Some(previous_level) = previous_level {
+                    if Some(previous_level) != effective_level {
+                        state.add_system_message(format!(
+                            "thinking level adjusted: {previous_level} → {}",
+                            effective_level.unwrap_or(ri_core::ThinkingLevel::Off)
+                        ));
+                    }
+                }
                 if let Err(error) = setup.remember_model(&model_ref) {
                     eprintln!("ri: warning: could not persist recent model selection: {error}");
                     state.add_system_message(format!(
@@ -1290,6 +1461,12 @@ async fn handle_model_command(
                 }
                 state.reduce(AgentEvent::ModelChanged(model_ref));
                 state.reduce(AgentEvent::ContextLimitsUpdated(setup.provider.limits()));
+                command_tx
+                    .send(AgentCommand::SetReasoningEffort {
+                        effort: setup.reasoning_effort.clone(),
+                    })
+                    .await
+                    .context("could not update thinking level for the selected model")?;
                 command_tx
                     .send(AgentCommand::RefreshContext)
                     .await
@@ -1301,6 +1478,65 @@ async fn handle_model_command(
         Err(error) => state.add_system_message(error.to_string()),
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnsupportedThinkingPolicy {
+    Reject,
+    AdjustDown,
+}
+
+fn select_thinking_level(
+    cli: Option<ri_core::ThinkingLevel>,
+    session: Option<ri_core::ThinkingLevel>,
+    settings: Option<ri_core::ThinkingLevel>,
+) -> (Option<ri_core::ThinkingLevel>, UnsupportedThinkingPolicy) {
+    if cli.is_some() {
+        (cli, UnsupportedThinkingPolicy::Reject)
+    } else if session.is_some() {
+        (session, UnsupportedThinkingPolicy::AdjustDown)
+    } else {
+        (settings, UnsupportedThinkingPolicy::Reject)
+    }
+}
+
+fn resolve_thinking_level(
+    model: &ResolvedModel,
+    level: Option<ri_core::ThinkingLevel>,
+    unsupported: UnsupportedThinkingPolicy,
+) -> Result<(Option<ri_core::ThinkingLevel>, Option<String>), String> {
+    let effective_level = match level {
+        Some(level)
+            if level != ri_core::ThinkingLevel::Off && model.thinking_effort(level).is_none() =>
+        {
+            match unsupported {
+                UnsupportedThinkingPolicy::Reject => {
+                    return Err(format!(
+                        "{level} is not supported by {}; supported levels: {}",
+                        model.model_ref.display_name(),
+                        model
+                            .supported_thinking_levels()
+                            .into_iter()
+                            .map(|level| level.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                UnsupportedThinkingPolicy::AdjustDown => Some(
+                    ri_core::ThinkingLevel::ALL
+                        .into_iter()
+                        .rev()
+                        .find(|candidate| {
+                            *candidate < level && model.thinking_effort(*candidate).is_some()
+                        })
+                        .unwrap_or(ri_core::ThinkingLevel::Off),
+                ),
+            }
+        }
+        level => level,
+    };
+    let effort = effective_level.and_then(|level| model.thinking_effort(level));
+    Ok((effective_level, effort))
 }
 
 fn print_and_flush(output: &mut impl Write, text: &str) -> Result<()> {
@@ -1465,6 +1701,8 @@ mod tests {
                 "custom".to_owned(),
                 "--model".to_owned(),
                 "coding".to_owned(),
+                "--thinking".to_owned(),
+                "max".to_owned(),
             ])
             .unwrap(),
             Options {
@@ -1472,6 +1710,7 @@ mod tests {
                 json: false,
                 provider: Some("custom".to_owned()),
                 model: Some("coding".to_owned()),
+                thinking: Some(ri_core::ThinkingLevel::Max),
                 no_context: false,
                 show_help: false,
                 continue_session: false,
@@ -1599,6 +1838,101 @@ mod tests {
                 .model_ref
                 .display_name(),
             "provider-b/model-b"
+        );
+    }
+
+    #[test]
+    fn session_thinking_precedence_is_cli_then_session_then_settings() {
+        use ri_core::ThinkingLevel::{High, Low, Medium};
+
+        assert_eq!(
+            select_thinking_level(Some(Low), Some(High), Some(Medium)),
+            (Some(Low), UnsupportedThinkingPolicy::Reject)
+        );
+        assert_eq!(
+            select_thinking_level(None, Some(High), Some(Medium)),
+            (Some(High), UnsupportedThinkingPolicy::AdjustDown)
+        );
+        assert_eq!(
+            select_thinking_level(None, None, Some(Medium)),
+            (Some(Medium), UnsupportedThinkingPolicy::Reject)
+        );
+        assert_eq!(
+            select_thinking_level(None, None, None),
+            (None, UnsupportedThinkingPolicy::Reject)
+        );
+    }
+
+    #[test]
+    fn model_switch_reconciles_native_thinking_effort_and_clamps_level() {
+        let catalog = ModelCatalog::from_json(
+            "models.json",
+            r#"{
+                "providers": {
+                    "provider": {
+                        "baseUrl": "https://example.test",
+                        "api": "openai-responses",
+                        "models": [
+                            {
+                                "id": "mapped",
+                                "reasoning": true,
+                                "thinkingLevelMap": {
+                                    "high": "high-native",
+                                    "xhigh": "xhigh-native",
+                                    "max": "max"
+                                }
+                            },
+                            {
+                                "id": "clamped",
+                                "reasoning": true,
+                                "thinkingLevelMap": {
+                                    "minimal": null,
+                                    "low": "low-native",
+                                    "medium": null,
+                                    "high": null,
+                                    "xhigh": null,
+                                    "max": null
+                                }
+                            }
+                        ]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let mapped = catalog.resolve(None, Some("mapped")).unwrap();
+        assert_eq!(
+            resolve_thinking_level(
+                &mapped,
+                Some(ri_core::ThinkingLevel::Max),
+                UnsupportedThinkingPolicy::AdjustDown,
+            )
+            .unwrap(),
+            (Some(ri_core::ThinkingLevel::Max), Some("max".to_owned()))
+        );
+
+        let clamped = catalog.resolve(None, Some("clamped")).unwrap();
+        assert_eq!(
+            resolve_thinking_level(
+                &clamped,
+                Some(ri_core::ThinkingLevel::Max),
+                UnsupportedThinkingPolicy::AdjustDown,
+            )
+            .unwrap(),
+            (
+                Some(ri_core::ThinkingLevel::Low),
+                Some("low-native".to_owned())
+            )
+        );
+        assert_eq!(
+            resolve_thinking_level(
+                &clamped,
+                Some(ri_core::ThinkingLevel::Max),
+                UnsupportedThinkingPolicy::Reject,
+            )
+            .unwrap_err(),
+            "max is not supported by provider/clamped; supported levels: off, low"
         );
     }
 

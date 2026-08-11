@@ -3,7 +3,7 @@ use std::ops::Index;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::agent::{AgentError, AgentEvent};
-use crate::config::ModelRef;
+use crate::config::{ModelRef, ThinkingLevel};
 use crate::context::ContextUsage;
 use crate::model::{ModelAssistantItem, ModelLimits, ModelMessage, StopReason, Usage};
 use crate::session::SessionInfo;
@@ -130,6 +130,7 @@ pub struct AppState {
     last_error: Option<String>,
     last_stop_reason: Option<StopReason>,
     active_model: Option<ModelRef>,
+    thinking_level: Option<ThinkingLevel>,
     session_info: Option<SessionInfo>,
     context_usage: ContextUsage,
     latest_usage: Option<Usage>,
@@ -223,6 +224,14 @@ impl AppState {
 
     pub fn active_model(&self) -> Option<&ModelRef> {
         self.active_model.as_ref()
+    }
+
+    pub fn thinking_level(&self) -> Option<ThinkingLevel> {
+        self.thinking_level
+    }
+
+    pub fn set_thinking_level(&mut self, level: Option<ThinkingLevel>) {
+        self.thinking_level = level;
     }
 
     pub fn session_info(&self) -> Option<&SessionInfo> {

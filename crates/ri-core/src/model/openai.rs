@@ -105,6 +105,7 @@ impl ModelProvider for OpenAiProvider {
             api = %model.api,
             message_count = request.messages.len(),
             tool_count = request.tools.len(),
+            reasoning_effort = request.reasoning_effort.as_deref().unwrap_or("off"),
             "provider request started"
         );
         let (endpoint, body) = request_for(&model, &request)?;
@@ -1537,7 +1538,7 @@ impl SseParser {
 mod tests {
     use super::*;
     use crate::agent::{AgentCommand, AgentEvent, AgentRuntime};
-    use crate::config::{Compatibility, CostMetadata, ModelRef};
+    use crate::config::{Compatibility, CostMetadata, ModelCatalog, ModelRef, ThinkingLevel};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -2288,6 +2289,7 @@ mod tests {
                 ..Compatibility::default()
             },
             reasoning: false,
+            thinking_level_map: BTreeMap::new(),
             input: vec!["text".to_owned()],
             context_window: None,
             max_tokens: Some(123),
@@ -2339,6 +2341,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reasoning_effort_uses_api_shape_native_mapping_and_omits_off() {
+        let catalog = ModelCatalog::from_json(
+            "models.json",
+            r#"{
+                "providers": {
+                    "p": {
+                        "baseUrl": "https://example.test/v1",
+                        "api": "openai-responses",
+                        "models": [{
+                            "id": "m",
+                            "reasoning": true,
+                            "thinkingLevelMap": {"max": "max"}
+                        }]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let responses_model = catalog.resolve(None, None).unwrap();
+        let mut request = ModelRequest::single_user("hello");
+        request.reasoning_effort = responses_model.thinking_effort(ThinkingLevel::Max);
+
+        let (_, responses) = request_for(&responses_model, &request).unwrap();
+        assert_eq!(responses["reasoning"], json!({"effort": "max"}));
+        assert!(responses.get("reasoning_effort").is_none());
+
+        let mut completions_model = responses_model.clone();
+        completions_model.api = ApiKind::OpenAiCompletions;
+        let (_, completions) = request_for(&completions_model, &request).unwrap();
+        assert_eq!(completions["reasoning_effort"], "max");
+        assert!(completions.get("reasoning").is_none());
+
+        request.reasoning_effort = responses_model.thinking_effort(ThinkingLevel::Off);
+        let (_, responses_off) = request_for(&responses_model, &request).unwrap();
+        let (_, completions_off) = request_for(&completions_model, &request).unwrap();
+        assert!(responses_off.get("reasoning").is_none());
+        assert!(completions_off.get("reasoning_effort").is_none());
+    }
+
     fn test_model(api: ApiKind, base_url: String) -> ResolvedModel {
         ResolvedModel {
             model_ref: ModelRef::new("p", "m"),
@@ -2350,6 +2392,7 @@ mod tests {
             auth_header: true,
             compatibility: Compatibility::default(),
             reasoning: false,
+            thinking_level_map: BTreeMap::new(),
             input: vec!["text".to_owned()],
             context_window: None,
             max_tokens: None,
