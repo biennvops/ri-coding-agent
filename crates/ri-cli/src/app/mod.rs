@@ -274,27 +274,15 @@ impl AppSetup {
         }
         let selection_source = selection.source;
         let selected = selection.model;
-        let thinking_level = options
+        let requested_thinking_level = options
             .thinking
             .or(settings.settings.default_thinking_level);
-        if let Some(level) = thinking_level {
-            if level != ri_core::ThinkingLevel::Off
-                && selected.thinking_effort(level).is_none()
-                && options.thinking.is_some()
-            {
-                bail!(
-                    "{level} is not supported by {}; supported levels: {}",
-                    selected.model_ref.display_name(),
-                    selected
-                        .supported_thinking_levels()
-                        .into_iter()
-                        .map(|level| level.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
-        }
-        let reasoning_effort = thinking_level.and_then(|level| selected.thinking_effort(level));
+        let (thinking_level, reasoning_effort) = resolve_thinking_level(
+            &selected,
+            requested_thinking_level,
+            UnsupportedThinkingPolicy::Reject,
+        )
+        .map_err(anyhow::Error::msg)?;
         tracing::info!(
             target: "ri",
             provider = %selected.model_ref.provider,
@@ -1314,23 +1302,17 @@ async fn handle_thinking_command(
             return Ok(());
         }
     };
-    if level != ri_core::ThinkingLevel::Off && model.thinking_effort(level).is_none() {
-        state.add_system_message(format!(
-            "{level} is not supported by {}; supported levels: {}",
-            model.model_ref.display_name(),
-            model
-                .supported_thinking_levels()
-                .into_iter()
-                .map(|level| level.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-        return Ok(());
-    }
-    let effort = model.thinking_effort(level);
+    let (thinking_level, effort) =
+        match resolve_thinking_level(model, Some(level), UnsupportedThinkingPolicy::Reject) {
+            Ok(resolved) => resolved,
+            Err(message) => {
+                state.add_system_message(message);
+                return Ok(());
+            }
+        };
     setup.reasoning_effort = effort.clone();
-    setup.thinking_level = Some(level);
-    state.set_thinking_level(Some(level));
+    setup.thinking_level = thinking_level;
+    state.set_thinking_level(thinking_level);
     command_tx
         .send(AgentCommand::SetReasoningEffort { effort })
         .await
@@ -1379,8 +1361,12 @@ async fn handle_model_command(
                     "model switched"
                 );
                 let previous_level = setup.thinking_level;
-                let (effective_level, reasoning_effort) =
-                    reconcile_thinking_level(&selected, previous_level);
+                let (effective_level, reasoning_effort) = resolve_thinking_level(
+                    &selected,
+                    previous_level,
+                    UnsupportedThinkingPolicy::AdjustDown,
+                )
+                .expect("adjusting an unsupported thinking level cannot fail");
                 setup.thinking_level = effective_level;
                 setup.reasoning_effort = reasoning_effort;
                 state.set_thinking_level(effective_level);
@@ -1420,23 +1406,49 @@ async fn handle_model_command(
     Ok(())
 }
 
-fn reconcile_thinking_level(
+#[derive(Clone, Copy)]
+enum UnsupportedThinkingPolicy {
+    Reject,
+    AdjustDown,
+}
+
+fn resolve_thinking_level(
     model: &ResolvedModel,
     level: Option<ri_core::ThinkingLevel>,
-) -> (Option<ri_core::ThinkingLevel>, Option<String>) {
-    let effective_level = level.map(|level| {
-        if model.thinking_effort(level).is_some() || level == ri_core::ThinkingLevel::Off {
-            level
-        } else {
-            ri_core::ThinkingLevel::ALL
-                .into_iter()
-                .rev()
-                .find(|candidate| *candidate < level && model.thinking_effort(*candidate).is_some())
-                .unwrap_or(ri_core::ThinkingLevel::Off)
+    unsupported: UnsupportedThinkingPolicy,
+) -> Result<(Option<ri_core::ThinkingLevel>, Option<String>), String> {
+    let effective_level = match level {
+        Some(level)
+            if level != ri_core::ThinkingLevel::Off && model.thinking_effort(level).is_none() =>
+        {
+            match unsupported {
+                UnsupportedThinkingPolicy::Reject => {
+                    return Err(format!(
+                        "{level} is not supported by {}; supported levels: {}",
+                        model.model_ref.display_name(),
+                        model
+                            .supported_thinking_levels()
+                            .into_iter()
+                            .map(|level| level.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                UnsupportedThinkingPolicy::AdjustDown => Some(
+                    ri_core::ThinkingLevel::ALL
+                        .into_iter()
+                        .rev()
+                        .find(|candidate| {
+                            *candidate < level && model.thinking_effort(*candidate).is_some()
+                        })
+                        .unwrap_or(ri_core::ThinkingLevel::Off),
+                ),
+            }
         }
-    });
+        level => level,
+    };
     let effort = effective_level.and_then(|level| model.thinking_effort(level));
-    (effective_level, effort)
+    Ok((effective_level, effort))
 }
 
 fn print_and_flush(output: &mut impl Write, text: &str) -> Result<()> {
@@ -1774,17 +1786,36 @@ mod tests {
 
         let mapped = catalog.resolve(None, Some("mapped")).unwrap();
         assert_eq!(
-            reconcile_thinking_level(&mapped, Some(ri_core::ThinkingLevel::High)),
+            resolve_thinking_level(
+                &mapped,
+                Some(ri_core::ThinkingLevel::High),
+                UnsupportedThinkingPolicy::AdjustDown,
+            )
+            .unwrap(),
             (Some(ri_core::ThinkingLevel::High), Some("max".to_owned()))
         );
 
         let clamped = catalog.resolve(None, Some("clamped")).unwrap();
         assert_eq!(
-            reconcile_thinking_level(&clamped, Some(ri_core::ThinkingLevel::High)),
+            resolve_thinking_level(
+                &clamped,
+                Some(ri_core::ThinkingLevel::High),
+                UnsupportedThinkingPolicy::AdjustDown,
+            )
+            .unwrap(),
             (
                 Some(ri_core::ThinkingLevel::Low),
                 Some("low-native".to_owned())
             )
+        );
+        assert_eq!(
+            resolve_thinking_level(
+                &clamped,
+                Some(ri_core::ThinkingLevel::High),
+                UnsupportedThinkingPolicy::Reject,
+            )
+            .unwrap_err(),
+            "high is not supported by provider/clamped; supported levels: off, low"
         );
     }
 
