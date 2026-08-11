@@ -1105,27 +1105,35 @@ fn footer_text(state: &AppState, width: u16, scroll_from_bottom: usize) -> Line<
         None => format!("ctx ~{current}"),
     };
     let status = if state.last_error().is_some() {
-        "error — see transcript"
+        "error — see transcript".to_owned()
     } else if state.is_busy() {
-        "busy · Esc cancel"
+        "busy".to_owned()
     } else {
-        "ready · Enter submit · Ctrl+C exit"
+        "ready".to_owned()
     };
-    let thinking = state
-        .thinking_level()
-        .map(|level| format!(" · think {level}"))
-        .unwrap_or_default();
-    let text = if scroll_from_bottom > 0 {
-        format!(
-            "{status} · ↑ {scroll_from_bottom} lines · PgDn latest · {model}{thinking} · {context} · {session}"
-        )
+    let mut components = vec![model];
+    if let Some(level) = state.thinking_level() {
+        components.push(format!("think {level}"));
+    }
+    components.push(context);
+    let critical_components = components.len();
+    if let Some(branch) = state.git_branch() {
+        components.push(branch.to_owned());
+    }
+    components.push(session);
+    components.push(if scroll_from_bottom > 0 {
+        format!("↑ {scroll_from_bottom} lines")
     } else {
-        format!("{model}{thinking} · {context} · {session} · {status}")
-    };
-    let truncated: String = text
-        .chars()
-        .take(width.saturating_sub(1) as usize)
-        .collect();
+        status
+    });
+
+    let limit = width.saturating_sub(1) as usize;
+    while components.len() > critical_components && components.join(" · ").chars().count() > limit
+    {
+        components.pop();
+    }
+    let text = components.join(" · ");
+    let truncated: String = text.chars().take(limit).collect();
     Line::from(Span::styled(truncated, Style::default().fg(Color::Gray)))
 }
 
@@ -1781,6 +1789,35 @@ mod tests {
     }
 
     #[test]
+    fn footer_shows_cached_branch_and_drops_it_before_critical_status() {
+        let mut state = AppState::new();
+        state.reduce(AgentEvent::ModelChanged(ModelRef {
+            provider: "cockpit".to_owned(),
+            model: "gpt".to_owned(),
+        }));
+        state.set_git_branch(Some("feature/footer".to_owned()));
+
+        let wide = footer_text(&state, 120, 0)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(wide.contains("cockpit/gpt"));
+        assert!(wide.contains("feature/footer"));
+        assert!(!wide.contains("Enter"));
+        assert!(!wide.contains("Esc"));
+
+        let narrow = footer_text(&state, 24, 0)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(narrow.contains("cockpit/gpt"));
+        assert!(narrow.contains("ctx ~0"));
+        assert!(!narrow.contains("feature/footer"));
+    }
+
+    #[test]
     fn scroll_indicator_only_appears_away_from_the_bottom() {
         let state = AppState::new();
         let at_bottom = footer_text(&state, 200, 0)
@@ -1794,8 +1831,9 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert!(!at_bottom.contains("PgDn latest"));
-        assert!(scrolled.contains("↑ 42 lines · PgDn latest"));
+        assert!(!at_bottom.contains("↑"));
+        assert!(scrolled.contains("↑ 42 lines"));
+        assert!(!scrolled.contains("PgDn"));
     }
 
     #[test]

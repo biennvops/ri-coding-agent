@@ -146,6 +146,7 @@ pub struct AppState {
     last_stop_reason: Option<StopReason>,
     active_model: Option<ModelRef>,
     thinking_level: Option<ThinkingLevel>,
+    git_branch: Option<String>,
     session_info: Option<SessionInfo>,
     context_usage: ContextUsage,
     latest_usage: Option<Usage>,
@@ -247,6 +248,14 @@ impl AppState {
 
     pub fn set_thinking_level(&mut self, level: Option<ThinkingLevel>) {
         self.thinking_level = level;
+    }
+
+    pub fn git_branch(&self) -> Option<&str> {
+        self.git_branch.as_deref()
+    }
+
+    pub fn set_git_branch(&mut self, branch: Option<String>) {
+        self.git_branch = branch;
     }
 
     pub fn session_info(&self) -> Option<&SessionInfo> {

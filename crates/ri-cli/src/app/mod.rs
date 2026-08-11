@@ -813,6 +813,7 @@ async fn run_tui(mut setup: AppSetup) -> Result<()> {
         state.add_system_message(format!("logging: {}", path.display()));
     }
     state.set_session_info(session_info);
+    state.set_git_branch(resolve_git_head(&setup.context.project_root));
     state.reduce(AgentEvent::ModelChanged(setup.model_ref()));
     state.set_thinking_level(setup.thinking_level);
     state.reduce(AgentEvent::ContextLimitsUpdated(setup.provider.limits()));
@@ -1067,6 +1068,41 @@ fn move_editor_or_suggestion(
     }
 }
 
+fn resolve_git_head(workspace: &std::path::Path) -> Option<String> {
+    const MAX_GIT_METADATA_BYTES: u64 = 4 * 1024;
+
+    let marker = workspace.join(".git");
+    let git_dir = if marker.is_dir() {
+        marker
+    } else {
+        let metadata = std::fs::metadata(&marker).ok()?;
+        if metadata.len() > MAX_GIT_METADATA_BYTES {
+            return None;
+        }
+        let contents = std::fs::read_to_string(&marker).ok()?;
+        let path = contents.trim().strip_prefix("gitdir:")?.trim();
+        let path = std::path::PathBuf::from(path);
+        if path.is_absolute() {
+            path
+        } else {
+            workspace.join(path)
+        }
+    };
+    let head_path = git_dir.join("HEAD");
+    if std::fs::metadata(&head_path).ok()?.len() > MAX_GIT_METADATA_BYTES {
+        return None;
+    }
+    let head = std::fs::read_to_string(head_path).ok()?;
+    let head = head.trim();
+    if let Some(branch) = head.strip_prefix("ref: refs/heads/") {
+        return (!branch.is_empty()).then(|| branch.to_owned());
+    }
+    if head.len() >= 7 && head.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Some(format!("@{}", &head[..7]));
+    }
+    None
+}
+
 fn apply_agent_event(
     event: AgentEvent,
     state: &mut AppState,
@@ -1075,9 +1111,17 @@ fn apply_agent_event(
     let urgency = redraw_urgency(&event);
     log_agent_event(&event);
     let session_loaded = matches!(event, AgentEvent::SessionLoaded { .. });
+    let refresh_git = matches!(
+        &event,
+        AgentEvent::ToolExecutionFinished { name, result, .. }
+            if name == "bash" && result.metadata.success
+    );
     state.reduce(event);
     if session_loaded {
         state.add_system_message(context.diagnostic());
+    }
+    if refresh_git {
+        state.set_git_branch(resolve_git_head(&context.project_root));
     }
     urgency
 }
@@ -2128,6 +2172,77 @@ mod tests {
         resume_live_after_editor_mutation(revision, &state, &mut scroll);
         assert_eq!(scroll.from_bottom(), 0);
         assert_eq!(state.input(), "abx\nyc");
+    }
+
+    #[test]
+    fn git_head_detection_handles_branches_detached_heads_worktrees_and_failures() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ri-git-head-{unique}"));
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(resolve_git_head(&root), None);
+
+        let git_dir = root.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert_eq!(resolve_git_head(&root).as_deref(), Some("main"));
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/feat/footer\n").unwrap();
+        assert_eq!(resolve_git_head(&root).as_deref(), Some("feat/footer"));
+        std::fs::write(
+            git_dir.join("HEAD"),
+            "a1b2c3d4e5f67890123456789012345678901234\n",
+        )
+        .unwrap();
+        assert_eq!(resolve_git_head(&root).as_deref(), Some("@a1b2c3d"));
+        std::fs::write(git_dir.join("HEAD"), "not a git head\n").unwrap();
+        assert_eq!(resolve_git_head(&root), None);
+
+        let worktree_git_dir = root.join("worktree-metadata");
+        std::fs::create_dir_all(&worktree_git_dir).unwrap();
+        std::fs::write(
+            worktree_git_dir.join("HEAD"),
+            "ref: refs/heads/worktree-branch\n",
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&git_dir).unwrap();
+        std::fs::write(
+            &git_dir,
+            format!("gitdir: {}\n", worktree_git_dir.display()),
+        )
+        .unwrap();
+        assert_eq!(resolve_git_head(&root).as_deref(), Some("worktree-branch"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn successful_bash_completion_refreshes_cached_git_head() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ri-git-refresh-{unique}"));
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let context = ContextBundle::disabled(root.clone(), root.clone());
+        let mut state = AppState::new();
+        state.set_git_branch(resolve_git_head(&root));
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/changed\n").unwrap();
+
+        apply_agent_event(
+            AgentEvent::ToolExecutionFinished {
+                call_id: "bash".to_owned(),
+                name: "bash".to_owned(),
+                result: ri_core::ToolExecutionResult::success("done"),
+            },
+            &mut state,
+            &context,
+        );
+
+        assert_eq!(state.git_branch(), Some("changed"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
