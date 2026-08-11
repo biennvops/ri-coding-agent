@@ -871,6 +871,12 @@ async fn run_tui_loop(
     let mut exit = false;
     let mut shutdown_source_closed = false;
 
+    match tokio::time::timeout(Duration::from_millis(10), shutdown.recv()).await {
+        Ok(Some(_)) => return Ok(()),
+        Ok(None) => shutdown_source_closed = true,
+        Err(_) => {}
+    }
+
     while !exit {
         if redraw.take_ready(Instant::now()) {
             drain_ready_agent_events(state, event_rx, &setup.context, &mut redraw)?;
