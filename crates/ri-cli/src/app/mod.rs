@@ -1379,24 +1379,10 @@ async fn handle_model_command(
                     "model switched"
                 );
                 let previous_level = setup.thinking_level;
-                let effective_level = previous_level.map(|level| {
-                    if selected.thinking_effort(level).is_some()
-                        || level == ri_core::ThinkingLevel::Off
-                    {
-                        level
-                    } else {
-                        ri_core::ThinkingLevel::ALL
-                            .into_iter()
-                            .rev()
-                            .find(|candidate| {
-                                *candidate < level && selected.thinking_effort(*candidate).is_some()
-                            })
-                            .unwrap_or(ri_core::ThinkingLevel::Off)
-                    }
-                });
+                let (effective_level, reasoning_effort) =
+                    reconcile_thinking_level(&selected, previous_level);
                 setup.thinking_level = effective_level;
-                setup.reasoning_effort =
-                    effective_level.and_then(|level| selected.thinking_effort(level));
+                setup.reasoning_effort = reasoning_effort;
                 state.set_thinking_level(effective_level);
                 setup.selected = Some(selected);
                 if let Some(previous_level) = previous_level {
@@ -1416,6 +1402,12 @@ async fn handle_model_command(
                 state.reduce(AgentEvent::ModelChanged(model_ref));
                 state.reduce(AgentEvent::ContextLimitsUpdated(setup.provider.limits()));
                 command_tx
+                    .send(AgentCommand::SetReasoningEffort {
+                        effort: setup.reasoning_effort.clone(),
+                    })
+                    .await
+                    .context("could not update thinking level for the selected model")?;
+                command_tx
                     .send(AgentCommand::RefreshContext)
                     .await
                     .context("could not refresh context for the selected model")?;
@@ -1426,6 +1418,25 @@ async fn handle_model_command(
         Err(error) => state.add_system_message(error.to_string()),
     }
     Ok(())
+}
+
+fn reconcile_thinking_level(
+    model: &ResolvedModel,
+    level: Option<ri_core::ThinkingLevel>,
+) -> (Option<ri_core::ThinkingLevel>, Option<String>) {
+    let effective_level = level.map(|level| {
+        if model.thinking_effort(level).is_some() || level == ri_core::ThinkingLevel::Off {
+            level
+        } else {
+            ri_core::ThinkingLevel::ALL
+                .into_iter()
+                .rev()
+                .find(|candidate| *candidate < level && model.thinking_effort(*candidate).is_some())
+                .unwrap_or(ri_core::ThinkingLevel::Off)
+        }
+    });
+    let effort = effective_level.and_then(|level| model.thinking_effort(level));
+    (effective_level, effort)
 }
 
 fn print_and_flush(output: &mut impl Write, text: &str) -> Result<()> {
@@ -1725,6 +1736,55 @@ mod tests {
                 .model_ref
                 .display_name(),
             "provider-b/model-b"
+        );
+    }
+
+    #[test]
+    fn model_switch_reconciles_native_thinking_effort_and_clamps_level() {
+        let catalog = ModelCatalog::from_json(
+            "models.json",
+            r#"{
+                "providers": {
+                    "provider": {
+                        "baseUrl": "https://example.test",
+                        "api": "openai-responses",
+                        "models": [
+                            {
+                                "id": "mapped",
+                                "reasoning": true,
+                                "thinkingLevelMap": {"high": "max"}
+                            },
+                            {
+                                "id": "clamped",
+                                "reasoning": true,
+                                "thinkingLevelMap": {
+                                    "minimal": null,
+                                    "low": "low-native",
+                                    "medium": null,
+                                    "high": null,
+                                    "xhigh": null
+                                }
+                            }
+                        ]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let mapped = catalog.resolve(None, Some("mapped")).unwrap();
+        assert_eq!(
+            reconcile_thinking_level(&mapped, Some(ri_core::ThinkingLevel::High)),
+            (Some(ri_core::ThinkingLevel::High), Some("max".to_owned()))
+        );
+
+        let clamped = catalog.resolve(None, Some("clamped")).unwrap();
+        assert_eq!(
+            reconcile_thinking_level(&clamped, Some(ri_core::ThinkingLevel::High)),
+            (
+                Some(ri_core::ThinkingLevel::Low),
+                Some("low-native".to_owned())
+            )
         );
     }
 
