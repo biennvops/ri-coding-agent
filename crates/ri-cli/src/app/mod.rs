@@ -1202,7 +1202,8 @@ async fn handle_slash_command(
             Ok(SlashCommandOutcome::Continue)
         }
         SlashCommand::Thinking(argument) => {
-            handle_thinking_command(state, setup, command_tx, argument.as_deref()).await?;
+            handle_thinking_command(terminal, state, setup, command_tx, argument.as_deref())
+                .await?;
             Ok(SlashCommandOutcome::Continue)
         }
         SlashCommand::Quit => Ok(SlashCommandOutcome::Quit),
@@ -1331,6 +1332,7 @@ fn model_command(input: &str) -> Option<Option<String>> {
 }
 
 async fn handle_thinking_command(
+    terminal: &mut TerminalGuard,
     state: &mut AppState,
     setup: &mut AppSetup,
     command_tx: &mpsc::Sender<AgentCommand>,
@@ -1340,21 +1342,22 @@ async fn handle_thinking_command(
         state.add_system_message("no model is selected");
         return Ok(());
     };
-    let Some(argument) = argument else {
-        let supported = model
-            .supported_thinking_levels()
-            .into_iter()
-            .map(|level| level.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        state.add_system_message(format!("thinking levels: {supported}"));
-        return Ok(());
-    };
-    let level: ri_core::ThinkingLevel = match argument.parse() {
-        Ok(level) => level,
-        Err(error) => {
-            state.add_system_message(error.to_string());
-            return Ok(());
+    let level = if let Some(argument) = argument {
+        match argument.parse::<ri_core::ThinkingLevel>() {
+            Ok(level) => level,
+            Err(error) => {
+                state.add_system_message(error.to_string());
+                return Ok(());
+            }
+        }
+    } else {
+        match crate::thinking_picker::pick_thinking_level_in_terminal(
+            terminal,
+            model,
+            setup.thinking_level,
+        )? {
+            Some(level) => level,
+            None => return Ok(()),
         }
     };
     let (thinking_level, effort) =

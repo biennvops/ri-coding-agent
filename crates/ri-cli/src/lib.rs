@@ -11,3 +11,4 @@ pub mod render;
 pub mod session_picker;
 mod signals;
 pub mod terminal;
+pub mod thinking_picker;
