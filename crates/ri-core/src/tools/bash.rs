@@ -88,6 +88,8 @@ impl Tool for BashTool {
         };
         ToolCallPresentation {
             summary: "bash".to_owned(),
+            summary_kind: super::ToolSummaryKind::Normal,
+            output_kind: super::ToolOutputKind::Normal,
             preview: preview_lines(
                 bounded_preview(
                     arguments.command.lines().map(|line| (None, line)),

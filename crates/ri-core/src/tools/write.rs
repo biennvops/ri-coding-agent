@@ -56,6 +56,8 @@ impl Tool for WriteTool {
         };
         ToolCallPresentation {
             summary: format!("write {}", arguments.path),
+            summary_kind: super::ToolSummaryKind::Normal,
+            output_kind: super::ToolOutputKind::Normal,
             preview: preview_lines(
                 bounded_preview(
                     arguments.content.lines().map(|line| (None, line)),

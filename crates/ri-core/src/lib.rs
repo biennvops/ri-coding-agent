@@ -40,7 +40,7 @@ pub use session::{
 };
 pub use tools::{
     Tool, ToolCallPresentation, ToolContext, ToolError, ToolEvent, ToolEventSender,
-    ToolExecutionMetadata, ToolExecutionResult, ToolOutputStream, ToolPreviewKind, ToolPreviewLine,
-    ToolRegistry, DEFAULT_BASH_TIMEOUT_MS, MAX_TOOL_OUTPUT_BYTES, MAX_TOOL_PREVIEW_BYTES,
-    MAX_TOOL_PREVIEW_LINES,
+    ToolExecutionMetadata, ToolExecutionResult, ToolOutputKind, ToolOutputStream, ToolPreviewKind,
+    ToolPreviewLine, ToolRegistry, ToolSummaryKind, DEFAULT_BASH_TIMEOUT_MS, MAX_TOOL_OUTPUT_BYTES,
+    MAX_TOOL_PREVIEW_BYTES, MAX_TOOL_PREVIEW_LINES,
 };

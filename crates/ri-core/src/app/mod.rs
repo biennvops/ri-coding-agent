@@ -8,8 +8,8 @@ use crate::context::ContextUsage;
 use crate::model::{ModelAssistantItem, ModelLimits, ModelMessage, StopReason, Usage};
 use crate::session::SessionInfo;
 use crate::tools::{
-    ToolCallPresentation, ToolExecutionMetadata, ToolOutputStream, ToolPreviewKind,
-    ToolPreviewLine, ToolRegistry, MAX_TOOL_PREVIEW_BYTES,
+    ToolCallPresentation, ToolExecutionMetadata, ToolOutputKind, ToolOutputStream, ToolPreviewKind,
+    ToolPreviewLine, ToolRegistry, ToolSummaryKind, MAX_TOOL_PREVIEW_BYTES,
 };
 
 const MAX_TOOL_TRANSCRIPT_OUTPUT_BYTES: usize = 256 * 1024;
@@ -176,6 +176,8 @@ pub enum ToolStatus {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolOutputChunk {
     pub stream: Option<ToolOutputStream>,
+    pub kind: ToolOutputKind,
+    pub prefixes: Vec<Option<usize>>,
     pub text: String,
 }
 
@@ -184,6 +186,8 @@ pub struct ToolTranscriptEntry {
     pub call_id: String,
     pub name: String,
     pub summary: String,
+    pub summary_kind: ToolSummaryKind,
+    pub output_kind: ToolOutputKind,
     pub preview: Vec<ToolPreviewLine>,
     pub output: String,
     pub output_chunks: Vec<ToolOutputChunk>,
@@ -634,6 +638,8 @@ impl AppState {
                     call_id,
                     name,
                     summary: presentation.summary,
+                    summary_kind: presentation.summary_kind,
+                    output_kind: presentation.output_kind,
                     preview: presentation.preview,
                     output: String::new(),
                     output_chunks: Vec::new(),
@@ -989,6 +995,8 @@ impl AppState {
                         call_id,
                         name,
                         summary: presentation.summary,
+                        summary_kind: presentation.summary_kind,
+                        output_kind: presentation.output_kind,
                         preview: presentation.preview,
                         output: String::new(),
                         output_chunks: Vec::new(),
@@ -1020,6 +1028,8 @@ impl AppState {
                         call_id: tool_call_id.clone(),
                         name: tool_name.clone(),
                         summary: tool_name.clone(),
+                        summary_kind: ToolSummaryKind::Normal,
+                        output_kind: ToolOutputKind::Normal,
                         preview: Vec::new(),
                         output: String::new(),
                         output_chunks: Vec::new(),
@@ -1066,6 +1076,22 @@ fn is_queued_user_entry(entry: &TranscriptEntry) -> bool {
     )
 }
 
+fn output_prefixes(kind: ToolOutputKind, text: &str) -> Vec<Option<usize>> {
+    if kind != ToolOutputKind::NumberedLines {
+        return Vec::new();
+    }
+    text.split('\n')
+        .map(|line| {
+            line.split_once(" | ").and_then(|(number, _)| {
+                number
+                    .parse::<usize>()
+                    .ok()
+                    .map(|_| number.len().saturating_add(3))
+            })
+        })
+        .collect()
+}
+
 fn append_tool_output_chunk(
     tool: &mut ToolTranscriptEntry,
     stream: Option<ToolOutputStream>,
@@ -1074,18 +1100,27 @@ fn append_tool_output_chunk(
     if text.is_empty() {
         return;
     }
+    let kind = match stream {
+        Some(_) => ToolOutputKind::Normal,
+        None => tool.output_kind,
+    };
     if let Some(last) = tool.output_chunks.last_mut() {
-        if last.stream == stream {
+        if last.stream == stream && last.kind == kind {
             last.text.push_str(text);
+            last.prefixes = output_prefixes(kind, &last.text);
         } else {
             tool.output_chunks.push(ToolOutputChunk {
                 stream,
+                kind,
+                prefixes: output_prefixes(kind, text),
                 text: text.to_owned(),
             });
         }
     } else {
         tool.output_chunks.push(ToolOutputChunk {
             stream,
+            kind,
+            prefixes: output_prefixes(kind, text),
             text: text.to_owned(),
         });
     }
@@ -1105,6 +1140,8 @@ fn append_tool_output_chunk(
     let mut bounded = tool_output_prefix(&tool.output_chunks, head_limit);
     bounded.push(ToolOutputChunk {
         stream: None,
+        kind: ToolOutputKind::Truncation,
+        prefixes: Vec::new(),
         text: TOOL_OUTPUT_MARKER.to_owned(),
     });
     bounded.extend(tool_output_suffix(&tool.output_chunks, tail_limit));
@@ -1122,6 +1159,8 @@ fn tool_output_prefix(chunks: &[ToolOutputChunk], limit: usize) -> Vec<ToolOutpu
         if !text.is_empty() {
             result.push(ToolOutputChunk {
                 stream: chunk.stream,
+                kind: chunk.kind,
+                prefixes: output_prefixes(chunk.kind, text),
                 text: text.to_owned(),
             });
             remaining = remaining.saturating_sub(text.len());
@@ -1144,6 +1183,8 @@ fn tool_output_suffix(chunks: &[ToolOutputChunk], limit: usize) -> Vec<ToolOutpu
         if !text.is_empty() {
             result.push(ToolOutputChunk {
                 stream: chunk.stream,
+                kind: chunk.kind,
+                prefixes: output_prefixes(chunk.kind, text),
                 text: text.to_owned(),
             });
             remaining = remaining.saturating_sub(text.len());
@@ -1219,6 +1260,8 @@ fn tool_call_presentation(name: &str, arguments: &str) -> ToolCallPresentation {
         Ok(arguments) => ToolRegistry::new().presentation(name, &arguments),
         Err(_) => ToolCallPresentation {
             summary: name.to_owned(),
+            summary_kind: ToolSummaryKind::Normal,
+            output_kind: ToolOutputKind::Normal,
             preview: truncate_text(arguments, MAX_TOOL_PREVIEW_BYTES)
                 .lines()
                 .map(|text| ToolPreviewLine {
@@ -1588,7 +1631,8 @@ mod tests {
         assert!(tool
             .output_chunks
             .iter()
-            .any(|chunk| chunk.text == TOOL_OUTPUT_MARKER));
+            .any(|chunk| chunk.text == TOOL_OUTPUT_MARKER
+                && chunk.kind == ToolOutputKind::Truncation));
     }
 
     struct ToolExecutionResultForTest;
@@ -1656,8 +1700,11 @@ mod tests {
         };
         assert_eq!(tool.call_id, "call-1");
         assert_eq!(tool.summary, "read note.txt");
+        assert_eq!(tool.summary_kind, ToolSummaryKind::Normal);
         assert!(tool.preview.is_empty());
         assert_eq!(tool.output, "1 | note");
+        assert_eq!(tool.output_chunks[0].kind, ToolOutputKind::NumberedLines);
+        assert_eq!(tool.output_chunks[0].prefixes, [Some(4)]);
         assert!(matches!(tool.status, ToolStatus::Finished(_)));
     }
 

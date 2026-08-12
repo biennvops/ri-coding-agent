@@ -89,6 +89,8 @@ impl Tool for EditTool {
         });
         ToolCallPresentation {
             summary: format!("edit {}", arguments.path),
+            summary_kind: super::ToolSummaryKind::Normal,
+            output_kind: super::ToolOutputKind::Normal,
             preview: [
                 old_preview.map(|preview| preview_lines(preview, ToolPreviewKind::Removed)),
                 new_preview.map(|preview| preview_lines(preview, ToolPreviewKind::Added)),

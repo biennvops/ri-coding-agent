@@ -12,9 +12,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 use ri_core::{
-    AppState, MessageRole, ModelRef, StreamingAssistantState, ToolOutputStream, ToolPreviewKind,
-    ToolStatus, ToolTranscriptEntry, TranscriptEntry, TranscriptEntryId, TranscriptEntryState,
-    UserMessageStatus,
+    AppState, MessageRole, ModelRef, StreamingAssistantState, ToolOutputKind, ToolOutputStream,
+    ToolPreviewKind, ToolStatus, ToolSummaryKind, ToolTranscriptEntry, TranscriptEntry,
+    TranscriptEntryId, TranscriptEntryState, UserMessageStatus,
 };
 
 use crate::commands::{matching_commands, CommandSuggestions};
@@ -343,7 +343,7 @@ fn render_command_suggestions(
 struct CachedRow {
     text: String,
     style: Style,
-    prefix_style: Option<(usize, Style)>,
+    span_style: Option<(usize, usize, Style)>,
 }
 
 #[derive(Clone, Debug)]
@@ -748,12 +748,12 @@ impl TranscriptLayoutCache {
                 header: CachedRow {
                     text: "▶ assistant · streaming".to_owned(),
                     style: Style::default().fg(Color::Green),
-                    prefix_style: None,
+                    span_style: None,
                 },
                 thinking_header: CachedRow {
                     text: "  thinking:".to_owned(),
                     style: Style::default().fg(Color::Cyan),
-                    prefix_style: None,
+                    span_style: None,
                 },
                 content_len: streaming.content.len(),
                 content_rows,
@@ -850,9 +850,18 @@ impl TranscriptLayoutCache {
                 continue;
             };
             buffer.set_stringn(area.x, y, row.text.as_str(), area.width as usize, row.style);
-            if let Some((prefix_width, style)) = row.prefix_style {
+            if let Some((span_start, span_width, style)) = row.span_style {
                 buffer.set_style(
-                    Rect::new(area.x, y, (prefix_width.min(area.width as usize)) as u16, 1),
+                    Rect::new(
+                        area.x
+                            .saturating_add(span_start.min(area.width as usize) as u16),
+                        y,
+                        (span_width
+                            .min(area.width as usize)
+                            .min(area.width as usize - span_start.min(area.width as usize)))
+                            as u16,
+                        1,
+                    ),
                     style,
                 );
             }
@@ -976,7 +985,7 @@ fn layout_entry(entry: &TranscriptEntry, width: usize) -> Vec<CachedRow> {
     rows.push(CachedRow {
         text: String::new(),
         style: Style::default(),
-        prefix_style: None,
+        span_style: None,
     });
     rows
 }
@@ -1019,11 +1028,17 @@ fn append_tool_entry(lines: &mut Vec<CachedRow>, tool: &ToolTranscriptEntry, wid
         }
         ToolStatus::Finished(_) => ("✗", Style::default().fg(Color::Red)),
     };
-    lines.extend(layout_styled_lines(
-        &format!("{marker} {}", tool.summary),
-        style,
-        width,
-    ));
+    let mut header = layout_styled_lines(&format!("{marker} {}", tool.summary), style, width);
+    if let ToolSummaryKind::Range { start: range_start } = tool.summary_kind {
+        apply_first_line_span(
+            &mut header,
+            &format!("{marker} {}", tool.summary),
+            marker.len() + 1 + range_start,
+            Style::default().fg(Color::Cyan),
+            width,
+        );
+    }
+    lines.extend(header);
     for preview in &tool.preview {
         let style = match preview.kind {
             ToolPreviewKind::Normal => Style::default(),
@@ -1045,21 +1060,25 @@ fn append_tool_entry(lines: &mut Vec<CachedRow>, tool: &ToolTranscriptEntry, wid
             lines.push(CachedRow {
                 text: String::new(),
                 style: Style::default(),
-                prefix_style: None,
+                span_style: None,
             });
         }
         if tool.output_chunks.is_empty() {
             append_layout_content(lines, &tool.output, Style::default(), width);
         } else {
             for chunk in &tool.output_chunks {
-                let style = match chunk.stream {
-                    Some(ToolOutputStream::Stderr) => Style::default().fg(Color::Red),
-                    Some(ToolOutputStream::Stdout) | None => Style::default(),
+                let style = match (chunk.stream, chunk.kind) {
+                    (Some(ToolOutputStream::Stderr), _) => Style::default().fg(Color::Red),
+                    (_, ToolOutputKind::Truncation) => Style::default().fg(Color::DarkGray),
+                    (Some(ToolOutputStream::Stdout) | None, _) => Style::default(),
                 };
-                if tool.name == "read" && chunk.stream.is_none() {
-                    append_read_output(lines, &chunk.text, width);
-                } else {
-                    append_layout_content(lines, &chunk.text, style, width);
+                match chunk.kind {
+                    ToolOutputKind::NumberedLines => {
+                        append_numbered_output(lines, &chunk.text, &chunk.prefixes, width)
+                    }
+                    ToolOutputKind::Normal | ToolOutputKind::Truncation => {
+                        append_layout_content(lines, &chunk.text, style, width);
+                    }
                 }
             }
         }
@@ -1096,15 +1115,39 @@ fn append_tool_entry(lines: &mut Vec<CachedRow>, tool: &ToolTranscriptEntry, wid
     }
 }
 
-fn append_read_output(lines: &mut Vec<CachedRow>, output: &str, width: usize) {
-    for line in output.split('\n') {
+fn apply_first_line_span(
+    rows: &mut [CachedRow],
+    text: &str,
+    source_start: usize,
+    style: Style,
+    width: usize,
+) {
+    let layout = VisualLayout::new(text, width);
+    let Some((row_index, row_start)) = layout
+        .row_start_offsets()
+        .into_iter()
+        .enumerate()
+        .rev()
+        .find(|(_, start)| *start <= source_start)
+    else {
+        return;
+    };
+    if let Some(row) = rows.get_mut(row_index) {
+        let start = source_start - row_start;
+        row.span_style = Some((start, row.text.len().saturating_sub(start), style));
+    }
+}
+
+fn append_numbered_output(
+    lines: &mut Vec<CachedRow>,
+    output: &str,
+    prefixes: &[Option<usize>],
+    width: usize,
+) {
+    for (line, prefix_width) in output.split('\n').zip(prefixes.iter().copied()) {
         let mut rows = layout_styled_lines(&format!("  {line}"), Style::default(), width);
-        if let Some((number, _)) = line.split_once(" | ") {
-            if number.parse::<usize>().is_ok() {
-                if let Some(first) = rows.first_mut() {
-                    first.prefix_style = Some((number.len() + 5, Style::default().fg(Color::Cyan)));
-                }
-            }
+        if let (Some(first), Some(prefix_width)) = (rows.first_mut(), prefix_width) {
+            first.span_style = Some((2, prefix_width, Style::default().fg(Color::Cyan)));
         }
         lines.extend(rows);
     }
@@ -1146,7 +1189,7 @@ fn layout_content_section_from(
             rows.push(CachedRow {
                 text: row.clone(),
                 style,
-                prefix_style: None,
+                span_style: None,
             });
             starts.push(
                 source_offset.saturating_add(start.saturating_sub(prefix_len).min(line.len())),
@@ -1196,7 +1239,7 @@ fn layout_styled_lines(text: &str, style: Style, width: usize) -> Vec<CachedRow>
         .map(|row| CachedRow {
             text: row,
             style,
-            prefix_style: None,
+            span_style: None,
         })
         .collect()
 }
@@ -1879,21 +1922,50 @@ mod tests {
 
     #[test]
     fn semantic_tool_lines_map_to_terminal_colors() {
-        let mut read_rows = Vec::new();
-        append_read_output(&mut read_rows, "18 | fn foo() {", 200);
-        assert_eq!(read_rows[0].style.fg, None);
-        assert_eq!(
-            read_rows[0].prefix_style.map(|(_, style)| style.fg),
-            Some(Some(Color::Cyan))
-        );
-
         let mut state = AppState::new();
         state.reduce(AgentEvent::ToolExecutionStarted {
+            call_id: "read".to_owned(),
+            name: "read".to_owned(),
+            arguments: r#"{"path":"src/foo.rs","offset":10,"limit":20}"#.to_owned(),
+        });
+        state.reduce(AgentEvent::ToolExecutionFinished {
+            call_id: "read".to_owned(),
+            name: "read".to_owned(),
+            result: ri_core::ToolExecutionResult::success("18 | fn foo() {"),
+        });
+        let read_rows = layout_entry(&state.transcript_display_entries()[0].entry, 200);
+        let read_header = read_rows.first().expect("read header");
+        assert_eq!(read_header.style.fg, Some(Color::Green));
+        assert_eq!(
+            read_header
+                .span_style
+                .map(|(start, width, style)| (&read_header.text[start..start + width], style.fg)),
+            Some((" · lines 10–29", Some(Color::Cyan)))
+        );
+        let wrapped_header = layout_entry(&state.transcript_display_entries()[0].entry, 24);
+        assert!(wrapped_header.iter().any(|row| {
+            row.span_style
+                .is_some_and(|(_, _, style)| style.fg == Some(Color::Cyan))
+        }));
+        let read_output = read_rows
+            .iter()
+            .find(|row| row.text == "  18 | fn foo() {")
+            .expect("read output");
+        assert_eq!(read_output.style.fg, None);
+        assert_eq!(
+            read_output
+                .span_style
+                .map(|(start, width, style)| (&read_output.text[start..start + width], style.fg)),
+            Some(("18 | ", Some(Color::Cyan)))
+        );
+
+        let mut edit_state = AppState::new();
+        edit_state.reduce(AgentEvent::ToolExecutionStarted {
             call_id: "edit".to_owned(),
             name: "edit".to_owned(),
             arguments: r#"{"path":"src/foo.rs","old_text":"old","new_text":"new"}"#.to_owned(),
         });
-        let edit_rows = layout_entry(&state.transcript_display_entries()[0].entry, 200);
+        let edit_rows = layout_entry(&edit_state.transcript_display_entries()[0].entry, 200);
         assert_eq!(
             edit_rows
                 .iter()
@@ -1913,22 +1985,23 @@ mod tests {
             Some(Color::Green)
         );
 
-        state.reduce(AgentEvent::ToolExecutionStarted {
+        let mut bash_state = AppState::new();
+        bash_state.reduce(AgentEvent::ToolExecutionStarted {
             call_id: "bash".to_owned(),
             name: "bash".to_owned(),
             arguments: r#"{"command":"run tests"}"#.to_owned(),
         });
-        state.reduce(AgentEvent::ToolExecutionOutput {
+        bash_state.reduce(AgentEvent::ToolExecutionOutput {
             call_id: "bash".to_owned(),
             stream: ToolOutputStream::Stdout,
             chunk: "normal output".to_owned(),
         });
-        state.reduce(AgentEvent::ToolExecutionOutput {
+        bash_state.reduce(AgentEvent::ToolExecutionOutput {
             call_id: "bash".to_owned(),
             stream: ToolOutputStream::Stderr,
             chunk: "error output".to_owned(),
         });
-        let bash_rows = layout_entry(&state.transcript_display_entries()[1].entry, 200);
+        let bash_rows = layout_entry(&bash_state.transcript_display_entries()[0].entry, 200);
         assert_eq!(
             bash_rows
                 .iter()
@@ -1956,6 +2029,24 @@ mod tests {
                 .fg,
             Some(Color::Red)
         );
+    }
+
+    #[test]
+    fn truncation_output_kind_maps_to_dim_style() {
+        let mut rows = Vec::new();
+        let chunk = ri_core::ToolOutputChunk {
+            stream: None,
+            kind: ToolOutputKind::Truncation,
+            prefixes: Vec::new(),
+            text: "[… output truncated …]".to_owned(),
+        };
+        let style = match (chunk.stream, chunk.kind) {
+            (Some(ToolOutputStream::Stderr), _) => Style::default().fg(Color::Red),
+            (_, ToolOutputKind::Truncation) => Style::default().fg(Color::DarkGray),
+            (Some(ToolOutputStream::Stdout) | None, _) => Style::default(),
+        };
+        append_layout_content(&mut rows, &chunk.text, style, 200);
+        assert_eq!(rows[0].style.fg, Some(Color::DarkGray));
     }
 
     #[test]

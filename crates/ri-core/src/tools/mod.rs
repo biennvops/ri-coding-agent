@@ -135,9 +135,24 @@ pub struct ToolPreviewLine {
     pub text: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolSummaryKind {
+    Normal,
+    Range { start: usize },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolOutputKind {
+    Normal,
+    NumberedLines,
+    Truncation,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolCallPresentation {
     pub summary: String,
+    pub summary_kind: ToolSummaryKind,
+    pub output_kind: ToolOutputKind,
     pub preview: Vec<ToolPreviewLine>,
 }
 
@@ -147,6 +162,8 @@ impl ToolCallPresentation {
             .unwrap_or_else(|_| "<arguments unavailable>".to_owned());
         Self {
             summary: name.to_owned(),
+            summary_kind: ToolSummaryKind::Normal,
+            output_kind: ToolOutputKind::Normal,
             preview: preview_lines(
                 bounded_preview(
                     arguments.lines().map(|line| (None, line)),
