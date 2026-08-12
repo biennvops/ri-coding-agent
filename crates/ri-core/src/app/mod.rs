@@ -205,6 +205,7 @@ pub enum TranscriptEntry {
 pub struct AppState {
     message_entry_indices: Vec<usize>,
     entries: Vec<TranscriptEntryState>,
+    transcript_entry_indices: Vec<usize>,
     transcript_entry_order: Vec<usize>,
     transcript_entry_positions: Vec<usize>,
     queued_transcript_start: Option<usize>,
@@ -252,16 +253,12 @@ impl AppState {
     }
 
     pub fn transcript_display_position(&self, id: TranscriptEntryId) -> Option<usize> {
-        self.entries
-            .binary_search_by_key(&id, |entry| entry.id)
-            .ok()
+        self.transcript_entry_index(id)
             .and_then(|index| self.transcript_entry_positions.get(index).copied())
     }
 
     pub fn transcript_entry(&self, id: TranscriptEntryId) -> Option<&TranscriptEntryState> {
-        self.entries
-            .binary_search_by_key(&id, |entry| entry.id)
-            .ok()
+        self.transcript_entry_index(id)
             .map(|index| &self.entries[index])
     }
 
@@ -383,6 +380,7 @@ impl AppState {
         self.pending_transcript_changes.clear();
         self.message_entry_indices = Vec::new();
         self.entries = Vec::new();
+        self.transcript_entry_indices = Vec::new();
         self.transcript_entry_order = Vec::new();
         self.transcript_entry_positions = Vec::new();
         self.queued_transcript_start = None;
@@ -821,6 +819,12 @@ impl AppState {
             revision,
             entry,
         });
+        let id_index = id.get() as usize;
+        if self.transcript_entry_indices.len() <= id_index {
+            self.transcript_entry_indices
+                .resize(id_index + 1, usize::MAX);
+        }
+        self.transcript_entry_indices[id_index] = index;
         let order_index = if queued {
             self.transcript_entry_order.len()
         } else {
@@ -864,6 +868,13 @@ impl AppState {
                 self.queued_transcript_start = None;
             }
         }
+    }
+
+    fn transcript_entry_index(&self, id: TranscriptEntryId) -> Option<usize> {
+        self.transcript_entry_indices
+            .get(id.get() as usize)
+            .copied()
+            .filter(|&index| index != usize::MAX)
     }
 
     fn allocate_transcript_entry_id(&mut self) -> TranscriptEntryId {
@@ -1858,6 +1869,55 @@ mod tests {
                 .map(|entry| entry.id)
                 .collect::<Vec<_>>(),
             [state.entries[1].id, queued_id, state.entries[2].id]
+        );
+        for index in 0..state.transcript_entry_positions.len() {
+            assert_eq!(
+                state.transcript_entry_positions[index],
+                state
+                    .transcript_entry_order
+                    .iter()
+                    .position(|&candidate| candidate == index)
+                    .expect("entry has a display position")
+            );
+        }
+    }
+
+    #[test]
+    fn finalized_streaming_entry_keeps_id_lookup_after_queued_append() {
+        let mut state = AppState::new();
+        state.reduce(AgentEvent::TurnStarted);
+        state.reduce(AgentEvent::AssistantMessageStarted);
+        state.reduce(AgentEvent::AssistantTextDelta {
+            index: None,
+            text: "working".to_owned(),
+        });
+        let streaming_id = state.streaming_assistant_state().unwrap().id;
+        state.insert_text("guidance");
+        state.queue_input().expect("queued input");
+        let queued_id = state.transcript_entries()[0].id;
+
+        state.reduce(AgentEvent::AssistantMessageFinished { items: Vec::new() });
+        assert_eq!(state.transcript_entries()[1].id, streaming_id);
+        assert_eq!(
+            state.transcript_entry(streaming_id).unwrap().id,
+            streaming_id
+        );
+        assert_eq!(state.transcript_display_position(streaming_id), Some(0));
+        assert_eq!(state.transcript_display_position(queued_id), Some(1));
+
+        state.reduce(AgentEvent::SteeringMessageDelivered {
+            text: "guidance".to_owned(),
+        });
+        assert_eq!(state.transcript_display_position(streaming_id), Some(0));
+        assert_eq!(state.transcript_display_position(queued_id), Some(1));
+        assert_eq!(
+            state
+                .transcript_entry(queued_id)
+                .and_then(|entry| match &entry.entry {
+                    TranscriptEntry::Message(message) => Some(message.user_status),
+                    TranscriptEntry::Tool(_) => None,
+                }),
+            Some(UserMessageStatus::Delivered)
         );
     }
 
