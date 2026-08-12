@@ -184,7 +184,37 @@ impl AgentRuntimeConfig {
     }
 }
 
-type SteeringQueue = Arc<Mutex<VecDeque<String>>>;
+#[derive(Default)]
+struct SteeringState {
+    messages: VecDeque<String>,
+    sealed: bool,
+}
+
+impl SteeringState {
+    fn accept(&mut self, text: String) -> Option<String> {
+        if self.sealed {
+            Some(text)
+        } else {
+            self.messages.push_back(text);
+            None
+        }
+    }
+
+    fn pop_front(&mut self, seal_when_empty: bool) -> Option<String> {
+        let text = self.messages.pop_front();
+        if text.is_none() && seal_when_empty {
+            self.sealed = true;
+        }
+        text
+    }
+
+    fn seal_and_drain(&mut self) -> Vec<String> {
+        self.sealed = true;
+        self.messages.drain(..).collect()
+    }
+}
+
+type SteeringQueue = Arc<Mutex<SteeringState>>;
 
 struct ActiveTurn {
     cancel: CancellationToken,
@@ -282,6 +312,7 @@ where
                     tokio::select! {
                         result = &mut active_task.task => {
                             task_finished = true;
+                            recover_pending_steering(&active_task.steering, &events).await;
                             apply_task_result(
                                 result,
                                 active_task.compaction,
@@ -292,20 +323,22 @@ where
                                 &events,
                             )
                             .await;
-                            recover_pending_steering(&active_task.steering, &events).await;
                         }
                         command = commands.recv() => {
                             match command {
                                 Some(AgentCommand::Cancel) => active_task.cancel.cancel(),
                                 Some(AgentCommand::Steer { text }) if !active_task.compaction => {
                                     if !text.trim().is_empty() {
-                                        active_task
+                                        let recovered = active_task
                                             .steering
                                             .as_ref()
                                             .expect("active turns have a steering queue")
                                             .lock()
                                             .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                            .push_back(text);
+                                            .accept(text);
+                                        if let Some(text) = recovered {
+                                            recover_steering(vec![text], &events).await;
+                                        }
                                     }
                                 }
                                 Some(AgentCommand::Submit { .. })
@@ -323,6 +356,7 @@ where
                                 Some(AgentCommand::Shutdown) | None => {
                                     active_task.cancel.cancel();
                                     let result = (&mut active_task.task).await;
+                                    recover_pending_steering(&active_task.steering, &events).await;
                                     apply_task_result(
                                         result,
                                         active_task.compaction,
@@ -333,7 +367,6 @@ where
                                         &events,
                                     )
                                     .await;
-                                    recover_pending_steering(&active_task.steering, &events).await;
                                     return;
                                 }
                             }
@@ -360,7 +393,7 @@ where
                         let turn_events = events.clone();
                         let turn_cancel = cancel.clone();
                         let compaction_enabled = self.compaction_enabled;
-                        let steering = Arc::new(Mutex::new(VecDeque::new()));
+                        let steering = Arc::new(Mutex::new(SteeringState::default()));
                         let turn_steering = Arc::clone(&steering);
                         let task = tokio::spawn(async move {
                             RuntimeTaskOutcome::Turn(
@@ -385,10 +418,8 @@ where
                             steering: Some(steering),
                         });
                     }
-                    Some(AgentCommand::Steer { .. }) => {
-                        let _ = events
-                            .send(AgentEvent::Error(AgentError::new("no turn is active")))
-                            .await;
+                    Some(AgentCommand::Steer { text }) => {
+                        recover_steering(vec![text], &events).await;
                     }
                     Some(AgentCommand::Compact) => {
                         let cancel = CancellationToken::new();
@@ -560,12 +591,14 @@ async fn recover_pending_steering(
     let Some(steering) = steering else {
         return;
     };
-    let messages = {
-        let mut queue = steering
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        queue.drain(..).collect::<Vec<_>>()
-    };
+    let messages = steering
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .seal_and_drain();
+    recover_steering(messages, events).await;
+}
+
+async fn recover_steering(messages: Vec<String>, events: &mpsc::Sender<AgentEvent>) {
     if !messages.is_empty() {
         let _ = events
             .send(AgentEvent::SteeringMessagesRecovered { messages })
@@ -826,7 +859,9 @@ where
                 fail_turn(&events, "provider returned an error stop reason").await;
                 return turn_outcome(history, StopReason::Error);
             }
-            match inject_next_steering(&steering, &mut history, &config.session, &events).await {
+            match inject_next_steering(&steering, &mut history, &config.session, &events, true)
+                .await
+            {
                 Ok(true) => continue,
                 Ok(false) => return turn_outcome(history, response.stop_reason),
                 Err(error) => {
@@ -910,7 +945,7 @@ where
         }
 
         if let Err(error) =
-            inject_next_steering(&steering, &mut history, &config.session, &events).await
+            inject_next_steering(&steering, &mut history, &config.session, &events, false).await
         {
             fail_turn(&events, error).await;
             return turn_outcome(history, StopReason::Error);
@@ -923,11 +958,12 @@ async fn inject_next_steering(
     history: &mut ConversationHistory,
     session: &SessionMode,
     events: &mpsc::Sender<AgentEvent>,
+    seal_when_empty: bool,
 ) -> Result<bool, String> {
     let text = steering
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .pop_front();
+        .pop_front(seal_when_empty);
     let Some(text) = text else {
         return Ok(false);
     };
@@ -2717,6 +2753,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn steering_after_the_final_response_boundary_is_recovered() {
+        let provider = ScriptedProvider::new(vec![final_step("done")]).with_limits(ModelLimits {
+            context_window: Some(1_000),
+            max_output_tokens: Some(100),
+        });
+        let requests = Arc::clone(&provider.requests);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        // A single slot makes each context snapshot a deterministic barrier. The
+        // final snapshot is emitted only after run_turn has returned.
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let runtime_task = tokio::spawn(AgentRuntime::new(provider).run(command_rx, event_tx));
+
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(AgentEvent::ContextLimitsUpdated(_))
+        ));
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(AgentEvent::ContextUsageUpdated(_))
+        ));
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "initial".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let mut response_finished = false;
+        loop {
+            let event = event_rx.recv().await.expect("turn event");
+            response_finished |= matches!(event, AgentEvent::AssistantMessageFinished { .. });
+            if response_finished && matches!(event, AgentEvent::ContextLimitsUpdated(_)) {
+                break;
+            }
+        }
+        command_tx
+            .send(AgentCommand::Steer {
+                text: "too late".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let mut tail = Vec::new();
+        while !tail
+            .iter()
+            .any(|event| matches!(event, AgentEvent::SteeringMessagesRecovered { .. }))
+        {
+            tail.push(event_rx.recv().await.expect("completion event"));
+        }
+        assert!(tail.iter().any(|event| matches!(
+            event,
+            AgentEvent::TurnFinished {
+                reason: StopReason::Stop
+            }
+        )));
+        assert!(tail.iter().any(|event| matches!(
+            event,
+            AgentEvent::SteeringMessagesRecovered { messages }
+                if messages == &["too late".to_owned()]
+        )));
+        assert!(!tail
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Error(_))));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn steering_waits_for_an_entire_tool_batch() {
         let root = unique_test_dir("steering-tool-batch");
         std::fs::create_dir_all(&root).unwrap();
@@ -2808,14 +2914,14 @@ mod tests {
             .await
             .unwrap();
         command_tx.send(AgentCommand::Cancel).await.unwrap();
-        let _ = collect_turn(&mut event_rx).await;
-        let recovered = event_rx.recv().await.unwrap();
-        assert_eq!(
-            recovered,
-            AgentEvent::SteeringMessagesRecovered {
-                messages: vec!["do not lose this".to_owned()]
-            }
-        );
+        let events = collect_turn(&mut event_rx).await;
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::SteeringMessagesRecovered { messages }
+                    if messages == &["do not lose this".to_owned()]
+            )
+        }));
 
         command_tx.send(AgentCommand::Shutdown).await.unwrap();
         runtime_task.await.unwrap();
