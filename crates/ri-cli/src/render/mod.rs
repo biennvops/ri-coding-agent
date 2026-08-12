@@ -16,6 +16,7 @@ use ri_core::{
     ToolPreviewKind, ToolStatus, ToolSummaryKind, ToolTranscriptEntry, TranscriptEntry,
     TranscriptEntryId, TranscriptEntryState, UserMessageStatus,
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::commands::{matching_commands, CommandSuggestions};
 use crate::input::VisualLayout;
@@ -1113,18 +1114,17 @@ fn apply_first_line_span(
     width: usize,
 ) {
     let layout = VisualLayout::new(text, width);
-    let Some((row_index, row_start)) = layout
-        .row_start_offsets()
-        .into_iter()
-        .enumerate()
-        .rev()
-        .find(|(_, start)| *start <= source_start)
-    else {
+    let starts = layout.row_start_offsets();
+    let Some(start_row) = starts.iter().rposition(|&start| start <= source_start) else {
         return;
     };
-    if let Some(row) = rows.get_mut(row_index) {
-        let start = source_start - row_start;
-        row.span_style = Some((start, row.text.len().saturating_sub(start), style));
+    for (row_index, row) in rows.iter_mut().enumerate().skip(start_row) {
+        let row_start = starts[row_index];
+        let source_offset = source_start.max(row_start);
+        let source_end = starts.get(row_index + 1).copied().unwrap_or(text.len());
+        let span_start = UnicodeWidthStr::width(&text[row_start..source_offset]);
+        let span_width = UnicodeWidthStr::width(&text[source_offset..source_end]);
+        row.span_style = Some((span_start, span_width, style));
     }
 }
 
@@ -1996,14 +1996,23 @@ mod tests {
         assert_eq!(
             read_header
                 .span_style
-                .map(|(start, width, style)| (&read_header.text[start..start + width], style.fg)),
-            Some((" · lines 10–29", Some(Color::Cyan)))
+                .map(|(start, width, style)| (start, width, style.fg)),
+            Some((
+                UnicodeWidthStr::width("✓ read src/foo.rs"),
+                UnicodeWidthStr::width(" · lines 10–29"),
+                Some(Color::Cyan)
+            ))
         );
-        let wrapped_header = layout_entry(&state.transcript_display_entries()[0].entry, 24);
-        assert!(wrapped_header.iter().any(|row| {
-            row.span_style
-                .is_some_and(|(_, _, style)| style.fg == Some(Color::Cyan))
-        }));
+        let wrapped_header = layout_entry(&state.transcript_display_entries()[0].entry, 12);
+        assert_eq!(
+            wrapped_header
+                .iter()
+                .filter(|row| row
+                    .span_style
+                    .is_some_and(|(_, _, style)| style.fg == Some(Color::Cyan)))
+                .count(),
+            3
+        );
         let read_output = read_rows
             .iter()
             .find(|row| row.text == "  18 | fn foo() {")
