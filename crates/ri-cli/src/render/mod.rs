@@ -452,7 +452,7 @@ impl TranscriptLayoutCache {
         let cold = self.epoch != Some(state.transcript_epoch()) || self.width != width;
         if cold {
             self.reset(state.transcript_epoch(), width);
-            for entry in state.transcript_entries() {
+            for entry in state.transcript_display_entries() {
                 self.append_static_entry(entry, width, stats);
             }
             self.update_deferred_start(state);
@@ -461,15 +461,20 @@ impl TranscriptLayoutCache {
             return;
         }
 
-        if state.transcript_entries().len() < self.indices.len() {
+        if state.transcript_display_entries().len() < self.indices.len() {
             self.reset(state.transcript_epoch(), width);
-            for entry in state.transcript_entries() {
+            for entry in state.transcript_display_entries() {
                 self.append_static_entry(entry, width, stats);
             }
         } else {
             let first_new = self.indices.len();
             for entry in state.transcript_entries().iter().skip(first_new) {
-                self.append_static_entry(entry, width, stats);
+                if is_queued_user_entry(&entry.entry) {
+                    self.append_static_entry(entry, width, stats);
+                } else {
+                    let index = self.first_queued_index(state);
+                    self.insert_static_entry(index, entry, width, stats);
+                }
             }
         }
 
@@ -524,18 +529,46 @@ impl TranscriptLayoutCache {
         self.static_total_rows = self.static_total_rows.saturating_add(row_count);
     }
 
+    fn insert_static_entry(
+        &mut self,
+        index: usize,
+        entry: &TranscriptEntryState,
+        width: usize,
+        stats: &mut RenderStats,
+    ) {
+        self.ensure_layout(entry.id, entry.revision, &entry.entry, width, stats);
+        let row_count = self
+            .layouts
+            .get(&entry.id)
+            .map(|layout| layout.rows.len())
+            .unwrap_or_default();
+        self.indices.insert(
+            index,
+            EntryLayoutIndex {
+                id: entry.id,
+                start: 0,
+                row_count,
+            },
+        );
+        for position in self.positions.values_mut() {
+            if *position >= index {
+                *position += 1;
+            }
+        }
+        self.positions.insert(entry.id, index);
+        self.reindex_from(index, stats);
+    }
+
+    fn first_queued_index(&self, state: &AppState) -> usize {
+        state
+            .queued_transcript_start()
+            .unwrap_or(self.indices.len())
+            .min(self.indices.len())
+    }
+
     fn update_deferred_start(&mut self, state: &AppState) {
         self.deferred_start_row = state
-            .transcript_entries()
-            .iter()
-            .position(|entry| {
-                matches!(
-                    &entry.entry,
-                    TranscriptEntry::Message(message)
-                        if message.role == MessageRole::User
-                            && message.user_status != UserMessageStatus::Delivered
-                )
-            })
+            .queued_transcript_start()
             .and_then(|index| self.indices.get(index).map(|entry| entry.start))
             .unwrap_or(self.static_total_rows);
     }
@@ -547,11 +580,20 @@ impl TranscriptLayoutCache {
         width: usize,
         stats: &mut RenderStats,
     ) {
-        let Some(entry) = state.transcript_entries().get(index) else {
+        let Some(id) = self.indices.get(index).map(|entry| entry.id) else {
+            return;
+        };
+        let Some(entry) = state.transcript_entry(id) else {
             return;
         };
         let old_row_count = self.indices[index].row_count;
+        let old_queued = self.layouts.get(&id).is_some_and(is_queued_layout);
         self.ensure_layout(entry.id, entry.revision, &entry.entry, width, stats);
+        let new_queued = self.layouts.get(&id).is_some_and(is_queued_layout);
+        if old_queued && !new_queued {
+            self.move_static_entry_to_deferred_boundary(index, stats);
+        }
+        let index = self.positions[&id];
         let new_row_count = self
             .layouts
             .get(&entry.id)
@@ -569,6 +611,23 @@ impl TranscriptLayoutCache {
         } else {
             self.reindex_from(index + 1, stats);
         }
+    }
+
+    fn move_static_entry_to_deferred_boundary(&mut self, index: usize, stats: &mut RenderStats) {
+        let target = self
+            .indices
+            .iter()
+            .position(|entry| self.layouts.get(&entry.id).is_some_and(is_queued_layout))
+            .unwrap_or(self.indices.len());
+        if index >= target {
+            return;
+        }
+        let entry = self.indices.remove(index);
+        self.indices.insert(target - 1, entry);
+        for (position, entry) in self.indices.iter().enumerate().skip(index) {
+            self.positions.insert(entry.id, position);
+        }
+        self.reindex_from(index, stats);
     }
 
     fn reindex_from(&mut self, start: usize, stats: &mut RenderStats) {
@@ -873,6 +932,22 @@ impl EditorLayoutCache {
             .as_ref()
             .expect("editor layout cache is populated")
     }
+}
+
+fn is_queued_layout(layout: &CachedLayout) -> bool {
+    layout
+        .rows
+        .first()
+        .is_some_and(|row| row.text == "▶ you · queued")
+}
+
+fn is_queued_user_entry(entry: &TranscriptEntry) -> bool {
+    matches!(
+        entry,
+        TranscriptEntry::Message(message)
+            if message.role == MessageRole::User
+                && message.user_status == UserMessageStatus::Queued
+    )
 }
 
 fn layout_entry(entry: &TranscriptEntry, width: usize) -> Vec<CachedRow> {
@@ -1433,7 +1508,7 @@ mod tests {
             .draw(&mut terminal, &state, 0)
             .expect("finalized draw should succeed");
         let entry = state
-            .transcript_entries()
+            .transcript_display_entries()
             .last()
             .expect("finalized transcript entry");
         let after = renderer
@@ -1646,17 +1721,81 @@ mod tests {
             text: "also add tests".to_owned(),
         });
         assert!(matches!(
-            state.transcript_entries()[0].entry,
+            state.transcript_display_entries()[0].entry,
             TranscriptEntry::Message(_)
         ));
         assert!(matches!(
-            state.transcript_entries()[1].entry,
+            state.transcript_display_entries()[1].entry,
             TranscriptEntry::Tool(_)
         ));
         assert!(matches!(
-            state.transcript_entries()[2].entry,
+            state.transcript_display_entries()[2].entry,
             TranscriptEntry::Message(_)
         ));
+    }
+
+    #[test]
+    fn queued_and_recovered_messages_preserve_incremental_layout_on_large_transcripts() {
+        let mut state = synthetic_transcript(100_000, 1_000);
+        let mut renderer = TuiRenderer::new();
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("test terminal");
+        renderer.draw(&mut terminal, &state, 0).unwrap();
+        state.acknowledge_transcript_changes();
+        let epoch = state.transcript_epoch();
+
+        state.reduce(AgentEvent::TurnStarted);
+        state.insert_text("keep this guidance");
+        state.queue_input().expect("queued input");
+        renderer.draw(&mut terminal, &state, 0).unwrap();
+        assert_eq!(state.transcript_epoch(), epoch);
+        assert_eq!(renderer.stats().entries_reflowed, 1);
+        assert_eq!(renderer.stats().entries_reindexed, 0);
+        state.acknowledge_transcript_changes();
+
+        state.add_system_message("work completed before cancellation");
+        renderer.draw(&mut terminal, &state, 0).unwrap();
+        assert_eq!(state.transcript_epoch(), epoch);
+        assert_eq!(renderer.stats().entries_reflowed, 1);
+        assert!(renderer.stats().entries_reindexed <= 2);
+        state.acknowledge_transcript_changes();
+
+        state.reduce(AgentEvent::SteeringMessagesRecovered {
+            messages: vec!["keep this guidance".to_owned()],
+        });
+        renderer.draw(&mut terminal, &state, 0).unwrap();
+        assert_eq!(state.transcript_epoch(), epoch);
+        assert_eq!(renderer.stats().entries_reflowed, 1);
+        state.acknowledge_transcript_changes();
+
+        state.add_system_message("ordinary next turn entry");
+        renderer.draw(&mut terminal, &state, 0).unwrap();
+        assert_eq!(state.transcript_epoch(), epoch);
+        assert_eq!(renderer.stats().entries_reflowed, 1);
+        assert!(renderer.stats().entries_reindexed <= 1);
+
+        let recovered = state
+            .transcript_display_entries()
+            .iter()
+            .position(|entry| {
+                matches!(
+                    &entry.entry,
+                    TranscriptEntry::Message(message)
+                        if message.user_status == UserMessageStatus::Recovered
+                )
+            })
+            .expect("recovered message");
+        let ordinary = state
+            .transcript_display_entries()
+            .iter()
+            .position(|entry| {
+                matches!(
+                    &entry.entry,
+                    TranscriptEntry::Message(message)
+                        if message.content == "ordinary next turn entry"
+                )
+            })
+            .expect("ordinary message");
+        assert!(recovered < ordinary);
     }
 
     #[test]
@@ -1665,16 +1804,16 @@ mod tests {
         state.reduce(AgentEvent::TurnStarted);
         state.insert_text("also add tests");
         state.queue_input().expect("queued input");
-        let entry_id = state.transcript_entries()[0].id;
-        let queued = layout_entry(&state.transcript_entries()[0].entry, 80);
+        let entry_id = state.transcript_display_entries()[0].id;
+        let queued = layout_entry(&state.transcript_display_entries()[0].entry, 80);
         assert!(queued.iter().any(|row| row.text == "▶ you · queued"));
 
         state.reduce(AgentEvent::SteeringMessageDelivered {
             text: "also add tests".to_owned(),
         });
-        assert_eq!(state.transcript_entries().len(), 1);
-        assert_eq!(state.transcript_entries()[0].id, entry_id);
-        let delivered = layout_entry(&state.transcript_entries()[0].entry, 80);
+        assert_eq!(state.transcript_display_entries().len(), 1);
+        assert_eq!(state.transcript_display_entries()[0].id, entry_id);
+        let delivered = layout_entry(&state.transcript_display_entries()[0].entry, 80);
         assert!(delivered.iter().any(|row| row.text == "▶ you"));
         assert!(!delivered.iter().any(|row| row.text.contains("queued")));
     }
@@ -1720,7 +1859,7 @@ mod tests {
                 name: name.to_owned(),
                 result: ri_core::ToolExecutionResult::success("tool result"),
             });
-            let rendered = layout_entry(&state.transcript_entries()[0].entry, 200)
+            let rendered = layout_entry(&state.transcript_display_entries()[0].entry, 200)
                 .into_iter()
                 .map(|row| row.text)
                 .collect::<Vec<_>>()
@@ -1754,7 +1893,7 @@ mod tests {
             name: "edit".to_owned(),
             arguments: r#"{"path":"src/foo.rs","old_text":"old","new_text":"new"}"#.to_owned(),
         });
-        let edit_rows = layout_entry(&state.transcript_entries()[0].entry, 200);
+        let edit_rows = layout_entry(&state.transcript_display_entries()[0].entry, 200);
         assert_eq!(
             edit_rows
                 .iter()
@@ -1789,7 +1928,7 @@ mod tests {
             stream: ToolOutputStream::Stderr,
             chunk: "error output".to_owned(),
         });
-        let bash_rows = layout_entry(&state.transcript_entries()[1].entry, 200);
+        let bash_rows = layout_entry(&state.transcript_display_entries()[1].entry, 200);
         assert_eq!(
             bash_rows
                 .iter()

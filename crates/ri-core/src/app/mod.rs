@@ -37,7 +37,7 @@ pub struct TranscriptMessage {
     pub user_status: UserMessageStatus,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TranscriptEntryId(u64);
 
 impl TranscriptEntryId {
@@ -90,6 +90,75 @@ impl Index<usize> for TranscriptMessages<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct TranscriptEntries<'a> {
+    entries: &'a [TranscriptEntryState],
+    indices: &'a [usize],
+}
+
+impl<'a> TranscriptEntries<'a> {
+    pub fn len(&self) -> usize {
+        self.indices.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+
+    pub fn iter(&self) -> TranscriptEntriesIter<'_> {
+        self.into_iter()
+    }
+
+    pub fn last(self) -> Option<&'a TranscriptEntryState> {
+        self.indices.last().map(|&index| &self.entries[index])
+    }
+}
+
+impl Index<usize> for TranscriptEntries<'_> {
+    type Output = TranscriptEntryState;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.entries[self.indices[index]]
+    }
+}
+
+pub struct TranscriptEntriesIter<'a> {
+    entries: &'a [TranscriptEntryState],
+    indices: std::slice::Iter<'a, usize>,
+}
+
+impl<'a> Iterator for TranscriptEntriesIter<'a> {
+    type Item = &'a TranscriptEntryState;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.indices.next().map(|&index| &self.entries[index])
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.indices.size_hint()
+    }
+}
+
+impl DoubleEndedIterator for TranscriptEntriesIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.indices.next_back().map(|&index| &self.entries[index])
+    }
+}
+
+impl ExactSizeIterator for TranscriptEntriesIter<'_> {}
+
+impl<'a> IntoIterator for TranscriptEntries<'a> {
+    type Item = &'a TranscriptEntryState;
+    type IntoIter = TranscriptEntriesIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        TranscriptEntriesIter {
+            entries: self.entries,
+            indices: self.indices.iter(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamingAssistantState {
     pub id: TranscriptEntryId,
@@ -132,6 +201,9 @@ pub enum TranscriptEntry {
 pub struct AppState {
     message_entry_indices: Vec<usize>,
     entries: Vec<TranscriptEntryState>,
+    transcript_entry_order: Vec<usize>,
+    transcript_entry_positions: Vec<usize>,
+    queued_transcript_start: Option<usize>,
     streaming_assistant: Option<StreamingAssistantState>,
     next_transcript_entry_id: u64,
     transcript_epoch: u64,
@@ -166,6 +238,31 @@ impl AppState {
 
     pub fn transcript_entries(&self) -> &[TranscriptEntryState] {
         &self.entries
+    }
+
+    pub fn transcript_display_entries(&self) -> TranscriptEntries<'_> {
+        TranscriptEntries {
+            entries: &self.entries,
+            indices: &self.transcript_entry_order,
+        }
+    }
+
+    pub fn transcript_display_position(&self, id: TranscriptEntryId) -> Option<usize> {
+        self.entries
+            .binary_search_by_key(&id, |entry| entry.id)
+            .ok()
+            .and_then(|index| self.transcript_entry_positions.get(index).copied())
+    }
+
+    pub fn transcript_entry(&self, id: TranscriptEntryId) -> Option<&TranscriptEntryState> {
+        self.entries
+            .binary_search_by_key(&id, |entry| entry.id)
+            .ok()
+            .map(|index| &self.entries[index])
+    }
+
+    pub fn queued_transcript_start(&self) -> Option<usize> {
+        self.queued_transcript_start
     }
 
     pub fn transcript_epoch(&self) -> u64 {
@@ -282,6 +379,9 @@ impl AppState {
         self.pending_transcript_changes.clear();
         self.message_entry_indices = Vec::new();
         self.entries = Vec::new();
+        self.transcript_entry_order = Vec::new();
+        self.transcript_entry_positions = Vec::new();
+        self.queued_transcript_start = None;
         self.streaming_assistant = None;
         self.input.clear();
         self.cursor = 0;
@@ -403,6 +503,9 @@ impl AppState {
             return None;
         }
         let text = self.take_input()?;
+        if self.queued_transcript_start.is_none() {
+            self.queued_transcript_start = Some(self.transcript_entry_order.len());
+        }
         self.push_message(TranscriptMessage {
             role: MessageRole::User,
             content: text.clone(),
@@ -420,7 +523,10 @@ impl AppState {
                 self.last_stop_reason = None;
             }
             AgentEvent::SteeringMessageDelivered { text } => {
-                if !self.update_oldest_queued_message(UserMessageStatus::Delivered) {
+                if let Some(index) = self.oldest_queued_message_index() {
+                    self.release_transcript_entry(index);
+                    self.update_queued_message(index, UserMessageStatus::Delivered);
+                } else {
                     self.push_message(TranscriptMessage {
                         role: MessageRole::User,
                         content: text,
@@ -431,7 +537,10 @@ impl AppState {
             }
             AgentEvent::SteeringMessagesRecovered { messages } => {
                 for text in messages {
-                    if !self.update_oldest_queued_message(UserMessageStatus::Recovered) {
+                    if let Some(index) = self.oldest_queued_message_index() {
+                        self.update_queued_message(index, UserMessageStatus::Recovered);
+                        self.release_transcript_entry(index);
+                    } else {
                         self.push_message(TranscriptMessage {
                             role: MessageRole::User,
                             content: text,
@@ -648,8 +757,8 @@ impl AppState {
         }
     }
 
-    fn update_oldest_queued_message(&mut self, status: UserMessageStatus) -> bool {
-        let Some(index) = self.entries.iter().position(|entry| {
+    fn oldest_queued_message_index(&self) -> Option<usize> {
+        self.entries.iter().position(|entry| {
             matches!(
                 &entry.entry,
                 TranscriptEntry::Message(TranscriptMessage {
@@ -658,14 +767,18 @@ impl AppState {
                     ..
                 })
             )
-        }) else {
-            return false;
-        };
-        if let TranscriptEntry::Message(message) = &mut self.entries[index].entry {
+        })
+    }
+
+    fn update_queued_message(&mut self, index: usize, status: UserMessageStatus) {
+        if let Some(TranscriptEntryState {
+            entry: TranscriptEntry::Message(message),
+            ..
+        }) = self.entries.get_mut(index)
+        {
             message.user_status = status;
+            self.mark_entry_changed(index);
         }
-        self.mark_entry_changed(index);
-        true
     }
 
     fn push_message(&mut self, message: TranscriptMessage) {
@@ -679,11 +792,8 @@ impl AppState {
         id: TranscriptEntryId,
         revision: u64,
     ) {
-        let entry_index =
-            self.push_entry_with_identity(TranscriptEntry::Message(message), id, revision);
-        if entry_index + 1 == self.entries.len() {
-            self.message_entry_indices.push(entry_index);
-        }
+        self.message_entry_indices.push(self.entries.len());
+        self.push_entry_with_identity(TranscriptEntry::Message(message), id, revision);
     }
 
     fn push_entry(&mut self, entry: TranscriptEntry) -> TranscriptEntryId {
@@ -697,37 +807,57 @@ impl AppState {
         entry: TranscriptEntry,
         id: TranscriptEntryId,
         revision: u64,
-    ) -> usize {
-        let entry_index = if is_deferred_user_entry(&entry) {
-            self.entries.len()
+    ) {
+        let queued = is_queued_user_entry(&entry);
+        let index = self.entries.len();
+        self.entries.push(TranscriptEntryState {
+            id,
+            revision,
+            entry,
+        });
+        let order_index = if queued {
+            self.transcript_entry_order.len()
         } else {
-            self.entries
-                .iter()
-                .position(|entry| is_deferred_user_entry(&entry.entry))
-                .unwrap_or(self.entries.len())
+            self.queued_transcript_start
+                .unwrap_or(self.transcript_entry_order.len())
         };
-        let inserted = entry_index < self.entries.len();
-        self.entries.insert(
-            entry_index,
-            TranscriptEntryState {
-                id,
-                revision,
-                entry,
-            },
-        );
-        if inserted {
-            self.transcript_epoch = self.transcript_epoch.wrapping_add(1);
-            self.message_entry_indices = self
-                .entries
-                .iter()
-                .enumerate()
-                .filter_map(|(index, entry)| {
-                    matches!(entry.entry, TranscriptEntry::Message(_)).then_some(index)
-                })
-                .collect();
+        self.transcript_entry_order.insert(order_index, index);
+        self.transcript_entry_positions.push(order_index);
+        for &entry_index in self.transcript_entry_order.iter().skip(order_index + 1) {
+            self.transcript_entry_positions[entry_index] += 1;
+        }
+        if !queued {
+            if let Some(start) = self.queued_transcript_start.as_mut() {
+                *start += 1;
+            }
         }
         self.mark_transcript_changed(id);
-        entry_index
+    }
+
+    fn release_transcript_entry(&mut self, index: usize) {
+        let Some(&position) = self.transcript_entry_positions.get(index) else {
+            return;
+        };
+        self.transcript_entry_order.remove(position);
+        let insert_at = self
+            .queued_transcript_start
+            .map(|start| start.saturating_sub(usize::from(position < start)))
+            .unwrap_or(self.transcript_entry_order.len());
+        self.transcript_entry_order.insert(insert_at, index);
+        let first_changed = position.min(insert_at);
+        let last_changed = position.max(insert_at);
+        for (position, &entry_index) in self.transcript_entry_order[first_changed..=last_changed]
+            .iter()
+            .enumerate()
+        {
+            self.transcript_entry_positions[entry_index] = first_changed + position;
+        }
+        if let Some(start) = self.queued_transcript_start.as_mut() {
+            *start = insert_at + 1;
+            if *start == self.transcript_entry_order.len() {
+                self.queued_transcript_start = None;
+            }
+        }
     }
 
     fn allocate_transcript_entry_id(&mut self) -> TranscriptEntryId {
@@ -925,12 +1055,12 @@ impl AppState {
     }
 }
 
-fn is_deferred_user_entry(entry: &TranscriptEntry) -> bool {
+fn is_queued_user_entry(entry: &TranscriptEntry) -> bool {
     matches!(
         entry,
         TranscriptEntry::Message(TranscriptMessage {
             role: MessageRole::User,
-            user_status: UserMessageStatus::Queued | UserMessageStatus::Recovered,
+            user_status: UserMessageStatus::Queued,
             ..
         })
     )
@@ -1644,6 +1774,43 @@ mod tests {
         assert_eq!(
             state.messages()[1].user_status,
             UserMessageStatus::Recovered
+        );
+    }
+
+    #[test]
+    fn queued_and_recovered_entries_keep_append_only_storage_and_display_chronology() {
+        let mut state = AppState::new();
+        state.reduce(AgentEvent::TurnStarted);
+        state.insert_text("guidance");
+        state.queue_input().expect("queued input");
+        let queued_id = state.entries[0].id;
+        let epoch = state.transcript_epoch();
+
+        state.add_system_message("completed work");
+        assert_eq!(state.entries[0].id, queued_id);
+        assert_eq!(state.transcript_epoch(), epoch);
+        assert_eq!(
+            state
+                .transcript_display_entries()
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            [state.entries[1].id, queued_id]
+        );
+
+        state.reduce(AgentEvent::SteeringMessagesRecovered {
+            messages: vec!["guidance".to_owned()],
+        });
+        state.add_system_message("next turn");
+        assert_eq!(state.entries[0].id, queued_id);
+        assert_eq!(state.transcript_epoch(), epoch);
+        assert_eq!(
+            state
+                .transcript_display_entries()
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            [state.entries[1].id, queued_id, state.entries[2].id]
         );
     }
 
