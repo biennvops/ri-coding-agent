@@ -218,6 +218,10 @@ impl SteeringState {
         Some(text)
     }
 
+    fn reserved_message(&self) -> Option<ModelMessage> {
+        self.reserved.as_deref().map(ModelMessage::user)
+    }
+
     fn cancel(&mut self, cancel: &CancellationToken) {
         if let Some(text) = self.reserved.take() {
             self.messages.push_front(text);
@@ -519,6 +523,7 @@ where
                                     compaction_cancel,
                                     false,
                                     true,
+                                    None,
                                 )
                                 .await
                                 .map_err(compaction_error_message),
@@ -788,7 +793,12 @@ where
                 &tools,
                 config.reasoning_effort.clone(),
             );
-            let estimate = ConservativeTokenEstimator.estimate_request(&request);
+            let steering_message = steering_pending
+                .then(|| reserved_steering_message(&steering))
+                .flatten();
+            let estimate = ConservativeTokenEstimator.estimate_request(
+                &request_with_provisional_message(request.clone(), steering_message.as_ref()),
+            );
             let _ = events.send(AgentEvent::ContextLimitsUpdated(limits)).await;
             let _ = events
                 .send(AgentEvent::ContextUsageUpdated(ContextUsage::estimated(
@@ -809,6 +819,7 @@ where
                     cancel.clone(),
                     true,
                     false,
+                    steering_message.as_ref(),
                 )
                 .await
                 {
@@ -870,6 +881,7 @@ where
                         cancel.clone(),
                         true,
                         true,
+                        None,
                     )
                     .await
                     {
@@ -1071,6 +1083,23 @@ fn reserve_next_steering(
     SteeringInjection::Pending
 }
 
+fn reserved_steering_message(steering: &SteeringQueue) -> Option<ModelMessage> {
+    steering
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .reserved_message()
+}
+
+fn request_with_provisional_message(
+    mut request: ModelRequest,
+    message: Option<&ModelMessage>,
+) -> ModelRequest {
+    if let Some(message) = message {
+        request.messages.push(message.clone());
+    }
+    request
+}
+
 fn normal_request_with_effort(
     base_messages: &[ModelMessage],
     history: &ConversationHistory,
@@ -1113,6 +1142,7 @@ async fn compact_conversation<P>(
     cancel: CancellationToken,
     automatic: bool,
     force: bool,
+    provisional_message: Option<&ModelMessage>,
 ) -> Result<ConversationHistory, CompactionError>
 where
     P: ModelProvider,
@@ -1120,14 +1150,22 @@ where
     let limits = provider.limits();
     let tools = registry.definitions();
     let estimator = ConservativeTokenEstimator;
-    let before_request = normal_request(&config.base_messages, &history, &tools);
+    let before_request = request_with_provisional_message(
+        normal_request(&config.base_messages, &history, &tools),
+        provisional_message,
+    );
     let before_tokens = estimator.estimate_request(&before_request);
     let target = input_budget(limits)
         .map(compaction_target)
         .unwrap_or_else(|| before_tokens.saturating_div(2).max(1));
-    let Some((prefix, retained)) =
-        select_compaction_prefix(&history, &config.base_messages, &tools, target, force)
-    else {
+    let Some((prefix, retained)) = select_compaction_prefix(
+        &history,
+        &config.base_messages,
+        &tools,
+        target,
+        force,
+        provisional_message,
+    ) else {
         if !automatic {
             let _ = events
                 .send(AgentEvent::CompactionFailed {
@@ -1215,8 +1253,10 @@ where
         }
     };
     let compacted = ConversationHistory::new(Some(summary.clone()), retained.clone());
-    let after_tokens =
-        estimator.estimate_request(&normal_request(&config.base_messages, &compacted, &tools));
+    let after_tokens = estimator.estimate_request(&request_with_provisional_message(
+        normal_request(&config.base_messages, &compacted, &tools),
+        provisional_message,
+    ));
     if after_tokens >= before_tokens {
         let message = format!(
             "compaction did not reduce context: estimated {before_tokens} tokens before and {after_tokens} after"
@@ -1267,6 +1307,7 @@ fn select_compaction_prefix(
     tools: &[crate::model::ToolDefinition],
     target: u64,
     force: bool,
+    provisional_message: Option<&ModelMessage>,
 ) -> Option<(Vec<ModelMessage>, Vec<ModelMessage>)> {
     let segments = segment_history(history.messages());
     if segments.is_empty() {
@@ -1287,7 +1328,10 @@ fn select_compaction_prefix(
     };
 
     let before_tokens =
-        ConservativeTokenEstimator.estimate_request(&normal_request(base_messages, history, tools));
+        ConservativeTokenEstimator.estimate_request(&request_with_provisional_message(
+            normal_request(base_messages, history, tools),
+            provisional_message,
+        ));
     if !force && before_tokens <= target {
         return None;
     }
@@ -1301,7 +1345,7 @@ fn select_compaction_prefix(
         prefix.extend(segment.messages.iter().cloned());
         retained_start = index + 1;
         let retained = messages_from_segments(&segments, retained_start);
-        if projected_tokens(base_messages, tools, &retained) <= target {
+        if projected_tokens(base_messages, tools, &retained, provisional_message) <= target {
             return Some((prefix, retained));
         }
     }
@@ -1317,12 +1361,16 @@ fn projected_tokens(
     base_messages: &[ModelMessage],
     tools: &[crate::model::ToolDefinition],
     retained: &[ModelMessage],
+    provisional_message: Option<&ModelMessage>,
 ) -> u64 {
     let placeholder = ConversationHistory::new(
         Some(CompactionSummary::new("[summary of earlier conversation]")),
         retained.to_vec(),
     );
-    ConservativeTokenEstimator.estimate_request(&normal_request(base_messages, &placeholder, tools))
+    ConservativeTokenEstimator.estimate_request(&request_with_provisional_message(
+        normal_request(base_messages, &placeholder, tools),
+        provisional_message,
+    ))
 }
 
 fn messages_from_segments(segments: &[HistorySegment], start: usize) -> Vec<ModelMessage> {
@@ -3572,7 +3620,7 @@ mod tests {
             ],
         );
         let current_turn = history.messages()[4..].to_vec();
-        let (prefix, retained) = select_compaction_prefix(&history, &[], &[], 1, true)
+        let (prefix, retained) = select_compaction_prefix(&history, &[], &[], 1, true, None)
             .expect("a completed prior turn should be compactable");
 
         assert!(prefix.iter().all(|message| !current_turn.contains(message)));
