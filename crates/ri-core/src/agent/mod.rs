@@ -1,9 +1,10 @@
 use std::collections::VecDeque;
+use std::future::{poll_fn, Future};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -187,6 +188,9 @@ impl AgentRuntimeConfig {
 #[derive(Default)]
 struct SteeringState {
     messages: VecDeque<String>,
+    reserved: Option<String>,
+    delivering: bool,
+    cancel_pending: bool,
     sealed: bool,
 }
 
@@ -200,16 +204,50 @@ impl SteeringState {
         }
     }
 
-    fn pop_front(&mut self, seal_when_empty: bool) -> Option<String> {
-        let text = self.messages.pop_front();
-        if text.is_none() && seal_when_empty {
+    fn reserve(&mut self, seal_when_empty: bool) -> bool {
+        self.reserved = self.messages.pop_front();
+        if self.reserved.is_none() && seal_when_empty {
             self.sealed = true;
         }
-        text
+        self.reserved.is_some()
+    }
+
+    fn begin_delivery(&mut self) -> Option<String> {
+        let text = self.reserved.take()?;
+        self.delivering = true;
+        Some(text)
+    }
+
+    fn cancel(&mut self, cancel: &CancellationToken) {
+        if let Some(text) = self.reserved.take() {
+            self.messages.push_front(text);
+            cancel.cancel();
+        } else if self.delivering {
+            self.cancel_pending = true;
+        } else {
+            cancel.cancel();
+        }
+    }
+
+    fn finish_delivery(&mut self, cancel: &CancellationToken) {
+        self.delivering = false;
+        if self.cancel_pending {
+            self.cancel_pending = false;
+            cancel.cancel();
+        }
+    }
+
+    fn abort_delivery(&mut self, cancel: &CancellationToken) {
+        self.delivering = false;
+        self.cancel_pending = false;
+        cancel.cancel();
     }
 
     fn seal_and_drain(&mut self) -> Vec<String> {
         self.sealed = true;
+        if let Some(text) = self.reserved.take() {
+            self.messages.push_front(text);
+        }
         self.messages.drain(..).collect()
     }
 }
@@ -219,6 +257,13 @@ type SteeringQueue = Arc<Mutex<SteeringState>>;
 #[cfg(test)]
 #[derive(Default)]
 struct FinalResponseBarrier {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct SteeringInjectionBarrier {
     reached: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
@@ -238,11 +283,10 @@ impl ActiveTurn {
 
 fn cancel_task(cancel: &CancellationToken, steering: Option<&SteeringQueue>) {
     if let Some(steering) = steering {
-        let steering = steering
+        steering
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        cancel.cancel();
-        drop(steering);
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .cancel(cancel);
     } else {
         cancel.cancel();
     }
@@ -432,6 +476,8 @@ where
                                     turn_cancel,
                                     compaction_enabled,
                                     turn_steering,
+                                    #[cfg(test)]
+                                    None,
                                     #[cfg(test)]
                                     None,
                                 )
@@ -707,6 +753,7 @@ async fn run_turn<P>(
     compaction_enabled: bool,
     steering: SteeringQueue,
     #[cfg(test)] final_response_barrier: Option<Arc<FinalResponseBarrier>>,
+    #[cfg(test)] steering_injection_barrier: Option<Arc<SteeringInjectionBarrier>>,
 ) -> TurnOutcome
 where
     P: ModelProvider,
@@ -721,6 +768,7 @@ where
     }
 
     let mut tool_rounds = 0;
+    let mut steering_pending = false;
     loop {
         if cancel.is_cancelled() {
             return turn_outcome(history, StopReason::Cancelled);
@@ -734,7 +782,7 @@ where
             if cancel.is_cancelled() {
                 return turn_outcome(history, StopReason::Cancelled);
             }
-            let request = normal_request_with_effort(
+            let mut request = normal_request_with_effort(
                 &config.base_messages,
                 &history,
                 &tools,
@@ -779,7 +827,7 @@ where
                 }
             }
 
-            if !assistant_started {
+            if !assistant_started && !steering_pending {
                 if events
                     .send(AgentEvent::AssistantMessageStarted)
                     .await
@@ -789,11 +837,19 @@ where
                 }
                 assistant_started = true;
             }
+            let steering_for_request = steering_pending.then_some(&steering);
+            steering_pending = false;
             match stream_model(
                 Arc::clone(&provider),
-                request,
-                events.clone(),
+                &mut request,
+                &mut history,
+                &config.session,
+                &events,
+                &mut assistant_started,
                 cancel.clone(),
+                steering_for_request,
+                #[cfg(test)]
+                steering_injection_barrier.as_deref(),
             )
             .await
             {
@@ -892,26 +948,16 @@ where
                 barrier.reached.notify_one();
                 barrier.release.notified().await;
             }
-            match inject_next_steering(
-                &steering,
-                &mut history,
-                &config.session,
-                &events,
-                &cancel,
-                true,
-            )
-            .await
-            {
-                Ok(SteeringInjection::Injected) => continue,
-                Ok(SteeringInjection::Empty) => {
+            match reserve_next_steering(&steering, &cancel, true) {
+                SteeringInjection::Pending => {
+                    steering_pending = true;
+                    continue;
+                }
+                SteeringInjection::Empty => {
                     return turn_outcome(history, response.stop_reason);
                 }
-                Ok(SteeringInjection::Cancelled) => {
+                SteeringInjection::Cancelled => {
                     return turn_outcome(history, StopReason::Cancelled);
-                }
-                Err(error) => {
-                    fail_turn(&events, error).await;
-                    return turn_outcome(history, StopReason::Error);
                 }
             }
         }
@@ -989,59 +1035,40 @@ where
             }
         }
 
-        match inject_next_steering(
-            &steering,
-            &mut history,
-            &config.session,
-            &events,
-            &cancel,
-            false,
-        )
-        .await
-        {
-            Ok(SteeringInjection::Injected | SteeringInjection::Empty) => {}
-            Ok(SteeringInjection::Cancelled) => {
+        match reserve_next_steering(&steering, &cancel, false) {
+            SteeringInjection::Pending => steering_pending = true,
+            SteeringInjection::Empty => {}
+            SteeringInjection::Cancelled => {
                 return turn_outcome(history, StopReason::Cancelled);
-            }
-            Err(error) => {
-                fail_turn(&events, error).await;
-                return turn_outcome(history, StopReason::Error);
             }
         }
     }
 }
 
 enum SteeringInjection {
-    Injected,
+    Pending,
     Empty,
     Cancelled,
 }
 
-async fn inject_next_steering(
+fn reserve_next_steering(
     steering: &SteeringQueue,
-    history: &mut ConversationHistory,
-    session: &SessionMode,
-    events: &mpsc::Sender<AgentEvent>,
     cancel: &CancellationToken,
     seal_when_empty: bool,
-) -> Result<SteeringInjection, String> {
-    let text = {
+) -> SteeringInjection {
+    let pending = {
         let mut steering = steering
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if cancel.is_cancelled() {
-            return Ok(SteeringInjection::Cancelled);
+            return SteeringInjection::Cancelled;
         }
-        steering.pop_front(seal_when_empty)
+        steering.reserve(seal_when_empty)
     };
-    let Some(text) = text else {
-        return Ok(SteeringInjection::Empty);
-    };
-    commit_message(history, session, ModelMessage::user(text.clone()), events).await?;
-    let _ = events
-        .send(AgentEvent::SteeringMessageDelivered { text })
-        .await;
-    Ok(SteeringInjection::Injected)
+    if !pending {
+        return SteeringInjection::Empty;
+    }
+    SteeringInjection::Pending
 }
 
 fn normal_request_with_effort(
@@ -1372,22 +1399,123 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_model<P>(
     provider: Arc<P>,
-    request: ModelRequest,
-    events: mpsc::Sender<AgentEvent>,
+    request: &mut ModelRequest,
+    history: &mut ConversationHistory,
+    session: &SessionMode,
+    events: &mpsc::Sender<AgentEvent>,
+    assistant_started: &mut bool,
     cancel: CancellationToken,
+    steering: Option<&SteeringQueue>,
+    #[cfg(test)] steering_injection_barrier: Option<&SteeringInjectionBarrier>,
 ) -> Result<ModelResponse, ProviderError>
 where
     P: ModelProvider,
 {
     let (model_event_tx, mut model_event_rx) = mpsc::channel(MODEL_EVENT_CHANNEL_CAPACITY);
-    let provider_cancel = cancel.clone();
-    let mut provider_task = tokio::spawn(async move {
-        provider
-            .stream(request, model_event_tx, provider_cancel)
+
+    let mut steering_delivery = false;
+    if let Some(steering) = steering {
+        #[cfg(test)]
+        if let Some(barrier) = steering_injection_barrier {
+            barrier.reached.notify_one();
+            barrier.release.notified().await;
+        }
+        let text = {
+            let mut state = steering
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if cancel.is_cancelled() {
+                return Err(ProviderError::Cancelled);
+            }
+            state
+                .begin_delivery()
+                .expect("pending steering has a reserved message")
+        };
+        if let Err(message) =
+            commit_message(history, session, ModelMessage::user(text.clone()), events).await
+        {
+            steering
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .abort_delivery(&cancel);
+            return Err(ProviderError::Failed { message });
+        }
+        request.messages.push(ModelMessage::user(text.clone()));
+        if events
+            .send(AgentEvent::SteeringMessageDelivered { text })
             .await
+            .is_err()
+        {
+            steering
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .abort_delivery(&cancel);
+            return Err(ProviderError::Failed {
+                message: "agent event stream closed".to_owned(),
+            });
+        }
+        if !*assistant_started {
+            if events
+                .send(AgentEvent::AssistantMessageStarted)
+                .await
+                .is_err()
+            {
+                steering
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .abort_delivery(&cancel);
+                return Err(ProviderError::Failed {
+                    message: "agent event stream closed".to_owned(),
+                });
+            }
+            *assistant_started = true;
+        }
+        steering_delivery = true;
+    }
+
+    let provider_events = model_event_tx;
+    let provider_request = request.clone();
+    let provider_cancel = cancel.child_token();
+    let (provider_polled_tx, provider_polled_rx) = oneshot::channel();
+    let mut provider_task = tokio::spawn(async move {
+        let provider = provider.stream(provider_request, provider_events, provider_cancel);
+        tokio::pin!(provider);
+        let result = poll_fn(|context| match provider.as_mut().poll(context) {
+            std::task::Poll::Ready(result) => std::task::Poll::Ready(Some(result)),
+            std::task::Poll::Pending => std::task::Poll::Ready(None),
+        })
+        .await;
+        let _ = provider_polled_tx.send(());
+        match result {
+            Some(result) => result,
+            None => provider.await,
+        }
     });
+    if provider_polled_rx.await.is_err() {
+        if steering_delivery {
+            steering
+                .expect("delivery has steering state")
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .abort_delivery(&cancel);
+        }
+        return match provider_task.await {
+            Ok(result) => result,
+            Err(error) => Err(ProviderError::Failed {
+                message: format!("provider task failed: {error}"),
+            }),
+        };
+    }
+    if steering_delivery {
+        steering
+            .expect("delivery has steering state")
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .finish_delivery(&cancel);
+    }
     let mut usage_event_seen = false;
 
     let provider_result = loop {
@@ -1400,7 +1528,7 @@ where
             model_event = model_event_rx.recv() => {
                 let Some(model_event) = model_event else { continue };
                 usage_event_seen |= matches!(&model_event, ModelEvent::UsageUpdated(_));
-                if let Err(error) = send_model_event(&events, model_event, &cancel).await {
+                if let Err(error) = send_model_event(events, model_event, &cancel).await {
                     provider_task.abort();
                     let _ = provider_task.await;
                     return Err(error);
@@ -1414,7 +1542,7 @@ where
 
     while let Some(model_event) = model_event_rx.recv().await {
         usage_event_seen |= matches!(&model_event, ModelEvent::UsageUpdated(_));
-        send_model_event(&events, model_event, &cancel).await?;
+        send_model_event(events, model_event, &cancel).await?;
     }
 
     match provider_result {
@@ -1422,7 +1550,7 @@ where
             let result = result?;
             if !usage_event_seen {
                 if let Some(usage) = result.usage.clone() {
-                    send_model_event(&events, ModelEvent::UsageUpdated(usage), &cancel).await?;
+                    send_model_event(events, ModelEvent::UsageUpdated(usage), &cancel).await?;
                 }
             }
             Ok(result)
@@ -2799,6 +2927,83 @@ mod tests {
             cancel.clone(),
             false,
             Arc::clone(&steering),
+            Some(Arc::clone(&barrier)),
+            None,
+        ));
+
+        barrier.reached.notified().await;
+        cancel_task(&cancel, Some(&steering));
+        barrier.release.notify_one();
+
+        let outcome = turn.await.unwrap();
+        recover_pending_steering(&Some(steering), &event_tx).await;
+        drop(event_tx);
+        let mut events = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            events.push(event);
+        }
+
+        assert_eq!(outcome.reason, StopReason::Cancelled);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::SteeringMessagesRecovered { messages }
+                if messages == &["queued guidance".to_owned()]
+        )));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::SteeringMessageDelivered { .. })));
+        assert!(!outcome
+            .history
+            .messages()
+            .contains(&ModelMessage::user("queued guidance")));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert!(!crate::session::read_session(&path)
+            .unwrap()
+            .history
+            .contains(&ModelMessage::user("queued guidance")));
+
+        drop(handle);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_steering_reservation_recovers_the_message() {
+        let root = unique_test_dir("agent-session-cancel-reserved-steering");
+        std::fs::create_dir_all(&root).unwrap();
+        let repository =
+            crate::session::SessionRepository::new(root.join("sessions"), &root, &root).unwrap();
+        let handle = repository.create().unwrap();
+        let path = handle.info().unwrap().path.clone();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            final_step("done"),
+            final_step("should not run"),
+        ]));
+        let requests = Arc::clone(&provider.requests);
+        let steering = Arc::new(Mutex::new(SteeringState::default()));
+        steering
+            .lock()
+            .unwrap()
+            .accept("queued guidance".to_owned());
+        let cancel = CancellationToken::new();
+        let barrier = Arc::new(SteeringInjectionBarrier::default());
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let turn = tokio::spawn(run_turn(
+            provider,
+            Arc::new(ToolRegistry::new()),
+            AgentRuntimeConfig {
+                tool_context: ToolContext::new(&root).unwrap(),
+                base_messages: Vec::new(),
+                initial_history: Vec::new(),
+                session: SessionMode::Enabled(handle.clone()),
+                reasoning_effort: None,
+            },
+            ConversationHistory::default(),
+            "initial".to_owned(),
+            event_tx.clone(),
+            cancel.clone(),
+            false,
+            Arc::clone(&steering),
+            None,
             Some(Arc::clone(&barrier)),
         ));
 
