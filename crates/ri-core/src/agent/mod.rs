@@ -3103,6 +3103,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automatic_compaction_accounts_for_reserved_steering_before_delivery() {
+        let initial_history = vec![
+            ModelMessage::user("old request ".repeat(120)),
+            ModelMessage::Assistant {
+                items: vec![ModelAssistantItem::Text {
+                    content: "old answer ".repeat(120),
+                }],
+            },
+            ModelMessage::user("recent request ".repeat(40)),
+            ModelMessage::Assistant {
+                items: vec![ModelAssistantItem::Text {
+                    content: "recent answer ".repeat(40),
+                }],
+            },
+        ];
+        let steering_text = "steering guidance ".repeat(20);
+        let mut history_before_continuation = initial_history.clone();
+        history_before_continuation.push(ModelMessage::user("initial"));
+        history_before_continuation.push(ModelMessage::Assistant {
+            items: vec![ModelAssistantItem::Text {
+                content: "initial answer".to_owned(),
+            }],
+        });
+        let registry = ToolRegistry::new();
+        let request_without_steering = normal_request(
+            &[],
+            &ConversationHistory::new(None, history_before_continuation),
+            &registry.definitions(),
+        );
+        let mut request_with_steering = request_without_steering.clone();
+        request_with_steering
+            .messages
+            .push(ModelMessage::user(steering_text.clone()));
+        let estimator = ConservativeTokenEstimator;
+        let without_steering = estimator.estimate_request(&request_without_steering);
+        let with_steering = estimator.estimate_request(&request_with_steering);
+        let context_window = (100u64..without_steering.saturating_mul(2).saturating_add(200))
+            .find(|context_window| {
+                let budget = context_window.saturating_sub(100);
+                let trigger = automatic_trigger(budget);
+                without_steering <= trigger && with_steering > trigger
+            })
+            .expect("limits should separate the requests at the automatic trigger");
+        let limits = ModelLimits {
+            context_window: Some(context_window),
+            max_output_tokens: Some(100),
+        };
+        let trigger = automatic_trigger(input_budget(limits).unwrap());
+        assert!(without_steering <= trigger);
+        assert!(with_steering > trigger);
+
+        let provider = Arc::new(
+            ScriptedProvider::new(vec![
+                final_step("initial answer"),
+                final_step("compaction summary"),
+                final_step("continued"),
+            ])
+            .with_limits(limits),
+        );
+        let requests = Arc::clone(&provider.requests);
+        let steering = Arc::new(Mutex::new(SteeringState::default()));
+        assert!(steering
+            .lock()
+            .unwrap()
+            .accept(steering_text.clone())
+            .is_none());
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let turn = tokio::spawn(run_turn(
+            provider,
+            Arc::new(registry),
+            AgentRuntimeConfig {
+                tool_context: ToolContext::from_current_dir().unwrap(),
+                base_messages: Vec::new(),
+                initial_history: Vec::new(),
+                session: SessionMode::Disabled,
+                reasoning_effort: None,
+            },
+            ConversationHistory::new(None, initial_history),
+            "initial".to_owned(),
+            event_tx.clone(),
+            CancellationToken::new(),
+            true,
+            steering,
+            None,
+            None,
+        ));
+        let outcome = turn.await.unwrap();
+        drop(event_tx);
+        let mut events = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            events.push(event);
+        }
+
+        assert_eq!(outcome.reason, StopReason::Stop);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::ContextUsageUpdated(usage)
+                    if usage.estimated_input_tokens == with_steering
+            )
+        }));
+        let compaction_started = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::CompactionStarted { automatic: true }))
+            .expect("reserved steering should trigger automatic compaction");
+        let steering_delivered = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::SteeringMessageDelivered { .. }))
+            .expect("steering should be delivered");
+        assert!(compaction_started < steering_delivered);
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(matches!(
+            requests[1].messages.first(),
+            Some(ModelMessage::System { content }) if content.contains("Return only the continuation summary")
+        ));
+        assert_eq!(
+            requests[2]
+                .messages
+                .iter()
+                .filter(|message| **message == ModelMessage::user(steering_text.clone()))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn steering_after_the_final_response_boundary_is_recovered() {
         let provider = ScriptedProvider::new(vec![final_step("done")]).with_limits(ModelLimits {
             context_window: Some(1_000),
