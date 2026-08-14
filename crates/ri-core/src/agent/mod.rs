@@ -1181,12 +1181,15 @@ where
     let target = input_budget(limits)
         .map(compaction_target)
         .unwrap_or_else(|| before_tokens.saturating_div(2).max(1));
+    // Manual compaction runs only while idle, so its latest segment is complete.
+    let compact_latest = !automatic;
     let Some((prefix, retained)) = select_compaction_prefix(
         &history,
         &config.base_messages,
         &tools,
         target,
         force,
+        compact_latest,
         provisional_message,
     ) else {
         if !automatic {
@@ -1330,6 +1333,7 @@ fn select_compaction_prefix(
     tools: &[crate::model::ToolDefinition],
     target: u64,
     force: bool,
+    compact_latest: bool,
     provisional_message: Option<&ModelMessage>,
 ) -> Option<(Vec<ModelMessage>, Vec<ModelMessage>)> {
     let segments = segment_history(history.messages());
@@ -1342,7 +1346,9 @@ fn select_compaction_prefix(
         .filter_map(|(index, segment)| segment.has_user_message.then_some(index))
         .collect();
     let current_segment = user_segments.last().copied().unwrap_or(segments.len() - 1);
-    let eligible_end = if force {
+    let eligible_end = if compact_latest {
+        segments.len()
+    } else if force {
         current_segment
     } else if user_segments.len() > 2 {
         user_segments[user_segments.len() - 2].min(current_segment)
@@ -3827,7 +3833,7 @@ mod tests {
             ],
         );
         let current_turn = history.messages()[4..].to_vec();
-        let (prefix, retained) = select_compaction_prefix(&history, &[], &[], 1, true, None)
+        let (prefix, retained) = select_compaction_prefix(&history, &[], &[], 1, true, false, None)
             .expect("a completed prior turn should be compactable");
 
         assert!(prefix.iter().all(|message| !current_turn.contains(message)));
