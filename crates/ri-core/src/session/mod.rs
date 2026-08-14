@@ -503,6 +503,11 @@ pub enum SessionError {
 
     #[error("session writer state was poisoned")]
     WriterPoisoned,
+
+    #[error(
+        "session writer state is uncertain after a failed append; close and reopen the session before writing again"
+    )]
+    WriterInvalidated,
 }
 
 fn io_error(path: impl Into<PathBuf>, source: io::Error) -> SessionError {
@@ -725,6 +730,12 @@ pub struct OpenedSession {
     pub warnings: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionWriterState {
+    Healthy,
+    Unknown,
+}
+
 struct SessionWriter {
     info: SessionInfo,
     header: SessionHeader,
@@ -733,6 +744,7 @@ struct SessionWriter {
     head: Option<MessageId>,
     active_messages: Vec<(MessageId, ModelMessage)>,
     transcript: Vec<ModelMessage>,
+    write_state: SessionWriterState,
     #[cfg(test)]
     fail_next_message_append_ambiguously: bool,
 }
@@ -781,6 +793,7 @@ impl SessionWriter {
                 head: None,
                 active_messages: Vec::new(),
                 transcript: Vec::new(),
+                write_state: SessionWriterState::Healthy,
                 #[cfg(test)]
                 fail_next_message_append_ambiguously: false,
             })),
@@ -855,6 +868,7 @@ impl SessionWriter {
             head: snapshot.last_message_id.clone(),
             active_messages,
             transcript: snapshot.transcript.clone(),
+            write_state: SessionWriterState::Healthy,
             #[cfg(test)]
             fail_next_message_append_ambiguously: false,
         };
@@ -865,7 +879,28 @@ impl SessionWriter {
         Ok((handle, SessionSnapshot { info, ..snapshot }))
     }
 
+    fn ensure_writable(&self) -> Result<(), SessionError> {
+        match self.write_state {
+            SessionWriterState::Healthy => Ok(()),
+            SessionWriterState::Unknown => Err(SessionError::WriterInvalidated),
+        }
+    }
+
+    fn finish_record_append(
+        &mut self,
+        result: Result<(), SessionWriteError>,
+    ) -> Result<(), SessionWriteError> {
+        if matches!(
+            result.as_ref(),
+            Err(error) if error.outcome == SessionWriteOutcome::Unknown
+        ) {
+            self.write_state = SessionWriterState::Unknown;
+        }
+        result
+    }
+
     fn append_message(&mut self, message: &ModelMessage) -> Result<SessionInfo, SessionWriteError> {
+        self.ensure_writable()?;
         let message = SessionMessage::from_model(message)?;
         self.materialize()?;
         let id = MessageId::new();
@@ -891,7 +926,7 @@ impl SessionWriter {
         };
         #[cfg(not(test))]
         let append_result = append_record(file, &record, &self.info.path);
-        append_result?;
+        self.finish_record_append(append_result)?;
         self.head = Some(id.clone());
         self.active_messages
             .push((id, message.clone().into_model()));
@@ -911,6 +946,7 @@ impl SessionWriter {
         summary: &str,
         retained_messages: &[ModelMessage],
     ) -> Result<SessionInfo, SessionError> {
+        self.ensure_writable()?;
         let mut retained_ids = Vec::with_capacity(retained_messages.len());
         let mut search_end = self.active_messages.len();
         for retained in retained_messages.iter().rev() {
@@ -939,11 +975,12 @@ impl SessionWriter {
             summary: summary.to_owned(),
             retained_message_ids: retained_ids,
         };
-        append_record(
+        let append_result = append_record(
             self.file.as_mut().expect("materialized session"),
             &record,
             &self.info.path,
-        )?;
+        );
+        self.finish_record_append(append_result)?;
         self.head = Some(id);
         self.active_messages = retained_messages
             .iter()
@@ -964,23 +1001,26 @@ impl SessionWriter {
     }
 
     fn rename(&mut self, name: &str) -> Result<SessionInfo, SessionError> {
+        self.ensure_writable()?;
         self.materialize()?;
         let timestamp = now_timestamp();
         let record = SessionRecord::Metadata {
             timestamp: timestamp.clone(),
             name: name.to_owned(),
         };
-        append_record(
+        let append_result = append_record(
             self.file.as_mut().expect("materialized session"),
             &record,
             &self.info.path,
-        )?;
+        );
+        self.finish_record_append(append_result)?;
         self.info.name = Some(name.to_owned());
         self.info.updated_at = timestamp;
         Ok(self.info.clone())
     }
 
     fn set_thinking_level(&mut self, level: ThinkingLevel) -> Result<SessionInfo, SessionError> {
+        self.ensure_writable()?;
         if self.info.thinking_level == Some(level) {
             return Ok(self.info.clone());
         }
@@ -993,17 +1033,19 @@ impl SessionWriter {
             timestamp: timestamp.clone(),
             level,
         };
-        append_record(
+        let append_result = append_record(
             self.file.as_mut().expect("materialized session"),
             &record,
             &self.info.path,
-        )?;
+        );
+        self.finish_record_append(append_result)?;
         self.info.thinking_level = Some(level);
         self.info.updated_at = timestamp;
         Ok(self.info.clone())
     }
 
-    fn materialize(&mut self) -> Result<(), SessionError> {
+    fn materialize(&mut self) -> Result<(), SessionWriteError> {
+        self.ensure_writable()?;
         if self.file.is_some() {
             debug_assert!(self._lock.is_some());
             return Ok(());
@@ -1021,7 +1063,7 @@ impl SessionWriter {
         let mut file = options
             .open(&self.info.path)
             .map_err(|source| io_error(&self.info.path, source))?;
-        append_record(
+        let append_result = append_record(
             &mut file,
             &SessionRecord::Session {
                 version: self.header.version,
@@ -1031,17 +1073,19 @@ impl SessionWriter {
                 project_root: self.header.project_root.clone(),
             },
             &self.info.path,
-        )?;
+        );
+        self.finish_record_append(append_result)?;
         if let Some(level) = self.info.thinking_level {
             let timestamp = now_timestamp();
-            append_record(
+            let append_result = append_record(
                 &mut file,
                 &SessionRecord::Thinking {
                     timestamp: timestamp.clone(),
                     level,
                 },
                 &self.info.path,
-            )?;
+            );
+            self.finish_record_append(append_result)?;
             self.info.updated_at = timestamp;
         }
         self.file = Some(file);
@@ -2169,9 +2213,22 @@ mod tests {
         ));
         let uncertain_file = fs::read(&path).unwrap();
 
-        assert!(handle
-            .append_message(&ModelMessage::user("later request"))
-            .is_err());
+        assert!(matches!(
+            handle.append_message(&ModelMessage::user("later request")),
+            Err(SessionError::WriterInvalidated)
+        ));
+        assert!(matches!(
+            handle.append_compaction("later summary", &[]),
+            Err(SessionError::WriterInvalidated)
+        ));
+        assert!(matches!(
+            handle.rename("later name"),
+            Err(SessionError::WriterInvalidated)
+        ));
+        assert!(matches!(
+            handle.set_thinking_level(ThinkingLevel::High),
+            Err(SessionError::WriterInvalidated)
+        ));
         assert_eq!(fs::read(&path).unwrap(), uncertain_file);
 
         drop(handle);
