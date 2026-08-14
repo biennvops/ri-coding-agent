@@ -20,7 +20,7 @@ use crate::model::{
     ModelAssistantItem, ModelEvent, ModelLimits, ModelMessage, ModelProvider, ModelRequest,
     ModelResponse, ModelToolCall, ProviderError, StopReason, Usage,
 };
-use crate::session::{SessionInfo, SessionMode};
+use crate::session::{SessionInfo, SessionMode, SessionWriteOutcome};
 use crate::tools::{
     ToolContext, ToolError, ToolEvent, ToolExecutionMetadata, ToolExecutionResult,
     ToolOutputStream, ToolRegistry,
@@ -187,7 +187,7 @@ impl AgentRuntimeConfig {
 
 struct SteeringDelivery {
     text: String,
-    committed: bool,
+    recoverable: bool,
 }
 
 #[derive(Default)]
@@ -221,7 +221,7 @@ impl SteeringState {
         let text = self.reserved.take()?;
         self.delivering = Some(SteeringDelivery {
             text: text.clone(),
-            committed: false,
+            recoverable: true,
         });
         Some(text)
     }
@@ -241,9 +241,9 @@ impl SteeringState {
         }
     }
 
-    fn mark_delivery_committed(&mut self) {
+    fn prevent_delivery_recovery(&mut self) {
         if let Some(delivery) = self.delivering.as_mut() {
-            delivery.committed = true;
+            delivery.recoverable = false;
         }
     }
 
@@ -257,7 +257,7 @@ impl SteeringState {
 
     fn abort_delivery(&mut self, cancel: &CancellationToken) {
         if let Some(delivery) = self.delivering.take() {
-            if !delivery.committed {
+            if delivery.recoverable {
                 self.messages.push_front(delivery.text);
             }
         }
@@ -268,7 +268,7 @@ impl SteeringState {
     fn seal_and_drain(&mut self) -> Vec<String> {
         self.sealed = true;
         if let Some(delivery) = self.delivering.take() {
-            if !delivery.committed {
+            if delivery.recoverable {
                 self.messages.push_front(delivery.text);
             }
         }
@@ -1508,12 +1508,12 @@ where
         let commit_result =
             commit_message(history, session, ModelMessage::user(text.clone()), events).await;
         if let Err(error) = commit_result {
-            let CommitMessageError { message, persisted } = error;
+            let CommitMessageError { message, outcome } = error;
             let mut state = steering
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if persisted {
-                state.mark_delivery_committed();
+            if !matches!(outcome, CommitMessageOutcome::NotPersisted) {
+                state.prevent_delivery_recovery();
             }
             state.abort_delivery(&cancel);
             return Err(ProviderError::Failed { message });
@@ -1521,7 +1521,7 @@ where
         steering
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .mark_delivery_committed();
+            .prevent_delivery_recovery();
         request.messages.push(ModelMessage::user(text.clone()));
         if events
             .send(AgentEvent::SteeringMessageDelivered { text })
@@ -1785,9 +1785,15 @@ fn tool_error_result(error: ToolError, cancelled: bool) -> ToolExecutionResult {
     }
 }
 
+enum CommitMessageOutcome {
+    NotPersisted,
+    Persisted,
+    Unknown,
+}
+
 struct CommitMessageError {
     message: String,
-    persisted: bool,
+    outcome: CommitMessageOutcome,
 }
 
 async fn commit_message(
@@ -1796,12 +1802,16 @@ async fn commit_message(
     message: ModelMessage,
     events: &mpsc::Sender<AgentEvent>,
 ) -> Result<(), CommitMessageError> {
-    let info = session
-        .append_message(&message)
-        .map_err(|error| CommitMessageError {
+    let info = session.append_message(&message).map_err(|error| {
+        let (error, outcome) = error.into_parts();
+        CommitMessageError {
             message: format!("session persistence failed: {error}"),
-            persisted: false,
-        })?;
+            outcome: match outcome {
+                SessionWriteOutcome::NotPersisted => CommitMessageOutcome::NotPersisted,
+                SessionWriteOutcome::Unknown => CommitMessageOutcome::Unknown,
+            },
+        }
+    })?;
     history.push(message);
     if let Some(info) = info {
         events
@@ -1809,7 +1819,7 @@ async fn commit_message(
             .await
             .map_err(|_| CommitMessageError {
                 message: "agent event stream closed".to_owned(),
-                persisted: true,
+                outcome: CommitMessageOutcome::Persisted,
             })?;
     }
     Ok(())
@@ -3049,7 +3059,12 @@ mod tests {
 
         assert_eq!(outcome.reason, StopReason::Error);
         assert!(events.iter().any(|event| {
-            matches!(event, AgentEvent::Error(error) if error.message.contains("session persistence failed"))
+            matches!(
+                event,
+                AgentEvent::Error(error)
+                    if error.message.contains("session persistence failed")
+                        && error.message.contains("write outcome is unknown")
+            )
         }));
         assert!(!events
             .iter()
