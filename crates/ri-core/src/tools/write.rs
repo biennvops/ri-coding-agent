@@ -12,8 +12,8 @@ use crate::model::ToolDefinition;
 
 use super::path::resolve_for_write;
 use super::{
-    bounded_preview, Tool, ToolCallPresentation, ToolContext, ToolError, ToolEventSender,
-    ToolExecutionResult,
+    bounded_preview, preview_lines, Tool, ToolCallPresentation, ToolContext, ToolError,
+    ToolEventSender, ToolExecutionResult, ToolPreviewKind,
 };
 
 pub(crate) struct WriteTool;
@@ -56,10 +56,15 @@ impl Tool for WriteTool {
         };
         ToolCallPresentation {
             summary: format!("write {}", arguments.path),
-            preview: Some(bounded_preview(
-                arguments.content.lines().map(|line| (None, line)),
-                arguments.content.lines().count(),
-            )),
+            summary_kind: super::ToolSummaryKind::Normal,
+            output_kind: super::ToolOutputKind::Normal,
+            preview: preview_lines(
+                bounded_preview(
+                    arguments.content.lines().map(|line| (None, line)),
+                    arguments.content.lines().count(),
+                ),
+                ToolPreviewKind::Normal,
+            ),
         }
     }
 
@@ -120,6 +125,15 @@ mod tests {
 
     use super::*;
 
+    fn preview_text(presentation: &ToolCallPresentation) -> String {
+        presentation
+            .preview
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn presents_path_and_unescaped_content() {
         let presentation = WriteTool.presentation(&json!({
@@ -128,8 +142,12 @@ mod tests {
         }));
 
         assert_eq!(presentation.summary, "write src/foo.rs");
-        assert_eq!(presentation.preview.as_deref(), Some("one\ntwo\nthree"));
-        assert!(!presentation.preview.unwrap().contains("\"content\":"));
+        assert_eq!(preview_text(&presentation), "one\ntwo\nthree");
+        assert!(presentation
+            .preview
+            .iter()
+            .all(|line| line.kind == ToolPreviewKind::Normal));
+        assert!(!preview_text(&presentation).contains("\"content\":"));
     }
 
     #[test]
@@ -142,7 +160,7 @@ mod tests {
             "path": "src/large.rs",
             "content": lines
         }));
-        let preview = presentation.preview.unwrap();
+        let preview = preview_text(&presentation);
 
         assert_eq!(presentation.summary, "write src/large.rs");
         assert!(preview.contains("line 20"));
@@ -154,7 +172,7 @@ mod tests {
             "path": "src/wide.rs",
             "content": "x".repeat(super::super::MAX_TOOL_PREVIEW_BYTES * 2)
         }));
-        let preview = presentation.preview.unwrap();
+        let preview = preview_text(&presentation);
         assert!(preview.contains("… content preview truncated …"));
         assert!(preview.len() <= super::super::MAX_TOOL_PREVIEW_BYTES);
     }

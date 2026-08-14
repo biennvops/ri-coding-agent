@@ -447,6 +447,15 @@ pub enum SessionError {
     #[error("could not access session {path}: {source}")]
     Io { path: PathBuf, source: io::Error },
 
+    #[error(
+        "session {path} write outcome is unknown: append failed: {append}; rollback failed: {rollback}"
+    )]
+    AppendRollback {
+        path: PathBuf,
+        append: io::Error,
+        rollback: io::Error,
+    },
+
     #[error("session {path} is corrupted at line {line}: {message}")]
     Corrupted {
         path: PathBuf,
@@ -494,12 +503,61 @@ pub enum SessionError {
 
     #[error("session writer state was poisoned")]
     WriterPoisoned,
+
+    #[error(
+        "session writer state is uncertain after a failed append; close and reopen the session before writing again"
+    )]
+    WriterInvalidated,
 }
 
 fn io_error(path: impl Into<PathBuf>, source: io::Error) -> SessionError {
     SessionError::Io {
         path: path.into(),
         source,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionWriteOutcome {
+    NotPersisted,
+    Unknown,
+}
+
+#[derive(Debug)]
+pub(crate) struct SessionWriteError {
+    error: SessionError,
+    outcome: SessionWriteOutcome,
+}
+
+impl SessionWriteError {
+    fn not_persisted(error: SessionError) -> Self {
+        Self {
+            error,
+            outcome: SessionWriteOutcome::NotPersisted,
+        }
+    }
+
+    fn unknown(error: SessionError) -> Self {
+        Self {
+            error,
+            outcome: SessionWriteOutcome::Unknown,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (SessionError, SessionWriteOutcome) {
+        (self.error, self.outcome)
+    }
+}
+
+impl From<SessionError> for SessionWriteError {
+    fn from(error: SessionError) -> Self {
+        Self::not_persisted(error)
+    }
+}
+
+impl From<SessionWriteError> for SessionError {
+    fn from(error: SessionWriteError) -> Self {
+        error.error
     }
 }
 
@@ -548,10 +606,28 @@ impl SessionHandle {
     }
 
     pub fn append_message(&self, message: &ModelMessage) -> Result<SessionInfo, SessionError> {
+        self.append_message_with_outcome(message)
+            .map_err(SessionError::from)
+    }
+
+    fn append_message_with_outcome(
+        &self,
+        message: &ModelMessage,
+    ) -> Result<SessionInfo, SessionWriteError> {
         self.inner
             .lock()
-            .map_err(|_| SessionError::WriterPoisoned)?
+            .map_err(|_| SessionWriteError::unknown(SessionError::WriterPoisoned))?
             .append_message(message)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_message_append_ambiguously(&self) -> Result<(), SessionError> {
+        let mut writer = self
+            .inner
+            .lock()
+            .map_err(|_| SessionError::WriterPoisoned)?;
+        writer.fail_next_message_append_ambiguously = true;
+        Ok(())
     }
 
     pub fn append_compaction(
@@ -615,10 +691,10 @@ impl SessionMode {
     pub(crate) fn append_message(
         &self,
         message: &ModelMessage,
-    ) -> Result<Option<SessionInfo>, SessionError> {
+    ) -> Result<Option<SessionInfo>, SessionWriteError> {
         match self {
             Self::Disabled => Ok(None),
-            Self::Enabled(handle) => handle.append_message(message).map(Some),
+            Self::Enabled(handle) => handle.append_message_with_outcome(message).map(Some),
         }
     }
 
@@ -654,6 +730,12 @@ pub struct OpenedSession {
     pub warnings: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionWriterState {
+    Healthy,
+    Unknown,
+}
+
 struct SessionWriter {
     info: SessionInfo,
     header: SessionHeader,
@@ -662,6 +744,9 @@ struct SessionWriter {
     head: Option<MessageId>,
     active_messages: Vec<(MessageId, ModelMessage)>,
     transcript: Vec<ModelMessage>,
+    write_state: SessionWriterState,
+    #[cfg(test)]
+    fail_next_message_append_ambiguously: bool,
 }
 
 impl SessionWriter {
@@ -708,6 +793,9 @@ impl SessionWriter {
                 head: None,
                 active_messages: Vec::new(),
                 transcript: Vec::new(),
+                write_state: SessionWriterState::Healthy,
+                #[cfg(test)]
+                fail_next_message_append_ambiguously: false,
             })),
         })
     }
@@ -780,6 +868,9 @@ impl SessionWriter {
             head: snapshot.last_message_id.clone(),
             active_messages,
             transcript: snapshot.transcript.clone(),
+            write_state: SessionWriterState::Healthy,
+            #[cfg(test)]
+            fail_next_message_append_ambiguously: false,
         };
         let handle = SessionHandle {
             inner: Arc::new(Mutex::new(writer)),
@@ -788,7 +879,28 @@ impl SessionWriter {
         Ok((handle, SessionSnapshot { info, ..snapshot }))
     }
 
-    fn append_message(&mut self, message: &ModelMessage) -> Result<SessionInfo, SessionError> {
+    fn ensure_writable(&self) -> Result<(), SessionError> {
+        match self.write_state {
+            SessionWriterState::Healthy => Ok(()),
+            SessionWriterState::Unknown => Err(SessionError::WriterInvalidated),
+        }
+    }
+
+    fn finish_record_append(
+        &mut self,
+        result: Result<(), SessionWriteError>,
+    ) -> Result<(), SessionWriteError> {
+        if matches!(
+            result.as_ref(),
+            Err(error) if error.outcome == SessionWriteOutcome::Unknown
+        ) {
+            self.write_state = SessionWriterState::Unknown;
+        }
+        result
+    }
+
+    fn append_message(&mut self, message: &ModelMessage) -> Result<SessionInfo, SessionWriteError> {
+        self.ensure_writable()?;
         let message = SessionMessage::from_model(message)?;
         self.materialize()?;
         let id = MessageId::new();
@@ -799,11 +911,22 @@ impl SessionWriter {
             timestamp: timestamp.clone(),
             message: message.clone(),
         };
-        append_record(
-            self.file.as_mut().expect("materialized session"),
-            &record,
-            &self.info.path,
-        )?;
+        #[cfg(test)]
+        let fail_ambiguously = std::mem::take(&mut self.fail_next_message_append_ambiguously);
+        let file = self.file.as_mut().expect("materialized session");
+        #[cfg(test)]
+        let append_result = if fail_ambiguously {
+            append_record(
+                &mut AmbiguousAppendFile { inner: file },
+                &record,
+                &self.info.path,
+            )
+        } else {
+            append_record(file, &record, &self.info.path)
+        };
+        #[cfg(not(test))]
+        let append_result = append_record(file, &record, &self.info.path);
+        self.finish_record_append(append_result)?;
         self.head = Some(id.clone());
         self.active_messages
             .push((id, message.clone().into_model()));
@@ -823,6 +946,7 @@ impl SessionWriter {
         summary: &str,
         retained_messages: &[ModelMessage],
     ) -> Result<SessionInfo, SessionError> {
+        self.ensure_writable()?;
         let mut retained_ids = Vec::with_capacity(retained_messages.len());
         let mut search_end = self.active_messages.len();
         for retained in retained_messages.iter().rev() {
@@ -851,11 +975,12 @@ impl SessionWriter {
             summary: summary.to_owned(),
             retained_message_ids: retained_ids,
         };
-        append_record(
+        let append_result = append_record(
             self.file.as_mut().expect("materialized session"),
             &record,
             &self.info.path,
-        )?;
+        );
+        self.finish_record_append(append_result)?;
         self.head = Some(id);
         self.active_messages = retained_messages
             .iter()
@@ -876,23 +1001,26 @@ impl SessionWriter {
     }
 
     fn rename(&mut self, name: &str) -> Result<SessionInfo, SessionError> {
+        self.ensure_writable()?;
         self.materialize()?;
         let timestamp = now_timestamp();
         let record = SessionRecord::Metadata {
             timestamp: timestamp.clone(),
             name: name.to_owned(),
         };
-        append_record(
+        let append_result = append_record(
             self.file.as_mut().expect("materialized session"),
             &record,
             &self.info.path,
-        )?;
+        );
+        self.finish_record_append(append_result)?;
         self.info.name = Some(name.to_owned());
         self.info.updated_at = timestamp;
         Ok(self.info.clone())
     }
 
     fn set_thinking_level(&mut self, level: ThinkingLevel) -> Result<SessionInfo, SessionError> {
+        self.ensure_writable()?;
         if self.info.thinking_level == Some(level) {
             return Ok(self.info.clone());
         }
@@ -905,17 +1033,19 @@ impl SessionWriter {
             timestamp: timestamp.clone(),
             level,
         };
-        append_record(
+        let append_result = append_record(
             self.file.as_mut().expect("materialized session"),
             &record,
             &self.info.path,
-        )?;
+        );
+        self.finish_record_append(append_result)?;
         self.info.thinking_level = Some(level);
         self.info.updated_at = timestamp;
         Ok(self.info.clone())
     }
 
-    fn materialize(&mut self) -> Result<(), SessionError> {
+    fn materialize(&mut self) -> Result<(), SessionWriteError> {
+        self.ensure_writable()?;
         if self.file.is_some() {
             debug_assert!(self._lock.is_some());
             return Ok(());
@@ -933,7 +1063,7 @@ impl SessionWriter {
         let mut file = options
             .open(&self.info.path)
             .map_err(|source| io_error(&self.info.path, source))?;
-        append_record(
+        let append_result = append_record(
             &mut file,
             &SessionRecord::Session {
                 version: self.header.version,
@@ -943,17 +1073,19 @@ impl SessionWriter {
                 project_root: self.header.project_root.clone(),
             },
             &self.info.path,
-        )?;
+        );
+        self.finish_record_append(append_result)?;
         if let Some(level) = self.info.thinking_level {
             let timestamp = now_timestamp();
-            append_record(
+            let append_result = append_record(
                 &mut file,
                 &SessionRecord::Thinking {
                     timestamp: timestamp.clone(),
                     level,
                 },
                 &self.info.path,
-            )?;
+            );
+            self.finish_record_append(append_result)?;
             self.info.updated_at = timestamp;
         }
         self.file = Some(file);
@@ -1624,22 +1756,156 @@ fn read_bounded_line<R: Read>(
     }
 }
 
-fn append_record(file: &mut File, record: &SessionRecord, path: &Path) -> Result<(), SessionError> {
-    let bytes = serde_json::to_vec(record).map_err(|error| SessionError::InvalidRecord {
-        path: path.to_path_buf(),
-        message: error.to_string(),
+trait SessionRecordFile: Write + Seek {
+    fn set_len(&mut self, length: u64) -> io::Result<()>;
+    fn sync_data(&mut self) -> io::Result<()>;
+    fn sync_all(&mut self) -> io::Result<()>;
+}
+
+impl SessionRecordFile for File {
+    fn set_len(&mut self, length: u64) -> io::Result<()> {
+        File::set_len(self, length)
+    }
+
+    fn sync_data(&mut self) -> io::Result<()> {
+        File::sync_data(self)
+    }
+
+    fn sync_all(&mut self) -> io::Result<()> {
+        File::sync_all(self)
+    }
+}
+
+#[cfg(test)]
+struct FailFirstSyncFile<'a> {
+    inner: &'a mut File,
+    failed: bool,
+}
+
+#[cfg(test)]
+impl Write for FailFirstSyncFile<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.inner.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+#[cfg(test)]
+impl Seek for FailFirstSyncFile<'_> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(position)
+    }
+}
+
+#[cfg(test)]
+impl SessionRecordFile for FailFirstSyncFile<'_> {
+    fn set_len(&mut self, length: u64) -> io::Result<()> {
+        self.inner.set_len(length)
+    }
+
+    fn sync_data(&mut self) -> io::Result<()> {
+        if !self.failed {
+            self.failed = true;
+            return Err(io::Error::other("injected session sync failure"));
+        }
+        self.inner.sync_data()
+    }
+
+    fn sync_all(&mut self) -> io::Result<()> {
+        self.inner.sync_all()
+    }
+}
+
+#[cfg(test)]
+struct AmbiguousAppendFile<'a> {
+    inner: &'a mut File,
+}
+
+#[cfg(test)]
+impl Write for AmbiguousAppendFile<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.inner.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+#[cfg(test)]
+impl Seek for AmbiguousAppendFile<'_> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.inner.seek(position)
+    }
+}
+
+#[cfg(test)]
+impl SessionRecordFile for AmbiguousAppendFile<'_> {
+    fn set_len(&mut self, _length: u64) -> io::Result<()> {
+        Err(io::Error::other("injected session rollback failure"))
+    }
+
+    fn sync_data(&mut self) -> io::Result<()> {
+        Err(io::Error::other("injected session sync failure"))
+    }
+
+    fn sync_all(&mut self) -> io::Result<()> {
+        Err(io::Error::other("injected session rollback sync failure"))
+    }
+}
+
+fn append_record<F>(
+    file: &mut F,
+    record: &SessionRecord,
+    path: &Path,
+) -> Result<(), SessionWriteError>
+where
+    F: SessionRecordFile + ?Sized,
+{
+    let bytes = serde_json::to_vec(record).map_err(|error| {
+        SessionWriteError::not_persisted(SessionError::InvalidRecord {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        })
     })?;
     if bytes.len().saturating_add(1) > MAX_SESSION_RECORD_BYTES {
-        return Err(SessionError::RecordTooLarge {
-            line: 0,
-            limit: MAX_SESSION_RECORD_BYTES,
-        });
+        return Err(SessionWriteError::not_persisted(
+            SessionError::RecordTooLarge {
+                line: 0,
+                limit: MAX_SESSION_RECORD_BYTES,
+            },
+        ));
     }
-    file.write_all(&bytes)
+    let original_length = file
+        .seek(SeekFrom::End(0))
+        .map_err(|source| SessionWriteError::not_persisted(io_error(path, source)))?;
+    let append_error = match file
+        .write_all(&bytes)
         .and_then(|_| file.write_all(b"\n"))
         .and_then(|_| file.flush())
         .and_then(|_| file.sync_data())
-        .map_err(|source| io_error(path, source))
+    {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    match file
+        .set_len(original_length)
+        .and_then(|_| file.seek(SeekFrom::Start(original_length)))
+        .and_then(|_| file.sync_all())
+    {
+        Ok(()) => Err(SessionWriteError::not_persisted(io_error(
+            path,
+            append_error,
+        ))),
+        Err(rollback) => Err(SessionWriteError::unknown(SessionError::AppendRollback {
+            path: path.to_path_buf(),
+            append: append_error,
+            rollback,
+        })),
+    }
 }
 
 fn canonical_directory(path: &Path) -> Result<PathBuf, SessionError> {
@@ -1928,6 +2194,78 @@ mod tests {
         assert!(encoded.contains(r#""summary":"""#));
         assert!(encoded.contains("call_123"));
         assert!(encoded.contains("fc_456"));
+    }
+
+    #[test]
+    fn ambiguous_append_rejects_reusing_the_same_writer() {
+        let root = test_dir("ambiguous-append-reuse");
+        fs::create_dir_all(&root).unwrap();
+        let repository = SessionRepository::new(root.join("sessions"), &root, &root).unwrap();
+        let handle = repository.create().unwrap();
+        handle
+            .append_message(&ModelMessage::user("initial request"))
+            .unwrap();
+        let path = handle.info().unwrap().path;
+        handle.fail_next_message_append_ambiguously().unwrap();
+        assert!(matches!(
+            handle.append_message(&ModelMessage::user("ambiguous message")),
+            Err(SessionError::AppendRollback { .. })
+        ));
+        let uncertain_file = fs::read(&path).unwrap();
+
+        assert!(matches!(
+            handle.append_message(&ModelMessage::user("later request")),
+            Err(SessionError::WriterInvalidated)
+        ));
+        assert!(matches!(
+            handle.append_compaction("later summary", &[]),
+            Err(SessionError::WriterInvalidated)
+        ));
+        assert!(matches!(
+            handle.rename("later name"),
+            Err(SessionError::WriterInvalidated)
+        ));
+        assert!(matches!(
+            handle.set_thinking_level(ThinkingLevel::High),
+            Err(SessionError::WriterInvalidated)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), uncertain_file);
+
+        drop(handle);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_sync_rolls_back_the_record_before_reporting_not_persisted() {
+        let root = test_dir("append-rollback");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.jsonl");
+        let original = b"existing record\n";
+        fs::write(&path, original).unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let error = append_record(
+            &mut FailFirstSyncFile {
+                inner: &mut file,
+                failed: false,
+            },
+            &SessionRecord::Metadata {
+                timestamp: now_timestamp(),
+                name: "new name".to_owned(),
+            },
+            &path,
+        )
+        .unwrap_err();
+        let (error, outcome) = error.into_parts();
+
+        assert_eq!(outcome, SessionWriteOutcome::NotPersisted);
+        assert!(matches!(error, SessionError::Io { .. }));
+        drop(file);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

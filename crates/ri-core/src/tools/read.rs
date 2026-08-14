@@ -10,7 +10,7 @@ use crate::model::ToolDefinition;
 use super::path::resolve_existing;
 use super::{
     BoundedText, Tool, ToolCallPresentation, ToolContext, ToolError, ToolEventSender,
-    ToolExecutionResult,
+    ToolExecutionResult, ToolOutputKind, ToolSummaryKind,
 };
 use super::{MAX_READ_FILE_BYTES, MAX_READ_LINES, MAX_TOOL_OUTPUT_BYTES};
 
@@ -68,15 +68,21 @@ impl Tool for ReadTool {
             return ToolCallPresentation::fallback("read", arguments);
         };
         let mut summary = format!("read {}", arguments.path);
-        if arguments.offset.is_some() || arguments.limit.is_some() {
+        let summary_kind = if arguments.offset.is_some() || arguments.limit.is_some() {
             let start = arguments.offset.unwrap_or(1);
             let limit = arguments.limit.unwrap_or(DEFAULT_READ_LIMIT);
             let end = start.saturating_add(limit).saturating_sub(1);
+            let range_start = summary.len();
             summary.push_str(&format!(" · lines {start}–{end}"));
-        }
+            ToolSummaryKind::Range { start: range_start }
+        } else {
+            ToolSummaryKind::Normal
+        };
         ToolCallPresentation {
             summary,
-            preview: None,
+            summary_kind,
+            output_kind: ToolOutputKind::NumberedLines,
+            preview: Vec::new(),
         }
     }
 
@@ -206,7 +212,14 @@ mod tests {
         }));
 
         assert_eq!(presentation.summary, "read src/foo.rs · lines 10–29");
-        assert_eq!(presentation.preview, None);
+        assert_eq!(
+            presentation.summary_kind,
+            ToolSummaryKind::Range {
+                start: "read src/foo.rs".len()
+            }
+        );
+        assert_eq!(presentation.output_kind, ToolOutputKind::NumberedLines);
+        assert!(presentation.preview.is_empty());
         assert!(!presentation.summary.contains("{\"path\":"));
     }
 

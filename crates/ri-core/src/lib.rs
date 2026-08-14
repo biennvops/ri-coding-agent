@@ -10,9 +10,9 @@ pub mod tools;
 
 pub use agent::{AgentCommand, AgentError, AgentEvent, AgentRuntime, AgentRuntimeConfig};
 pub use app::{
-    AppState, MessageRole, StreamingAssistantState, ToolStatus, ToolTranscriptEntry,
-    TranscriptEntry, TranscriptEntryId, TranscriptEntryState, TranscriptMessage,
-    TranscriptMessages,
+    AppState, MessageRole, StreamingAssistantState, ToolOutputChunk, ToolStatus,
+    ToolTranscriptEntry, TranscriptEntries, TranscriptEntry, TranscriptEntryId,
+    TranscriptEntryState, TranscriptMessage, TranscriptMessages, UserMessageStatus,
 };
 pub use config::{
     default_state_path, load_state, persist_recent_model, ApiKind, CompactionSettings,
@@ -40,6 +40,7 @@ pub use session::{
 };
 pub use tools::{
     Tool, ToolCallPresentation, ToolContext, ToolError, ToolEvent, ToolEventSender,
-    ToolExecutionMetadata, ToolExecutionResult, ToolOutputStream, ToolRegistry,
-    DEFAULT_BASH_TIMEOUT_MS, MAX_TOOL_OUTPUT_BYTES, MAX_TOOL_PREVIEW_BYTES, MAX_TOOL_PREVIEW_LINES,
+    ToolExecutionMetadata, ToolExecutionResult, ToolOutputKind, ToolOutputStream, ToolPreviewKind,
+    ToolPreviewLine, ToolRegistry, ToolSummaryKind, DEFAULT_BASH_TIMEOUT_MS, MAX_TOOL_OUTPUT_BYTES,
+    MAX_TOOL_PREVIEW_BYTES, MAX_TOOL_PREVIEW_LINES,
 };

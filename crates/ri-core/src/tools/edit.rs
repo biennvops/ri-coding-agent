@@ -11,8 +11,9 @@ use super::path::resolve_existing;
 use super::write::atomic_replace;
 use super::MAX_EDIT_FILE_BYTES;
 use super::{
-    bounded_preview_with_limits, Tool, ToolCallPresentation, ToolContext, ToolError,
-    ToolEventSender, ToolExecutionResult, MAX_TOOL_PREVIEW_BYTES, MAX_TOOL_PREVIEW_LINES,
+    bounded_preview_with_limits, preview_lines, Tool, ToolCallPresentation, ToolContext, ToolError,
+    ToolEventSender, ToolExecutionResult, ToolPreviewKind, MAX_TOOL_PREVIEW_BYTES,
+    MAX_TOOL_PREVIEW_LINES,
 };
 
 pub(crate) struct EditTool;
@@ -88,13 +89,16 @@ impl Tool for EditTool {
         });
         ToolCallPresentation {
             summary: format!("edit {}", arguments.path),
-            preview: Some(
-                [old_preview, new_preview]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ),
+            summary_kind: super::ToolSummaryKind::Normal,
+            output_kind: super::ToolOutputKind::Normal,
+            preview: [
+                old_preview.map(|preview| preview_lines(preview, ToolPreviewKind::Removed)),
+                new_preview.map(|preview| preview_lines(preview, ToolPreviewKind::Added)),
+            ]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect(),
         }
     }
 
@@ -212,6 +216,15 @@ mod tests {
 
     use super::*;
 
+    fn preview_text(presentation: &ToolCallPresentation) -> String {
+        presentation
+            .preview
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn presents_single_line_replacement_as_diff() {
         let presentation = EditTool.presentation(&json!({
@@ -221,10 +234,9 @@ mod tests {
         }));
 
         assert_eq!(presentation.summary, "edit src/foo.rs");
-        assert_eq!(
-            presentation.preview.as_deref(),
-            Some("-let a = 1;\n+let a = 2;")
-        );
+        assert_eq!(preview_text(&presentation), "-let a = 1;\n+let a = 2;");
+        assert_eq!(presentation.preview[0].kind, ToolPreviewKind::Removed);
+        assert_eq!(presentation.preview[1].kind, ToolPreviewKind::Added);
     }
 
     #[test]
@@ -242,7 +254,7 @@ mod tests {
             "old_text": old_text,
             "new_text": new_text
         }));
-        let preview = presentation.preview.unwrap();
+        let preview = preview_text(&presentation);
 
         assert!(preview.contains("-old 1"));
         assert!(preview.contains("+new 1"));
@@ -268,7 +280,7 @@ mod tests {
             "old_text": old_text,
             "new_text": "replacement"
         }));
-        let preview = presentation.preview.unwrap();
+        let preview = preview_text(&presentation);
 
         assert!(preview.contains("-old 1"));
         assert!(preview.contains("+replacement"));

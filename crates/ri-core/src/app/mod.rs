@@ -8,8 +8,8 @@ use crate::context::ContextUsage;
 use crate::model::{ModelAssistantItem, ModelLimits, ModelMessage, StopReason, Usage};
 use crate::session::SessionInfo;
 use crate::tools::{
-    ToolCallPresentation, ToolExecutionMetadata, ToolOutputStream, ToolRegistry,
-    MAX_TOOL_PREVIEW_BYTES,
+    ToolCallPresentation, ToolExecutionMetadata, ToolOutputKind, ToolOutputStream, ToolPreviewKind,
+    ToolPreviewLine, ToolRegistry, ToolSummaryKind, MAX_TOOL_PREVIEW_BYTES,
 };
 
 const MAX_TOOL_TRANSCRIPT_OUTPUT_BYTES: usize = 256 * 1024;
@@ -22,14 +22,22 @@ pub enum MessageRole {
     Assistant,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UserMessageStatus {
+    Delivered,
+    Queued,
+    Recovered,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TranscriptMessage {
     pub role: MessageRole,
     pub content: String,
     pub thinking: Option<String>,
+    pub user_status: UserMessageStatus,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TranscriptEntryId(u64);
 
 impl TranscriptEntryId {
@@ -82,6 +90,75 @@ impl Index<usize> for TranscriptMessages<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct TranscriptEntries<'a> {
+    entries: &'a [TranscriptEntryState],
+    indices: &'a [usize],
+}
+
+impl<'a> TranscriptEntries<'a> {
+    pub fn len(&self) -> usize {
+        self.indices.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+
+    pub fn iter(&self) -> TranscriptEntriesIter<'_> {
+        self.into_iter()
+    }
+
+    pub fn last(self) -> Option<&'a TranscriptEntryState> {
+        self.indices.last().map(|&index| &self.entries[index])
+    }
+}
+
+impl Index<usize> for TranscriptEntries<'_> {
+    type Output = TranscriptEntryState;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.entries[self.indices[index]]
+    }
+}
+
+pub struct TranscriptEntriesIter<'a> {
+    entries: &'a [TranscriptEntryState],
+    indices: std::slice::Iter<'a, usize>,
+}
+
+impl<'a> Iterator for TranscriptEntriesIter<'a> {
+    type Item = &'a TranscriptEntryState;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.indices.next().map(|&index| &self.entries[index])
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.indices.size_hint()
+    }
+}
+
+impl DoubleEndedIterator for TranscriptEntriesIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.indices.next_back().map(|&index| &self.entries[index])
+    }
+}
+
+impl ExactSizeIterator for TranscriptEntriesIter<'_> {}
+
+impl<'a> IntoIterator for TranscriptEntries<'a> {
+    type Item = &'a TranscriptEntryState;
+    type IntoIter = TranscriptEntriesIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        TranscriptEntriesIter {
+            entries: self.entries,
+            indices: self.indices.iter(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamingAssistantState {
     pub id: TranscriptEntryId,
@@ -97,12 +174,23 @@ pub enum ToolStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolOutputChunk {
+    pub stream: Option<ToolOutputStream>,
+    pub kind: ToolOutputKind,
+    pub prefixes: Vec<Option<usize>>,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolTranscriptEntry {
     pub call_id: String,
     pub name: String,
     pub summary: String,
-    pub preview: Option<String>,
+    pub summary_kind: ToolSummaryKind,
+    pub output_kind: ToolOutputKind,
+    pub preview: Vec<ToolPreviewLine>,
     pub output: String,
+    pub output_chunks: Vec<ToolOutputChunk>,
     pub output_truncated: bool,
     pub status: ToolStatus,
 }
@@ -117,6 +205,10 @@ pub enum TranscriptEntry {
 pub struct AppState {
     message_entry_indices: Vec<usize>,
     entries: Vec<TranscriptEntryState>,
+    transcript_entry_indices: Vec<usize>,
+    transcript_entry_order: Vec<usize>,
+    transcript_entry_positions: Vec<usize>,
+    queued_transcript_start: Option<usize>,
     streaming_assistant: Option<StreamingAssistantState>,
     next_transcript_entry_id: u64,
     transcript_epoch: u64,
@@ -131,6 +223,7 @@ pub struct AppState {
     last_stop_reason: Option<StopReason>,
     active_model: Option<ModelRef>,
     thinking_level: Option<ThinkingLevel>,
+    git_branch: Option<String>,
     session_info: Option<SessionInfo>,
     context_usage: ContextUsage,
     latest_usage: Option<Usage>,
@@ -150,6 +243,27 @@ impl AppState {
 
     pub fn transcript_entries(&self) -> &[TranscriptEntryState] {
         &self.entries
+    }
+
+    pub fn transcript_display_entries(&self) -> TranscriptEntries<'_> {
+        TranscriptEntries {
+            entries: &self.entries,
+            indices: &self.transcript_entry_order,
+        }
+    }
+
+    pub fn transcript_display_position(&self, id: TranscriptEntryId) -> Option<usize> {
+        self.transcript_entry_index(id)
+            .and_then(|index| self.transcript_entry_positions.get(index).copied())
+    }
+
+    pub fn transcript_entry(&self, id: TranscriptEntryId) -> Option<&TranscriptEntryState> {
+        self.transcript_entry_index(id)
+            .map(|index| &self.entries[index])
+    }
+
+    pub fn queued_transcript_start(&self) -> Option<usize> {
+        self.queued_transcript_start
     }
 
     pub fn transcript_epoch(&self) -> u64 {
@@ -191,7 +305,7 @@ impl AppState {
     }
 
     pub fn set_cursor(&mut self, cursor: usize) {
-        if !self.is_busy() && cursor <= self.input.len() && self.input.is_char_boundary(cursor) {
+        if cursor <= self.input.len() && self.input.is_char_boundary(cursor) {
             self.cursor = cursor;
         }
     }
@@ -234,6 +348,14 @@ impl AppState {
         self.thinking_level = level;
     }
 
+    pub fn git_branch(&self) -> Option<&str> {
+        self.git_branch.as_deref()
+    }
+
+    pub fn set_git_branch(&mut self, branch: Option<String>) {
+        self.git_branch = branch;
+    }
+
     pub fn session_info(&self) -> Option<&SessionInfo> {
         self.session_info.as_ref()
     }
@@ -258,6 +380,10 @@ impl AppState {
         self.pending_transcript_changes.clear();
         self.message_entry_indices = Vec::new();
         self.entries = Vec::new();
+        self.transcript_entry_indices = Vec::new();
+        self.transcript_entry_order = Vec::new();
+        self.transcript_entry_positions = Vec::new();
+        self.queued_transcript_start = None;
         self.streaming_assistant = None;
         self.input.clear();
         self.cursor = 0;
@@ -281,7 +407,7 @@ impl AppState {
     }
 
     pub fn insert_text(&mut self, text: &str) {
-        if self.is_busy() || text.is_empty() {
+        if text.is_empty() {
             return;
         }
         self.input.insert_str(self.cursor, text);
@@ -290,7 +416,7 @@ impl AppState {
     }
 
     pub fn set_input(&mut self, text: String) {
-        if self.is_busy() || self.input == text {
+        if self.input == text {
             return;
         }
         self.input = text;
@@ -303,7 +429,7 @@ impl AppState {
     }
 
     pub fn backspace(&mut self) {
-        if self.is_busy() || self.cursor == 0 {
+        if self.cursor == 0 {
             return;
         }
         let previous = previous_grapheme_boundary(&self.input, self.cursor);
@@ -313,7 +439,7 @@ impl AppState {
     }
 
     pub fn delete(&mut self) {
-        if self.is_busy() || self.cursor == self.input.len() {
+        if self.cursor == self.input.len() {
             return;
         }
         let next = next_grapheme_boundary(&self.input, self.cursor);
@@ -322,31 +448,23 @@ impl AppState {
     }
 
     pub fn move_left(&mut self) {
-        if !self.is_busy() {
-            self.cursor = previous_grapheme_boundary(&self.input, self.cursor);
-        }
+        self.cursor = previous_grapheme_boundary(&self.input, self.cursor);
     }
 
     pub fn move_right(&mut self) {
-        if !self.is_busy() {
-            self.cursor = next_grapheme_boundary(&self.input, self.cursor);
-        }
+        self.cursor = next_grapheme_boundary(&self.input, self.cursor);
     }
 
     pub fn move_home(&mut self) {
-        if !self.is_busy() {
-            self.cursor = line_start(&self.input, self.cursor);
-        }
+        self.cursor = line_start(&self.input, self.cursor);
     }
 
     pub fn move_end(&mut self) {
-        if !self.is_busy() {
-            self.cursor = line_end(&self.input, self.cursor);
-        }
+        self.cursor = line_end(&self.input, self.cursor);
     }
 
     pub fn take_input(&mut self) -> Option<String> {
-        if self.is_busy() || self.input.trim().is_empty() {
+        if self.input.trim().is_empty() {
             return None;
         }
         let text = std::mem::take(&mut self.input);
@@ -360,20 +478,42 @@ impl AppState {
             role: MessageRole::System,
             content: content.into(),
             thinking: None,
+            user_status: UserMessageStatus::Delivered,
         });
     }
 
     pub fn submit_input(&mut self) -> Option<String> {
+        if self.is_busy() {
+            return None;
+        }
         let text = self.take_input()?;
         self.finalize_streaming_assistant();
         self.push_message(TranscriptMessage {
             role: MessageRole::User,
             content: text.clone(),
             thinking: None,
+            user_status: UserMessageStatus::Delivered,
         });
         self.turn_active = true;
         self.last_error = None;
         self.last_stop_reason = None;
+        Some(text)
+    }
+
+    pub fn queue_input(&mut self) -> Option<String> {
+        if !self.turn_active || self.compaction_active {
+            return None;
+        }
+        let text = self.take_input()?;
+        if self.queued_transcript_start.is_none() {
+            self.queued_transcript_start = Some(self.transcript_entry_order.len());
+        }
+        self.push_message(TranscriptMessage {
+            role: MessageRole::User,
+            content: text.clone(),
+            thinking: None,
+            user_status: UserMessageStatus::Queued,
+        });
         Some(text)
     }
 
@@ -383,6 +523,34 @@ impl AppState {
                 self.turn_active = true;
                 self.last_error = None;
                 self.last_stop_reason = None;
+            }
+            AgentEvent::SteeringMessageDelivered { text } => {
+                if let Some(index) = self.oldest_queued_message_index() {
+                    self.release_transcript_entry(index);
+                    self.update_queued_message(index, UserMessageStatus::Delivered);
+                } else {
+                    self.push_message(TranscriptMessage {
+                        role: MessageRole::User,
+                        content: text,
+                        thinking: None,
+                        user_status: UserMessageStatus::Delivered,
+                    });
+                }
+            }
+            AgentEvent::SteeringMessagesRecovered { messages } => {
+                for text in messages {
+                    if let Some(index) = self.oldest_queued_message_index() {
+                        self.update_queued_message(index, UserMessageStatus::Recovered);
+                        self.release_transcript_entry(index);
+                    } else {
+                        self.push_message(TranscriptMessage {
+                            role: MessageRole::User,
+                            content: text,
+                            thinking: None,
+                            user_status: UserMessageStatus::Recovered,
+                        });
+                    }
+                }
             }
             AgentEvent::AssistantMessageStarted => {
                 self.finalize_streaming_assistant();
@@ -468,8 +636,11 @@ impl AppState {
                     call_id,
                     name,
                     summary: presentation.summary,
+                    summary_kind: presentation.summary_kind,
+                    output_kind: presentation.output_kind,
                     preview: presentation.preview,
                     output: String::new(),
+                    output_chunks: Vec::new(),
                     output_truncated: false,
                     status: ToolStatus::Running,
                 }));
@@ -482,13 +653,10 @@ impl AppState {
                 if let Some(index) = self.entries.iter().rposition(
                     |entry| matches!(&entry.entry, TranscriptEntry::Tool(tool) if tool.call_id == call_id),
                 ) {
-                    let mut changed = !chunk.is_empty();
+                    let changed = !chunk.is_empty();
                     if let TranscriptEntry::Tool(tool) = &mut self.entries[index].entry {
-                        if matches!(stream, ToolOutputStream::Stderr) && tool.output.is_empty() {
-                            append_tool_output(tool, "[stderr]\n");
-                            changed = true;
-                        }
                         append_tool_output(tool, &chunk);
+                        append_tool_output_chunk(tool, Some(stream), &chunk);
                     }
                     if changed {
                         self.mark_entry_changed(index);
@@ -508,6 +676,9 @@ impl AppState {
                         tool.output.clear();
                         tool.output_truncated = false;
                         append_tool_output(tool, &result.model_content);
+                        if tool.output_chunks.is_empty() {
+                            append_tool_output_chunk(tool, None, &result.model_content);
+                        }
                         tool.output_truncated |= live_output_truncated || result.metadata.truncated;
                         tool.status = ToolStatus::Finished(result.metadata);
                     }
@@ -536,6 +707,7 @@ impl AppState {
                         compact_token_count(after_tokens)
                     ),
                     thinking: None,
+                    user_status: UserMessageStatus::Delivered,
                 });
             }
             AgentEvent::CompactionFailed { message } => {
@@ -545,6 +717,7 @@ impl AppState {
                     role: MessageRole::System,
                     content: message,
                     thinking: None,
+                    user_status: UserMessageStatus::Delivered,
                 });
             }
             AgentEvent::AssistantTextItem { .. }
@@ -582,8 +755,33 @@ impl AppState {
                     role: MessageRole::System,
                     content: format!("error: {message}"),
                     thinking: None,
+                    user_status: UserMessageStatus::Delivered,
                 });
             }
+        }
+    }
+
+    fn oldest_queued_message_index(&self) -> Option<usize> {
+        self.entries.iter().position(|entry| {
+            matches!(
+                &entry.entry,
+                TranscriptEntry::Message(TranscriptMessage {
+                    role: MessageRole::User,
+                    user_status: UserMessageStatus::Queued,
+                    ..
+                })
+            )
+        })
+    }
+
+    fn update_queued_message(&mut self, index: usize, status: UserMessageStatus) {
+        if let Some(TranscriptEntryState {
+            entry: TranscriptEntry::Message(message),
+            ..
+        }) = self.entries.get_mut(index)
+        {
+            message.user_status = status;
+            self.mark_entry_changed(index);
         }
     }
 
@@ -598,9 +796,8 @@ impl AppState {
         id: TranscriptEntryId,
         revision: u64,
     ) {
-        let entry_index = self.entries.len();
+        self.message_entry_indices.push(self.entries.len());
         self.push_entry_with_identity(TranscriptEntry::Message(message), id, revision);
-        self.message_entry_indices.push(entry_index);
     }
 
     fn push_entry(&mut self, entry: TranscriptEntry) -> TranscriptEntryId {
@@ -615,12 +812,69 @@ impl AppState {
         id: TranscriptEntryId,
         revision: u64,
     ) {
+        let queued = is_queued_user_entry(&entry);
+        let index = self.entries.len();
         self.entries.push(TranscriptEntryState {
             id,
             revision,
             entry,
         });
+        let id_index = id.get() as usize;
+        if self.transcript_entry_indices.len() <= id_index {
+            self.transcript_entry_indices
+                .resize(id_index + 1, usize::MAX);
+        }
+        self.transcript_entry_indices[id_index] = index;
+        let order_index = if queued {
+            self.transcript_entry_order.len()
+        } else {
+            self.queued_transcript_start
+                .unwrap_or(self.transcript_entry_order.len())
+        };
+        self.transcript_entry_order.insert(order_index, index);
+        self.transcript_entry_positions.push(order_index);
+        for &entry_index in self.transcript_entry_order.iter().skip(order_index + 1) {
+            self.transcript_entry_positions[entry_index] += 1;
+        }
+        if !queued {
+            if let Some(start) = self.queued_transcript_start.as_mut() {
+                *start += 1;
+            }
+        }
         self.mark_transcript_changed(id);
+    }
+
+    fn release_transcript_entry(&mut self, index: usize) {
+        let Some(&position) = self.transcript_entry_positions.get(index) else {
+            return;
+        };
+        self.transcript_entry_order.remove(position);
+        let insert_at = self
+            .queued_transcript_start
+            .map(|start| start.saturating_sub(usize::from(position < start)))
+            .unwrap_or(self.transcript_entry_order.len());
+        self.transcript_entry_order.insert(insert_at, index);
+        let first_changed = position.min(insert_at);
+        let last_changed = position.max(insert_at);
+        for (position, &entry_index) in self.transcript_entry_order[first_changed..=last_changed]
+            .iter()
+            .enumerate()
+        {
+            self.transcript_entry_positions[entry_index] = first_changed + position;
+        }
+        if let Some(start) = self.queued_transcript_start.as_mut() {
+            *start = insert_at + 1;
+            if *start == self.transcript_entry_order.len() {
+                self.queued_transcript_start = None;
+            }
+        }
+    }
+
+    fn transcript_entry_index(&self, id: TranscriptEntryId) -> Option<usize> {
+        self.transcript_entry_indices
+            .get(id.get() as usize)
+            .copied()
+            .filter(|&index| index != usize::MAX)
     }
 
     fn allocate_transcript_entry_id(&mut self) -> TranscriptEntryId {
@@ -705,6 +959,7 @@ impl AppState {
                 role: MessageRole::User,
                 content: content.clone(),
                 thinking: None,
+                user_status: UserMessageStatus::Delivered,
             }),
             ModelMessage::Assistant { items } => {
                 let content = items
@@ -735,6 +990,7 @@ impl AppState {
                         role: MessageRole::Assistant,
                         content,
                         thinking: (!thinking.is_empty()).then_some(thinking),
+                        user_status: UserMessageStatus::Delivered,
                     });
                 }
                 for item in items {
@@ -750,8 +1006,11 @@ impl AppState {
                         call_id,
                         name,
                         summary: presentation.summary,
+                        summary_kind: presentation.summary_kind,
+                        output_kind: presentation.output_kind,
                         preview: presentation.preview,
                         output: String::new(),
+                        output_chunks: Vec::new(),
                         output_truncated: false,
                         status: ToolStatus::Running,
                     }));
@@ -768,8 +1027,10 @@ impl AppState {
                 if let Some(index) = found {
                     if let TranscriptEntry::Tool(tool) = &mut self.entries[index].entry {
                         tool.output.clear();
+                        tool.output_chunks.clear();
                         tool.output_truncated = false;
                         append_tool_output(tool, content);
+                        append_tool_output_chunk(tool, None, content);
                         tool.status = ToolStatus::Finished(ToolExecutionMetadata::success());
                     }
                     self.mark_entry_changed(index);
@@ -778,12 +1039,16 @@ impl AppState {
                         call_id: tool_call_id.clone(),
                         name: tool_name.clone(),
                         summary: tool_name.clone(),
-                        preview: None,
+                        summary_kind: ToolSummaryKind::Normal,
+                        output_kind: ToolOutputKind::Normal,
+                        preview: Vec::new(),
                         output: String::new(),
+                        output_chunks: Vec::new(),
                         output_truncated: false,
                         status: ToolStatus::Finished(ToolExecutionMetadata::success()),
                     };
                     append_tool_output(&mut tool, content);
+                    append_tool_output_chunk(&mut tool, None, content);
                     self.push_entry(TranscriptEntry::Tool(tool));
                 }
             }
@@ -802,12 +1067,145 @@ impl AppState {
                     role: MessageRole::Assistant,
                     content: assistant.content,
                     thinking: (!assistant.thinking.is_empty()).then_some(assistant.thinking),
+                    user_status: UserMessageStatus::Delivered,
                 },
                 assistant.id,
                 assistant.revision.wrapping_add(1),
             );
         }
     }
+}
+
+fn is_queued_user_entry(entry: &TranscriptEntry) -> bool {
+    matches!(
+        entry,
+        TranscriptEntry::Message(TranscriptMessage {
+            role: MessageRole::User,
+            user_status: UserMessageStatus::Queued,
+            ..
+        })
+    )
+}
+
+fn output_prefixes(kind: ToolOutputKind, text: &str) -> Vec<Option<usize>> {
+    if kind != ToolOutputKind::NumberedLines {
+        return Vec::new();
+    }
+    text.split('\n')
+        .map(|line| {
+            line.split_once(" | ").and_then(|(number, _)| {
+                number
+                    .parse::<usize>()
+                    .ok()
+                    .map(|_| number.len().saturating_add(3))
+            })
+        })
+        .collect()
+}
+
+fn append_tool_output_chunk(
+    tool: &mut ToolTranscriptEntry,
+    stream: Option<ToolOutputStream>,
+    text: &str,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let kind = match stream {
+        Some(_) => ToolOutputKind::Normal,
+        None => tool.output_kind,
+    };
+    if let Some(last) = tool.output_chunks.last_mut() {
+        if last.stream == stream && last.kind == kind {
+            last.text.push_str(text);
+            last.prefixes = output_prefixes(kind, &last.text);
+        } else {
+            tool.output_chunks.push(ToolOutputChunk {
+                stream,
+                kind,
+                prefixes: output_prefixes(kind, text),
+                text: text.to_owned(),
+            });
+        }
+    } else {
+        tool.output_chunks.push(ToolOutputChunk {
+            stream,
+            kind,
+            prefixes: output_prefixes(kind, text),
+            text: text.to_owned(),
+        });
+    }
+
+    let total = tool
+        .output_chunks
+        .iter()
+        .map(|chunk| chunk.text.len())
+        .sum::<usize>();
+    if total <= MAX_TOOL_TRANSCRIPT_OUTPUT_BYTES {
+        return;
+    }
+
+    let retained = MAX_TOOL_TRANSCRIPT_OUTPUT_BYTES.saturating_sub(TOOL_OUTPUT_MARKER.len());
+    let head_limit = retained / 2;
+    let tail_limit = retained - head_limit;
+    let mut bounded = tool_output_prefix(&tool.output_chunks, head_limit);
+    bounded.push(ToolOutputChunk {
+        stream: None,
+        kind: ToolOutputKind::Truncation,
+        prefixes: Vec::new(),
+        text: TOOL_OUTPUT_MARKER.to_owned(),
+    });
+    bounded.extend(tool_output_suffix(&tool.output_chunks, tail_limit));
+    tool.output_chunks = bounded;
+}
+
+fn tool_output_prefix(chunks: &[ToolOutputChunk], limit: usize) -> Vec<ToolOutputChunk> {
+    let mut remaining = limit;
+    let mut result = Vec::new();
+    for chunk in chunks {
+        if remaining == 0 {
+            break;
+        }
+        let text = prefix_at_boundary(&chunk.text, remaining.min(chunk.text.len()));
+        if !text.is_empty() {
+            result.push(ToolOutputChunk {
+                stream: chunk.stream,
+                kind: chunk.kind,
+                prefixes: output_prefixes(chunk.kind, text),
+                text: text.to_owned(),
+            });
+            remaining = remaining.saturating_sub(text.len());
+        }
+        if text.len() < chunk.text.len() {
+            break;
+        }
+    }
+    result
+}
+
+fn tool_output_suffix(chunks: &[ToolOutputChunk], limit: usize) -> Vec<ToolOutputChunk> {
+    let mut remaining = limit;
+    let mut result = Vec::new();
+    for chunk in chunks.iter().rev() {
+        if remaining == 0 {
+            break;
+        }
+        let text = suffix_at_boundary(&chunk.text, remaining.min(chunk.text.len()));
+        if !text.is_empty() {
+            result.push(ToolOutputChunk {
+                stream: chunk.stream,
+                kind: chunk.kind,
+                prefixes: output_prefixes(chunk.kind, text),
+                text: text.to_owned(),
+            });
+            remaining = remaining.saturating_sub(text.len());
+        }
+        if text.len() < chunk.text.len() {
+            break;
+        }
+    }
+    result.reverse();
+    result
 }
 
 fn compact_token_count(value: u64) -> String {
@@ -873,7 +1271,19 @@ fn tool_call_presentation(name: &str, arguments: &str) -> ToolCallPresentation {
         Ok(arguments) => ToolRegistry::new().presentation(name, &arguments),
         Err(_) => ToolCallPresentation {
             summary: name.to_owned(),
-            preview: Some(truncate_text(arguments, MAX_TOOL_PREVIEW_BYTES)),
+            summary_kind: ToolSummaryKind::Normal,
+            output_kind: ToolOutputKind::Normal,
+            preview: truncate_text(arguments, MAX_TOOL_PREVIEW_BYTES)
+                .lines()
+                .map(|text| ToolPreviewLine {
+                    kind: if text.starts_with('…') || text.starts_with("[…") {
+                        ToolPreviewKind::Dim
+                    } else {
+                        ToolPreviewKind::Normal
+                    },
+                    text: text.to_owned(),
+                })
+                .collect(),
         },
     }
 }
@@ -1046,6 +1456,54 @@ mod tests {
     }
 
     #[test]
+    fn live_tool_output_preserves_bounded_stream_order_after_completion() {
+        let mut state = AppState::new();
+        state.reduce(AgentEvent::ToolExecutionStarted {
+            call_id: "call-1".to_owned(),
+            name: "bash".to_owned(),
+            arguments: r#"{"command":"test"}"#.to_owned(),
+        });
+        for (stream, chunk) in [
+            (ToolOutputStream::Stdout, "out 1\n"),
+            (ToolOutputStream::Stderr, "err\n"),
+            (ToolOutputStream::Stdout, "out 2\n"),
+        ] {
+            state.reduce(AgentEvent::ToolExecutionOutput {
+                call_id: "call-1".to_owned(),
+                stream,
+                chunk: chunk.to_owned(),
+            });
+        }
+        state.reduce(AgentEvent::ToolExecutionFinished {
+            call_id: "call-1".to_owned(),
+            name: "bash".to_owned(),
+            result: ToolExecutionResultForTest::result_with_content("authoritative result"),
+        });
+
+        let TranscriptEntry::Tool(tool) = &state.transcript_entries()[0].entry else {
+            panic!("expected tool entry");
+        };
+        assert_eq!(
+            tool.output_chunks
+                .iter()
+                .map(|chunk| (chunk.stream, chunk.text.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (Some(ToolOutputStream::Stdout), "out 1\n"),
+                (Some(ToolOutputStream::Stderr), "err\n"),
+                (Some(ToolOutputStream::Stdout), "out 2\n"),
+            ]
+        );
+        assert!(
+            tool.output_chunks
+                .iter()
+                .map(|chunk| chunk.text.len())
+                .sum::<usize>()
+                <= MAX_TOOL_TRANSCRIPT_OUTPUT_BYTES
+        );
+    }
+
+    #[test]
     fn write_and_edit_previews_survive_tool_completion() {
         let cases = [
             (
@@ -1079,7 +1537,14 @@ mod tests {
                 panic!("expected tool entry");
             };
             assert_eq!(tool.summary, summary);
-            assert_eq!(tool.preview.as_deref(), Some(preview));
+            assert_eq!(
+                tool.preview
+                    .iter()
+                    .map(|line| line.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                preview
+            );
             assert_eq!(tool.output, "completed result");
             assert!(matches!(tool.status, ToolStatus::Finished(_)));
         }
@@ -1104,7 +1569,14 @@ mod tests {
         let TranscriptEntry::Tool(tool) = &state.transcript_entries()[0].entry else {
             panic!("expected tool entry");
         };
-        assert_eq!(tool.preview.as_deref(), Some("-old\n+new"));
+        assert_eq!(
+            tool.preview
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            "-old\n+new"
+        );
         assert!(tool.output.contains("matched 3 locations"));
         assert!(matches!(
             tool.status,
@@ -1124,7 +1596,12 @@ mod tests {
         let TranscriptEntry::Tool(tool) = &state.transcript_entries()[0].entry else {
             panic!("expected tool entry");
         };
-        let preview = tool.preview.as_deref().expect("fallback preview");
+        let preview = tool
+            .preview
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert_eq!(tool.summary, "write");
         assert!(preview.contains("[… text truncated …]"));
         assert!(preview.len() <= MAX_TOOL_PREVIEW_BYTES);
@@ -1155,6 +1632,18 @@ mod tests {
         assert!(tool.output_truncated);
         assert!(matches!(tool.status, ToolStatus::Finished(_)));
         assert!(tool.output.len() <= MAX_TOOL_TRANSCRIPT_OUTPUT_BYTES + TOOL_OUTPUT_MARKER.len());
+        assert!(
+            tool.output_chunks
+                .iter()
+                .map(|chunk| chunk.text.len())
+                .sum::<usize>()
+                <= MAX_TOOL_TRANSCRIPT_OUTPUT_BYTES
+        );
+        assert!(tool
+            .output_chunks
+            .iter()
+            .any(|chunk| chunk.text == TOOL_OUTPUT_MARKER
+                && chunk.kind == ToolOutputKind::Truncation));
     }
 
     struct ToolExecutionResultForTest;
@@ -1222,8 +1711,11 @@ mod tests {
         };
         assert_eq!(tool.call_id, "call-1");
         assert_eq!(tool.summary, "read note.txt");
-        assert_eq!(tool.preview, None);
+        assert_eq!(tool.summary_kind, ToolSummaryKind::Normal);
+        assert!(tool.preview.is_empty());
         assert_eq!(tool.output, "1 | note");
+        assert_eq!(tool.output_chunks[0].kind, ToolOutputKind::NumberedLines);
+        assert_eq!(tool.output_chunks[0].prefixes, [Some(4)]);
         assert!(matches!(tool.status, ToolStatus::Finished(_)));
     }
 
@@ -1307,6 +1799,129 @@ mod tests {
     }
 
     #[test]
+    fn queued_user_messages_transition_without_duplicate_transcript_entries() {
+        let mut state = AppState::new();
+        state.reduce(AgentEvent::TurnStarted);
+        state.insert_text("A");
+        assert_eq!(state.queue_input().as_deref(), Some("A"));
+        state.insert_text("B");
+        assert_eq!(state.queue_input().as_deref(), Some("B"));
+        assert_eq!(state.messages().len(), 2);
+        assert!(state
+            .messages()
+            .iter()
+            .all(|message| message.user_status == UserMessageStatus::Queued));
+
+        state.reduce(AgentEvent::SteeringMessageDelivered {
+            text: "A".to_owned(),
+        });
+        assert_eq!(state.messages().len(), 2);
+        assert_eq!(
+            state
+                .messages()
+                .iter()
+                .map(|message| message.user_status)
+                .collect::<Vec<_>>(),
+            [UserMessageStatus::Delivered, UserMessageStatus::Queued]
+        );
+
+        state.reduce(AgentEvent::SteeringMessagesRecovered {
+            messages: vec!["B".to_owned()],
+        });
+        assert_eq!(state.messages().len(), 2);
+        assert_eq!(
+            state.messages()[1].user_status,
+            UserMessageStatus::Recovered
+        );
+    }
+
+    #[test]
+    fn queued_and_recovered_entries_keep_append_only_storage_and_display_chronology() {
+        let mut state = AppState::new();
+        state.reduce(AgentEvent::TurnStarted);
+        state.insert_text("guidance");
+        state.queue_input().expect("queued input");
+        let queued_id = state.entries[0].id;
+        let epoch = state.transcript_epoch();
+
+        state.add_system_message("completed work");
+        assert_eq!(state.entries[0].id, queued_id);
+        assert_eq!(state.transcript_epoch(), epoch);
+        assert_eq!(
+            state
+                .transcript_display_entries()
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            [state.entries[1].id, queued_id]
+        );
+
+        state.reduce(AgentEvent::SteeringMessagesRecovered {
+            messages: vec!["guidance".to_owned()],
+        });
+        state.add_system_message("next turn");
+        assert_eq!(state.entries[0].id, queued_id);
+        assert_eq!(state.transcript_epoch(), epoch);
+        assert_eq!(
+            state
+                .transcript_display_entries()
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            [state.entries[1].id, queued_id, state.entries[2].id]
+        );
+        for index in 0..state.transcript_entry_positions.len() {
+            assert_eq!(
+                state.transcript_entry_positions[index],
+                state
+                    .transcript_entry_order
+                    .iter()
+                    .position(|&candidate| candidate == index)
+                    .expect("entry has a display position")
+            );
+        }
+    }
+
+    #[test]
+    fn finalized_streaming_entry_keeps_id_lookup_after_queued_append() {
+        let mut state = AppState::new();
+        state.reduce(AgentEvent::TurnStarted);
+        state.reduce(AgentEvent::AssistantMessageStarted);
+        state.reduce(AgentEvent::AssistantTextDelta {
+            index: None,
+            text: "working".to_owned(),
+        });
+        let streaming_id = state.streaming_assistant_state().unwrap().id;
+        state.insert_text("guidance");
+        state.queue_input().expect("queued input");
+        let queued_id = state.transcript_entries()[0].id;
+
+        state.reduce(AgentEvent::AssistantMessageFinished { items: Vec::new() });
+        assert_eq!(state.transcript_entries()[1].id, streaming_id);
+        assert_eq!(
+            state.transcript_entry(streaming_id).unwrap().id,
+            streaming_id
+        );
+        assert_eq!(state.transcript_display_position(streaming_id), Some(0));
+        assert_eq!(state.transcript_display_position(queued_id), Some(1));
+
+        state.reduce(AgentEvent::SteeringMessageDelivered {
+            text: "guidance".to_owned(),
+        });
+        assert_eq!(state.transcript_display_position(streaming_id), Some(0));
+        assert_eq!(state.transcript_display_position(queued_id), Some(1));
+        assert_eq!(
+            state
+                .transcript_entry(queued_id)
+                .and_then(|entry| match &entry.entry {
+                    TranscriptEntry::Message(message) => Some(message.user_status),
+                    TranscriptEntry::Tool(_) => None,
+                }),
+            Some(UserMessageStatus::Delivered)
+        );
+    }
+
+    #[test]
     fn context_usage_reducer_keeps_provider_and_estimated_signals() {
         let mut state = AppState::new();
         state.reduce(AgentEvent::ContextLimitsUpdated(
@@ -1347,12 +1962,24 @@ mod tests {
     }
 
     #[test]
-    fn compaction_busy_state_disables_editor_until_finished() {
+    fn editor_remains_usable_during_turns_and_compaction() {
         let mut state = AppState::new();
-        state.insert_text("/compact");
+        state.insert_text("abc");
+        state.reduce(AgentEvent::TurnStarted);
+        state.insert_text("d");
+        state.move_left();
+        state.backspace();
+        state.insert_newline();
+        state.delete();
+        assert_eq!(state.input(), "ab\n");
+        assert_eq!(state.take_input().as_deref(), Some("ab\n"));
+
+        state.reduce(AgentEvent::TurnFinished {
+            reason: StopReason::Stop,
+        });
         state.set_compaction_active(true);
-        assert!(state.is_busy());
-        assert_eq!(state.take_input(), None);
+        state.insert_text("during compaction");
+        assert_eq!(state.input(), "during compaction");
         state.reduce(AgentEvent::CompactionFinished {
             automatic: false,
             before_tokens: 142_000,
