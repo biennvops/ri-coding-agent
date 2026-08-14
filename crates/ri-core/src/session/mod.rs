@@ -2153,6 +2153,32 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_append_rejects_reusing_the_same_writer() {
+        let root = test_dir("ambiguous-append-reuse");
+        fs::create_dir_all(&root).unwrap();
+        let repository = SessionRepository::new(root.join("sessions"), &root, &root).unwrap();
+        let handle = repository.create().unwrap();
+        handle
+            .append_message(&ModelMessage::user("initial request"))
+            .unwrap();
+        let path = handle.info().unwrap().path;
+        handle.fail_next_message_append_ambiguously().unwrap();
+        assert!(matches!(
+            handle.append_message(&ModelMessage::user("ambiguous message")),
+            Err(SessionError::AppendRollback { .. })
+        ));
+        let uncertain_file = fs::read(&path).unwrap();
+
+        assert!(handle
+            .append_message(&ModelMessage::user("later request"))
+            .is_err());
+        assert_eq!(fs::read(&path).unwrap(), uncertain_file);
+
+        drop(handle);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn failed_sync_rolls_back_the_record_before_reporting_not_persisted() {
         let root = test_dir("append-rollback");
         fs::create_dir_all(&root).unwrap();
