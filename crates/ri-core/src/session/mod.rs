@@ -554,6 +554,16 @@ impl SessionHandle {
             .append_message(message)
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_next_message_append_ambiguously(&self) -> Result<(), SessionError> {
+        let mut writer = self
+            .inner
+            .lock()
+            .map_err(|_| SessionError::WriterPoisoned)?;
+        writer.fail_next_message_append_ambiguously = true;
+        Ok(())
+    }
+
     pub fn append_compaction(
         &self,
         summary: &str,
@@ -662,6 +672,8 @@ struct SessionWriter {
     head: Option<MessageId>,
     active_messages: Vec<(MessageId, ModelMessage)>,
     transcript: Vec<ModelMessage>,
+    #[cfg(test)]
+    fail_next_message_append_ambiguously: bool,
 }
 
 impl SessionWriter {
@@ -708,6 +720,8 @@ impl SessionWriter {
                 head: None,
                 active_messages: Vec::new(),
                 transcript: Vec::new(),
+                #[cfg(test)]
+                fail_next_message_append_ambiguously: false,
             })),
         })
     }
@@ -780,6 +794,8 @@ impl SessionWriter {
             head: snapshot.last_message_id.clone(),
             active_messages,
             transcript: snapshot.transcript.clone(),
+            #[cfg(test)]
+            fail_next_message_append_ambiguously: false,
         };
         let handle = SessionHandle {
             inner: Arc::new(Mutex::new(writer)),
@@ -799,11 +815,22 @@ impl SessionWriter {
             timestamp: timestamp.clone(),
             message: message.clone(),
         };
-        append_record(
-            self.file.as_mut().expect("materialized session"),
-            &record,
-            &self.info.path,
-        )?;
+        #[cfg(test)]
+        let fail_ambiguously = std::mem::take(&mut self.fail_next_message_append_ambiguously);
+        let file = self.file.as_mut().expect("materialized session");
+        #[cfg(test)]
+        let append_result = if fail_ambiguously {
+            append_record(
+                &mut AmbiguousAppendFile { inner: file },
+                &record,
+                &self.info.path,
+            )
+        } else {
+            append_record(file, &record, &self.info.path)
+        };
+        #[cfg(not(test))]
+        let append_result = append_record(file, &record, &self.info.path);
+        append_result?;
         self.head = Some(id.clone());
         self.active_messages
             .push((id, message.clone().into_model()));
@@ -1624,7 +1651,46 @@ fn read_bounded_line<R: Read>(
     }
 }
 
-fn append_record(file: &mut File, record: &SessionRecord, path: &Path) -> Result<(), SessionError> {
+trait SessionRecordFile: Write {
+    fn sync_data(&mut self) -> io::Result<()>;
+}
+
+impl SessionRecordFile for File {
+    fn sync_data(&mut self) -> io::Result<()> {
+        File::sync_data(self)
+    }
+}
+
+#[cfg(test)]
+struct AmbiguousAppendFile<'a> {
+    inner: &'a mut File,
+}
+
+#[cfg(test)]
+impl Write for AmbiguousAppendFile<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.inner.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+#[cfg(test)]
+impl SessionRecordFile for AmbiguousAppendFile<'_> {
+    fn sync_data(&mut self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "injected session sync failure",
+        ))
+    }
+}
+
+fn append_record<F>(file: &mut F, record: &SessionRecord, path: &Path) -> Result<(), SessionError>
+where
+    F: SessionRecordFile + ?Sized,
+{
     let bytes = serde_json::to_vec(record).map_err(|error| SessionError::InvalidRecord {
         path: path.to_path_buf(),
         message: error.to_string(),
