@@ -185,11 +185,16 @@ impl AgentRuntimeConfig {
     }
 }
 
+struct SteeringDelivery {
+    text: String,
+    committed: bool,
+}
+
 #[derive(Default)]
 struct SteeringState {
     messages: VecDeque<String>,
     reserved: Option<String>,
-    delivering: bool,
+    delivering: Option<SteeringDelivery>,
     cancel_pending: bool,
     sealed: bool,
 }
@@ -214,7 +219,10 @@ impl SteeringState {
 
     fn begin_delivery(&mut self) -> Option<String> {
         let text = self.reserved.take()?;
-        self.delivering = true;
+        self.delivering = Some(SteeringDelivery {
+            text: text.clone(),
+            committed: false,
+        });
         Some(text)
     }
 
@@ -226,15 +234,21 @@ impl SteeringState {
         if let Some(text) = self.reserved.take() {
             self.messages.push_front(text);
             cancel.cancel();
-        } else if self.delivering {
+        } else if self.delivering.is_some() {
             self.cancel_pending = true;
         } else {
             cancel.cancel();
         }
     }
 
+    fn mark_delivery_committed(&mut self) {
+        if let Some(delivery) = self.delivering.as_mut() {
+            delivery.committed = true;
+        }
+    }
+
     fn finish_delivery(&mut self, cancel: &CancellationToken) {
-        self.delivering = false;
+        self.delivering = None;
         if self.cancel_pending {
             self.cancel_pending = false;
             cancel.cancel();
@@ -242,13 +256,22 @@ impl SteeringState {
     }
 
     fn abort_delivery(&mut self, cancel: &CancellationToken) {
-        self.delivering = false;
+        if let Some(delivery) = self.delivering.take() {
+            if !delivery.committed {
+                self.messages.push_front(delivery.text);
+            }
+        }
         self.cancel_pending = false;
         cancel.cancel();
     }
 
     fn seal_and_drain(&mut self) -> Vec<String> {
         self.sealed = true;
+        if let Some(delivery) = self.delivering.take() {
+            if !delivery.committed {
+                self.messages.push_front(delivery.text);
+            }
+        }
         if let Some(text) = self.reserved.take() {
             self.messages.push_front(text);
         }
@@ -765,7 +788,7 @@ where
 {
     let user_message = ModelMessage::user(text);
     if let Err(error) = commit_message(&mut history, &config.session, user_message, &events).await {
-        fail_turn(&events, error).await;
+        fail_turn(&events, error.message).await;
         return turn_outcome(history, StopReason::Error);
     }
     if events.send(AgentEvent::TurnStarted).await.is_err() {
@@ -937,7 +960,7 @@ where
         if let Err(error) =
             commit_message(&mut history, &config.session, assistant_message, &events).await
         {
-            fail_turn(&events, error).await;
+            fail_turn(&events, error.message).await;
             return turn_outcome(history, StopReason::Error);
         }
         if events
@@ -1024,7 +1047,7 @@ where
                 })
                 .await;
             if let Err(error) = persistence_error {
-                fail_turn(&events, error).await;
+                fail_turn(&events, error.message).await;
                 return turn_outcome(history, StopReason::Error);
             }
 
@@ -1482,15 +1505,23 @@ where
                 .begin_delivery()
                 .expect("pending steering has a reserved message")
         };
-        if let Err(message) =
-            commit_message(history, session, ModelMessage::user(text.clone()), events).await
-        {
-            steering
+        let commit_result =
+            commit_message(history, session, ModelMessage::user(text.clone()), events).await;
+        if let Err(error) = commit_result {
+            let CommitMessageError { message, persisted } = error;
+            let mut state = steering
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .abort_delivery(&cancel);
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if persisted {
+                state.mark_delivery_committed();
+            }
+            state.abort_delivery(&cancel);
             return Err(ProviderError::Failed { message });
         }
+        steering
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .mark_delivery_committed();
         request.messages.push(ModelMessage::user(text.clone()));
         if events
             .send(AgentEvent::SteeringMessageDelivered { text })
@@ -1754,21 +1785,32 @@ fn tool_error_result(error: ToolError, cancelled: bool) -> ToolExecutionResult {
     }
 }
 
+struct CommitMessageError {
+    message: String,
+    persisted: bool,
+}
+
 async fn commit_message(
     history: &mut ConversationHistory,
     session: &SessionMode,
     message: ModelMessage,
     events: &mpsc::Sender<AgentEvent>,
-) -> Result<(), String> {
+) -> Result<(), CommitMessageError> {
     let info = session
         .append_message(&message)
-        .map_err(|error| format!("session persistence failed: {error}"))?;
+        .map_err(|error| CommitMessageError {
+            message: format!("session persistence failed: {error}"),
+            persisted: false,
+        })?;
     history.push(message);
     if let Some(info) = info {
         events
             .send(AgentEvent::SessionChanged { info })
             .await
-            .map_err(|_| "agent event stream closed".to_owned())?;
+            .map_err(|_| CommitMessageError {
+                message: "agent event stream closed".to_owned(),
+                persisted: true,
+            })?;
     }
     Ok(())
 }
@@ -1804,7 +1846,9 @@ async fn append_synthetic_results(
             tool_name: name.clone(),
             content: result.model_content.clone(),
         };
-        commit_message(history, session, tool_message, events).await?;
+        commit_message(history, session, tool_message, events)
+            .await
+            .map_err(|error| error.message)?;
         events
             .send(AgentEvent::ToolExecutionFinished {
                 call_id,
