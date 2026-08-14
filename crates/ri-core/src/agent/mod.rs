@@ -4143,16 +4143,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manual_compaction_compacts_a_single_completed_turn() {
-        let initial_history = vec![
-            ModelMessage::user("only request ".repeat(100)),
-            ModelMessage::Assistant {
-                items: vec![ModelAssistantItem::Text {
-                    content: "only answer ".repeat(100),
-                }],
-            },
-        ];
-        let provider = ScriptedProvider::new(vec![final_step("single turn summary")]);
+    async fn manual_compaction_recovers_a_single_turn_after_context_overflow() {
+        let user_text = "only request ".repeat(100);
+        let user_message = ModelMessage::user(user_text.clone());
+        let provider =
+            ScriptedProvider::new(vec![final_step("single turn summary")]).with_overflow_once();
         let requests = Arc::clone(&provider.requests);
         let (command_tx, command_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(128);
@@ -4161,12 +4156,24 @@ mod tests {
             AgentRuntimeConfig {
                 tool_context: ToolContext::from_current_dir().unwrap(),
                 base_messages: Vec::new(),
-                initial_history: initial_history.clone(),
+                initial_history: Vec::new(),
                 session: SessionMode::Disabled,
                 reasoning_effort: None,
             },
         );
         let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+
+        command_tx
+            .send(AgentCommand::Submit { text: user_text })
+            .await
+            .unwrap();
+        let failed_turn = collect_turn(&mut event_rx).await;
+        assert!(failed_turn.iter().any(|event| matches!(
+            event,
+            AgentEvent::TurnFinished {
+                reason: StopReason::Error
+            }
+        )));
 
         command_tx.send(AgentCommand::Compact).await.unwrap();
         wait_for_compaction_finished(&mut event_rx).await;
@@ -4174,15 +4181,13 @@ mod tests {
         runtime_task.await.unwrap();
 
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0]
+        assert_eq!(requests.len(), 2);
+        assert!(!requests[0].tools.is_empty());
+        assert!(requests[1].tools.is_empty());
+        assert!(requests[1]
             .messages
             .iter()
-            .any(|message| message == &initial_history[0]));
-        assert!(requests[0]
-            .messages
-            .iter()
-            .any(|message| message == &initial_history[1]));
+            .any(|message| message == &user_message));
     }
 
     #[tokio::test]
