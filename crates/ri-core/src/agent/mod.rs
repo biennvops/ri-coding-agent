@@ -2886,6 +2886,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn steering_session_write_failure_recovers_the_queued_message() {
+        let root = unique_test_dir("agent-steering-session-failure");
+        std::fs::create_dir_all(&root).unwrap();
+        let repository =
+            crate::session::SessionRepository::new(root.join("sessions"), &root, &root).unwrap();
+        let handle = repository.create().unwrap();
+        let path = handle.info().unwrap().path.clone();
+        let steering_text = "x".repeat(crate::session::MAX_SESSION_RECORD_BYTES);
+        let provider = Arc::new(ScriptedProvider::new(vec![final_step("initial answer")]));
+        let requests = Arc::clone(&provider.requests);
+        let steering = Arc::new(Mutex::new(SteeringState::default()));
+        steering.lock().unwrap().accept(steering_text.clone());
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let outcome = run_turn(
+            provider,
+            Arc::new(ToolRegistry::new()),
+            AgentRuntimeConfig {
+                tool_context: ToolContext::new(&root).unwrap(),
+                base_messages: Vec::new(),
+                initial_history: Vec::new(),
+                session: SessionMode::Enabled(handle.clone()),
+                reasoning_effort: None,
+            },
+            ConversationHistory::default(),
+            "initial request".to_owned(),
+            event_tx.clone(),
+            CancellationToken::new(),
+            false,
+            Arc::clone(&steering),
+            None,
+            None,
+        )
+        .await;
+        recover_pending_steering(&Some(steering), &event_tx).await;
+        drop(event_tx);
+        let mut events = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            events.push(event);
+        }
+
+        assert_eq!(outcome.reason, StopReason::Error);
+        assert!(events.iter().any(|event| {
+            matches!(event, AgentEvent::Error(error) if error.message.contains("session persistence failed"))
+        }));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::SteeringMessageDelivered { .. })));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::SteeringMessagesRecovered { messages }
+                    if messages.len() == 1 && messages[0] == steering_text
+            )
+        }));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert!(!outcome.history.messages().iter().any(|message| {
+            matches!(message, ModelMessage::User { content } if content == &steering_text)
+        }));
+        assert!(!crate::session::read_session(&path)
+            .unwrap()
+            .history
+            .iter()
+            .any(|message| {
+                matches!(message, ModelMessage::User { content } if content == &steering_text)
+            }));
+
+        drop(handle);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn cancelled_persisted_turn_keeps_the_valid_user_history() {
         let root = unique_test_dir("agent-session-cancel");
         std::fs::create_dir_all(&root).unwrap();
