@@ -4137,6 +4137,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_compaction_compacts_a_single_completed_turn() {
+        let initial_history = vec![
+            ModelMessage::user("only request ".repeat(100)),
+            ModelMessage::Assistant {
+                items: vec![ModelAssistantItem::Text {
+                    content: "only answer ".repeat(100),
+                }],
+            },
+        ];
+        let provider = ScriptedProvider::new(vec![final_step("single turn summary")]);
+        let requests = Arc::clone(&provider.requests);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let runtime = AgentRuntime::with_config(
+            provider,
+            AgentRuntimeConfig {
+                tool_context: ToolContext::from_current_dir().unwrap(),
+                base_messages: Vec::new(),
+                initial_history: initial_history.clone(),
+                session: SessionMode::Disabled,
+                reasoning_effort: None,
+            },
+        );
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+
+        command_tx.send(AgentCommand::Compact).await.unwrap();
+        wait_for_compaction_finished(&mut event_rx).await;
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0]
+            .messages
+            .iter()
+            .any(|message| message == &initial_history[0]));
+        assert!(requests[0]
+            .messages
+            .iter()
+            .any(|message| message == &initial_history[1]));
+    }
+
+    #[tokio::test]
+    async fn resumed_single_turn_session_can_be_compacted_manually() {
+        let root = unique_test_dir("agent-resumed-single-turn-compaction");
+        std::fs::create_dir_all(&root).unwrap();
+        let repository =
+            crate::session::SessionRepository::new(root.join("sessions"), &root, &root).unwrap();
+        let handle = repository.create().unwrap();
+        let initial_history = vec![
+            ModelMessage::user("inspect the result ".repeat(100)),
+            ModelMessage::Assistant {
+                items: vec![ModelAssistantItem::ToolCall(tool_call(
+                    "read-call",
+                    "read",
+                    "{}",
+                ))],
+            },
+            ModelMessage::ToolResult {
+                tool_call_id: "read-call".to_owned(),
+                tool_name: "read".to_owned(),
+                content: "large result ".repeat(100),
+            },
+            ModelMessage::Assistant {
+                items: vec![ModelAssistantItem::Text {
+                    content: "completed answer ".repeat(100),
+                }],
+            },
+        ];
+        for message in &initial_history {
+            handle.append_message(message).unwrap();
+        }
+        let path = handle.info().unwrap().path;
+        drop(handle);
+
+        let opened = repository.open_path(&path).unwrap();
+        let handle = opened.handle;
+        let provider = ScriptedProvider::new(vec![final_step("resumed turn summary")]);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let runtime = AgentRuntime::with_config(
+            provider,
+            AgentRuntimeConfig {
+                tool_context: ToolContext::new(&root).unwrap(),
+                base_messages: Vec::new(),
+                initial_history: opened.history,
+                session: SessionMode::Enabled(handle.clone()),
+                reasoning_effort: None,
+            },
+        );
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+
+        command_tx.send(AgentCommand::Compact).await.unwrap();
+        wait_for_compaction_finished(&mut event_rx).await;
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+        drop(handle);
+
+        let snapshot = crate::session::read_session(&path).unwrap();
+        assert_eq!(snapshot.transcript, initial_history);
+        assert_eq!(
+            snapshot.active_summary,
+            Some(CompactionSummary::new("resumed turn summary"))
+        );
+        assert_eq!(snapshot.history.len(), 1);
+        assert!(matches!(
+            &snapshot.history[0],
+            ModelMessage::Developer { content } if content.contains("resumed turn summary")
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn repeated_compaction_replaces_summary_after_reincluding_previous_state() {
         let initial_history = vec![
             ModelMessage::user("first ".repeat(100)),
@@ -4539,11 +4652,12 @@ mod tests {
 
     async fn wait_for_compaction_finished(event_rx: &mut mpsc::Receiver<AgentEvent>) {
         loop {
-            if matches!(
-                event_rx.recv().await.expect("compaction event"),
-                AgentEvent::CompactionFinished { .. }
-            ) {
-                return;
+            match event_rx.recv().await.expect("compaction event") {
+                AgentEvent::CompactionFinished { .. } => return,
+                AgentEvent::CompactionFailed { message } => {
+                    panic!("compaction failed unexpectedly: {message}")
+                }
+                _ => {}
             }
         }
     }
