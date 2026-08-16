@@ -1181,12 +1181,15 @@ where
     let target = input_budget(limits)
         .map(compaction_target)
         .unwrap_or_else(|| before_tokens.saturating_div(2).max(1));
+    // Manual compaction runs only while idle, so its latest segment is complete.
+    let compact_latest = !automatic;
     let Some((prefix, retained)) = select_compaction_prefix(
         &history,
         &config.base_messages,
         &tools,
         target,
         force,
+        compact_latest,
         provisional_message,
     ) else {
         if !automatic {
@@ -1217,28 +1220,17 @@ where
         ));
     }
 
-    let mut summary_messages = vec![ModelMessage::System {
-        content: COMPACTION_SYSTEM_INSTRUCTION.to_owned(),
-    }];
-    if let Some(summary) = history.summary() {
-        summary_messages.push(summary.as_message());
-    }
-    summary_messages.extend(prefix);
-    let output_limit = limits
-        .max_output_tokens
-        .map(|limit| limit.min(COMPACTION_MAX_OUTPUT_TOKENS))
-        .unwrap_or(COMPACTION_MAX_OUTPUT_TOKENS)
-        .max(1);
-    let request = ModelRequest {
-        messages: summary_messages,
-        tools: Vec::new(),
-        max_tokens: Some(output_limit),
-        reasoning_effort: None,
-        sampling_params: Default::default(),
-    };
-    let response = match stream_private_model(provider, request, cancel.clone()).await {
-        Ok(response) => response,
-        Err(ProviderError::Cancelled) => {
+    let summary = match summarize_compaction_prefix(
+        provider,
+        history.summary().cloned(),
+        prefix,
+        limits,
+        cancel.clone(),
+    )
+    .await
+    {
+        Ok(summary) => summary,
+        Err(CompactionError::Cancelled) => {
             let _ = events
                 .send(AgentEvent::CompactionFailed {
                     message: "compaction cancelled".to_owned(),
@@ -1246,8 +1238,7 @@ where
                 .await;
             return Err(CompactionError::Cancelled);
         }
-        Err(error) => {
-            let message = format!("compaction failed: {error}");
+        Err(CompactionError::Failed(message)) => {
             let _ = events
                 .send(AgentEvent::CompactionFailed {
                     message: message.clone(),
@@ -1255,6 +1246,7 @@ where
                 .await;
             return Err(CompactionError::Failed(message));
         }
+        Err(CompactionError::NoHistory) => unreachable!("compaction prefix is not empty"),
     };
     if cancel.is_cancelled() {
         let _ = events
@@ -1264,17 +1256,6 @@ where
             .await;
         return Err(CompactionError::Cancelled);
     }
-    let summary = match extract_summary(&response) {
-        Ok(summary) => CompactionSummary::new(summary),
-        Err(message) => {
-            let _ = events
-                .send(AgentEvent::CompactionFailed {
-                    message: message.clone(),
-                })
-                .await;
-            return Err(CompactionError::Failed(message));
-        }
-    };
     let compacted = ConversationHistory::new(Some(summary.clone()), retained.clone());
     let after_tokens = estimator.estimate_request(&request_with_provisional_message(
         normal_request(&config.base_messages, &compacted, &tools),
@@ -1324,12 +1305,144 @@ where
     Ok(compacted)
 }
 
+async fn summarize_compaction_prefix<P>(
+    provider: Arc<P>,
+    mut summary: Option<CompactionSummary>,
+    prefix: Vec<ModelMessage>,
+    limits: ModelLimits,
+    cancel: CancellationToken,
+) -> Result<CompactionSummary, CompactionError>
+where
+    P: ModelProvider,
+{
+    let output_limit = limits
+        .max_output_tokens
+        .map(|limit| limit.min(COMPACTION_MAX_OUTPUT_TOKENS))
+        .unwrap_or(COMPACTION_MAX_OUTPUT_TOKENS)
+        .max(1);
+    let budget = input_budget(limits);
+    let mut units = compaction_units(prefix);
+
+    while !units.is_empty() {
+        if cancel.is_cancelled() {
+            return Err(CompactionError::Cancelled);
+        }
+        let messages = take_compaction_chunk(&mut units, summary.as_ref(), budget)?;
+        let request = compaction_request(summary.as_ref(), messages, output_limit);
+        let response =
+            match stream_private_model(Arc::clone(&provider), request, cancel.clone()).await {
+                Ok(response) => response,
+                Err(ProviderError::Cancelled) => return Err(CompactionError::Cancelled),
+                Err(error) => {
+                    return Err(CompactionError::Failed(format!(
+                        "compaction failed: {error}"
+                    )))
+                }
+            };
+        if cancel.is_cancelled() {
+            return Err(CompactionError::Cancelled);
+        }
+        summary = Some(CompactionSummary::new(
+            extract_summary(&response).map_err(CompactionError::Failed)?,
+        ));
+    }
+
+    summary.ok_or_else(|| CompactionError::Failed("compaction selected no history".to_owned()))
+}
+
+fn compaction_request(
+    summary: Option<&CompactionSummary>,
+    messages: Vec<ModelMessage>,
+    output_limit: u64,
+) -> ModelRequest {
+    let mut summary_messages = Vec::with_capacity(messages.len() + 2);
+    summary_messages.push(ModelMessage::System {
+        content: COMPACTION_SYSTEM_INSTRUCTION.to_owned(),
+    });
+    if let Some(summary) = summary {
+        summary_messages.push(summary.as_message());
+    }
+    summary_messages.extend(messages);
+    ModelRequest {
+        messages: summary_messages,
+        tools: Vec::new(),
+        max_tokens: Some(output_limit),
+        reasoning_effort: None,
+        sampling_params: Default::default(),
+    }
+}
+
+fn compaction_units(messages: Vec<ModelMessage>) -> VecDeque<Vec<ModelMessage>> {
+    let mut units = VecDeque::new();
+    let mut current = Vec::new();
+    let mut pending_tool_results = 0usize;
+
+    for message in messages {
+        match &message {
+            ModelMessage::Assistant { items } => {
+                debug_assert_eq!(pending_tool_results, 0);
+                pending_tool_results += items
+                    .iter()
+                    .filter(|item| matches!(item, ModelAssistantItem::ToolCall(_)))
+                    .count();
+            }
+            ModelMessage::ToolResult { .. } => {
+                debug_assert!(pending_tool_results > 0);
+                pending_tool_results = pending_tool_results.saturating_sub(1);
+            }
+            ModelMessage::System { .. }
+            | ModelMessage::Developer { .. }
+            | ModelMessage::User { .. } => {}
+        }
+        current.push(message);
+        if pending_tool_results == 0 {
+            units.push_back(std::mem::take(&mut current));
+        }
+    }
+
+    debug_assert!(current.is_empty());
+    if !current.is_empty() {
+        units.push_back(current);
+    }
+    units
+}
+
+fn take_compaction_chunk(
+    units: &mut VecDeque<Vec<ModelMessage>>,
+    summary: Option<&CompactionSummary>,
+    budget: Option<u64>,
+) -> Result<Vec<ModelMessage>, CompactionError> {
+    let Some(budget) = budget else {
+        return Ok(units.drain(..).flatten().collect());
+    };
+
+    let estimator = ConservativeTokenEstimator;
+    let mut estimated_tokens =
+        estimator.estimate_request(&compaction_request(summary, Vec::new(), 1));
+    let mut messages = Vec::new();
+    while let Some(unit) = units.front() {
+        let next_tokens = estimated_tokens.saturating_add(estimator.estimate_messages(unit));
+        if next_tokens > budget {
+            if messages.is_empty() {
+                return Err(CompactionError::Failed(format!(
+                    "compaction failed: the smallest safe history chunk is estimated at {next_tokens} input tokens, exceeding the model budget of {budget}"
+                )));
+            }
+            break;
+        }
+        estimated_tokens = next_tokens;
+        messages.extend(units.pop_front().expect("front unit exists"));
+    }
+    Ok(messages)
+}
+
 fn select_compaction_prefix(
     history: &ConversationHistory,
     base_messages: &[ModelMessage],
     tools: &[crate::model::ToolDefinition],
     target: u64,
     force: bool,
+    compact_latest: bool,
     provisional_message: Option<&ModelMessage>,
 ) -> Option<(Vec<ModelMessage>, Vec<ModelMessage>)> {
     let segments = segment_history(history.messages());
@@ -1342,7 +1455,9 @@ fn select_compaction_prefix(
         .filter_map(|(index, segment)| segment.has_user_message.then_some(index))
         .collect();
     let current_segment = user_segments.last().copied().unwrap_or(segments.len() - 1);
-    let eligible_end = if force {
+    let eligible_end = if compact_latest {
+        segments.len()
+    } else if force {
         current_segment
     } else if user_segments.len() > 2 {
         user_segments[user_segments.len() - 2].min(current_segment)
@@ -3827,7 +3942,7 @@ mod tests {
             ],
         );
         let current_turn = history.messages()[4..].to_vec();
-        let (prefix, retained) = select_compaction_prefix(&history, &[], &[], 1, true, None)
+        let (prefix, retained) = select_compaction_prefix(&history, &[], &[], 1, true, false, None)
             .expect("a completed prior turn should be compactable");
 
         assert!(prefix.iter().all(|message| !current_turn.contains(message)));
@@ -4137,6 +4252,160 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_compaction_chunks_a_single_oversized_completed_turn() {
+        let limits = ModelLimits {
+            context_window: Some(600),
+            max_output_tokens: Some(100),
+        };
+        let budget = input_budget(limits).unwrap();
+        let mut initial_history = vec![ModelMessage::user("inspect all generated files")];
+        for index in 0..8 {
+            let call_id = format!("read-{index}");
+            initial_history.push(ModelMessage::Assistant {
+                items: vec![ModelAssistantItem::ToolCall(tool_call(
+                    &call_id, "read", "{}",
+                ))],
+            });
+            initial_history.push(ModelMessage::ToolResult {
+                tool_call_id: call_id,
+                tool_name: "read".to_owned(),
+                content: format!("generated file {index}: {}", "x".repeat(300)),
+            });
+        }
+        initial_history.push(ModelMessage::Assistant {
+            items: vec![ModelAssistantItem::Text {
+                content: "inspection complete".to_owned(),
+            }],
+        });
+        assert_eq!(segment_history(&initial_history).len(), 1);
+        assert!(ConservativeTokenEstimator.estimate_messages(&initial_history) > budget);
+
+        let steps = (0..initial_history.len())
+            .map(|index| final_step(&format!("summary through chunk {index}")))
+            .collect();
+        let provider = ScriptedProvider::new(steps)
+            .with_limits(limits)
+            .with_enforced_input_budget();
+        let requests = Arc::clone(&provider.requests);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let runtime = AgentRuntime::with_config(
+            provider,
+            AgentRuntimeConfig {
+                tool_context: ToolContext::from_current_dir().unwrap(),
+                base_messages: Vec::new(),
+                initial_history: initial_history.clone(),
+                session: SessionMode::Disabled,
+                reasoning_effort: None,
+            },
+        );
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+
+        command_tx.send(AgentCommand::Compact).await.unwrap();
+        wait_for_compaction_finished(&mut event_rx).await;
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert!(requests.len() > 1);
+        assert!(requests.iter().all(|request| request.tools.is_empty()));
+        assert!(requests
+            .iter()
+            .all(|request| { ConservativeTokenEstimator.estimate_request(request) <= budget }));
+        assert!(requests.iter().skip(1).all(|request| request
+            .messages
+            .iter()
+            .any(|message| matches!(message, ModelMessage::Developer { .. }))));
+        assert!(requests
+            .iter()
+            .all(|request| segment_history(&request.messages)
+                .iter()
+                .all(|segment| segment.safe_to_compact)));
+        let summarized_history: Vec<ModelMessage> = requests
+            .iter()
+            .flat_map(|request| request.messages.iter())
+            .filter(|message| {
+                !matches!(
+                    message,
+                    ModelMessage::System { .. } | ModelMessage::Developer { .. }
+                )
+            })
+            .cloned()
+            .collect();
+        assert_eq!(summarized_history, initial_history);
+    }
+
+    #[tokio::test]
+    async fn resumed_single_turn_session_can_be_compacted_manually() {
+        let root = unique_test_dir("agent-resumed-single-turn-compaction");
+        std::fs::create_dir_all(&root).unwrap();
+        let repository =
+            crate::session::SessionRepository::new(root.join("sessions"), &root, &root).unwrap();
+        let handle = repository.create().unwrap();
+        let initial_history = vec![
+            ModelMessage::user("inspect the result ".repeat(100)),
+            ModelMessage::Assistant {
+                items: vec![ModelAssistantItem::ToolCall(tool_call(
+                    "read-call",
+                    "read",
+                    "{}",
+                ))],
+            },
+            ModelMessage::ToolResult {
+                tool_call_id: "read-call".to_owned(),
+                tool_name: "read".to_owned(),
+                content: "large result ".repeat(100),
+            },
+            ModelMessage::Assistant {
+                items: vec![ModelAssistantItem::Text {
+                    content: "completed answer ".repeat(100),
+                }],
+            },
+        ];
+        for message in &initial_history {
+            handle.append_message(message).unwrap();
+        }
+        let path = handle.info().unwrap().path;
+        drop(handle);
+
+        let opened = repository.open_path(&path).unwrap();
+        let handle = opened.handle;
+        let provider = ScriptedProvider::new(vec![final_step("resumed turn summary")]);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let runtime = AgentRuntime::with_config(
+            provider,
+            AgentRuntimeConfig {
+                tool_context: ToolContext::new(&root).unwrap(),
+                base_messages: Vec::new(),
+                initial_history: opened.history,
+                session: SessionMode::Enabled(handle.clone()),
+                reasoning_effort: None,
+            },
+        );
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+
+        command_tx.send(AgentCommand::Compact).await.unwrap();
+        wait_for_compaction_finished(&mut event_rx).await;
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+        drop(handle);
+
+        let snapshot = crate::session::read_session(&path).unwrap();
+        assert_eq!(snapshot.transcript, initial_history);
+        assert_eq!(
+            snapshot.active_summary,
+            Some(CompactionSummary::new("resumed turn summary"))
+        );
+        assert_eq!(snapshot.history.len(), 1);
+        assert!(matches!(
+            &snapshot.history[0],
+            ModelMessage::Developer { content } if content.contains("resumed turn summary")
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn repeated_compaction_replaces_summary_after_reincluding_previous_state() {
         let initial_history = vec![
             ModelMessage::user("first ".repeat(100)),
@@ -4221,10 +4490,10 @@ mod tests {
     #[tokio::test]
     async fn emergency_compaction_recovers_after_a_large_current_turn_tool_result() {
         let initial_history = vec![
-            ModelMessage::user("previous request ".repeat(100)),
+            ModelMessage::user("previous request ".repeat(30)),
             ModelMessage::Assistant {
                 items: vec![ModelAssistantItem::Text {
-                    content: "previous answer ".repeat(100),
+                    content: "previous answer ".repeat(30),
                 }],
             },
         ];
@@ -4416,6 +4685,7 @@ mod tests {
         delay: Duration,
         overflow_once: Arc<Mutex<bool>>,
         overflow_after_tool_result_once: Arc<Mutex<bool>>,
+        enforce_input_budget: bool,
     }
 
     struct ScriptedStep {
@@ -4432,6 +4702,7 @@ mod tests {
                 delay: Duration::ZERO,
                 overflow_once: Arc::new(Mutex::new(false)),
                 overflow_after_tool_result_once: Arc::new(Mutex::new(false)),
+                enforce_input_budget: false,
             }
         }
 
@@ -4454,6 +4725,11 @@ mod tests {
             *self.overflow_after_tool_result_once.lock().unwrap() = true;
             self
         }
+
+        fn with_enforced_input_budget(mut self) -> Self {
+            self.enforce_input_budget = true;
+            self
+        }
     }
 
     #[async_trait::async_trait]
@@ -4473,6 +4749,7 @@ mod tests {
                 .messages
                 .iter()
                 .any(|message| matches!(message, ModelMessage::ToolResult { .. }));
+            let estimated_input = ConservativeTokenEstimator.estimate_request(&request);
             self.requests.lock().unwrap().push(request);
             if !self.delay.is_zero() {
                 tokio::select! {
@@ -4480,7 +4757,9 @@ mod tests {
                     _ = tokio::time::sleep(self.delay) => {}
                 }
             }
-            let overflow = (has_tools && *self.overflow_once.lock().unwrap())
+            let overflow = (self.enforce_input_budget
+                && input_budget(self.limits).is_some_and(|budget| estimated_input > budget))
+                || (has_tools && *self.overflow_once.lock().unwrap())
                 || (has_tool_result && *self.overflow_after_tool_result_once.lock().unwrap());
             if overflow {
                 if has_tools && *self.overflow_once.lock().unwrap() {
@@ -4539,11 +4818,12 @@ mod tests {
 
     async fn wait_for_compaction_finished(event_rx: &mut mpsc::Receiver<AgentEvent>) {
         loop {
-            if matches!(
-                event_rx.recv().await.expect("compaction event"),
-                AgentEvent::CompactionFinished { .. }
-            ) {
-                return;
+            match event_rx.recv().await.expect("compaction event") {
+                AgentEvent::CompactionFinished { .. } => return,
+                AgentEvent::CompactionFailed { message } => {
+                    panic!("compaction failed unexpectedly: {message}")
+                }
+                _ => {}
             }
         }
     }
