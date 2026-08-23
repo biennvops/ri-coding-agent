@@ -454,7 +454,8 @@ impl AppSetup {
         persist_recent_model(path, &self.workspace_id, model).map_err(|error| error.to_string())
     }
 
-    fn remember_thinking(&self, level: ri_core::ThinkingLevel) -> Result<(), String> {
+    fn remember_thinking(&mut self, level: ri_core::ThinkingLevel) -> Result<(), String> {
+        self.recent_thinking_level = Some(level);
         let Some(path) = self.state_path.as_ref() else {
             return Ok(());
         };
@@ -2019,6 +2020,78 @@ mod tests {
             select_thinking_level(None, None, None, None),
             (None, UnsupportedThinkingPolicy::Reject)
         );
+    }
+
+    #[test]
+    fn changed_thinking_level_is_retained_when_resuming_session_without_one() {
+        use ri_core::ThinkingLevel::{High, Medium};
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ri-thinking-resume-{unique}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let repository = SessionRepository::new(root.join("sessions"), &root, &root).unwrap();
+        let session = repository.create().unwrap();
+        session
+            .append_message(&ModelMessage::user("older request"))
+            .unwrap();
+        let path = session.info().unwrap().path;
+        drop(session);
+
+        let opened = repository.open_path(path).unwrap();
+        assert_eq!(opened.info.thinking_level, None);
+
+        let catalog = ModelCatalog::from_json(
+            "models.json",
+            r#"{
+                "providers": {
+                    "provider": {
+                        "baseUrl": "https://example.test",
+                        "api": "openai-responses",
+                        "models": [{"id": "model", "reasoning": true}]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let selected = catalog.resolve(None, Some("model")).unwrap();
+        let mut setup = AppSetup {
+            provider: ConfiguredProvider::mock(),
+            catalog: Some(catalog),
+            selected: Some(selected),
+            tool_context: ToolContext::new(&root).unwrap(),
+            context: ContextBundle::disabled(root.clone(), root.clone()),
+            system_prompt: String::new(),
+            repository: Some(repository),
+            session: None,
+            initial_history: Vec::new(),
+            initial_transcript: Vec::new(),
+            compaction_enabled: false,
+            thinking_level: Some(Medium),
+            reasoning_effort: Some("medium".to_owned()),
+            cli_thinking_level: None,
+            default_thinking_level: None,
+            recent_thinking_level: Some(Medium),
+            resume_requested: false,
+            initial_session_resumed: false,
+            state_path: None,
+            workspace_id: "workspace".to_owned(),
+        };
+
+        setup.remember_thinking(High).unwrap();
+        setup.apply_opened(opened).unwrap();
+
+        assert_eq!(setup.recent_thinking_level, Some(High));
+        assert_eq!(setup.thinking_level, Some(High));
+        assert_eq!(
+            setup.session_info().unwrap().unwrap().thinking_level,
+            Some(High)
+        );
+
+        drop(setup);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
