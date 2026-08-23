@@ -15,10 +15,10 @@ pub use app::{
     TranscriptEntryState, TranscriptMessage, TranscriptMessages, UserMessageStatus,
 };
 pub use config::{
-    default_state_path, load_state, persist_recent_model, ApiKind, CompactionSettings,
-    Compatibility, ConfigError, ConfigWarning, ContextSettings, CostMetadata, ModelCatalog,
-    ModelRef, RecentModel, RecentModelState, ResolvedModel, ResolvedSettings, Settings,
-    SettingsError, SettingsLoad, StateError, ThinkingLevel, ThinkingLevelError,
+    default_state_path, load_state, persist_recent_model, persist_recent_thinking, ApiKind,
+    CompactionSettings, Compatibility, ConfigError, ConfigWarning, ContextSettings, CostMetadata,
+    ModelCatalog, ModelRef, RecentModel, RecentModelState, ResolvedModel, ResolvedSettings,
+    Settings, SettingsError, SettingsLoad, StateError, ThinkingLevel, ThinkingLevelError,
     WorkspaceRecentModel,
 };
 pub use context::{

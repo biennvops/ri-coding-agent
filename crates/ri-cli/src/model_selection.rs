@@ -123,6 +123,7 @@ mod tests {
                         provider: "provider".to_owned(),
                         model: "workspace".to_owned(),
                     }),
+                    ..WorkspaceRecentModel::default()
                 },
             )]),
             ..RecentModelState::default()
@@ -215,6 +216,7 @@ mod tests {
                         provider: "provider".to_owned(),
                         model: "also-removed".to_owned(),
                     }),
+                    ..WorkspaceRecentModel::default()
                 },
             )]),
             ..RecentModelState::default()
