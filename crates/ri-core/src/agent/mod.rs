@@ -59,13 +59,26 @@ pub enum AgentCommand {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentError {
     pub message: String,
+    terminal: bool,
 }
 
 impl AgentError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            terminal: true,
         }
+    }
+
+    pub fn non_terminal(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            terminal: false,
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        self.terminal
     }
 }
 
@@ -445,7 +458,7 @@ where
                                 | Some(AgentCommand::RenameSession { .. })
                                 | Some(AgentCommand::RefreshContext)
                                 | Some(AgentCommand::SetReasoningEffort { .. }) => {
-                                    let _ = events.send(AgentEvent::Error(AgentError::new(
+                                    let _ = events.send(AgentEvent::Error(AgentError::non_terminal(
                                         "a turn or compaction is already active",
                                     ))).await;
                                 }

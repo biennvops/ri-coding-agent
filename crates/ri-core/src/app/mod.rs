@@ -2,7 +2,7 @@ use std::ops::Index;
 
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::agent::{AgentError, AgentEvent};
+use crate::agent::AgentEvent;
 use crate::config::{ModelRef, ThinkingLevel};
 use crate::context::ContextUsage;
 use crate::model::{ModelAssistantItem, ModelLimits, ModelMessage, StopReason, Usage};
@@ -686,6 +686,10 @@ impl AppState {
                 }
             }
             AgentEvent::TurnFinished { reason } => {
+                if reason == StopReason::Error {
+                    self.finalize_streaming_assistant();
+                    self.compaction_active = false;
+                }
                 self.turn_active = false;
                 self.last_stop_reason = Some(reason);
             }
@@ -749,7 +753,15 @@ impl AppState {
                 self.session_info = Some(info);
                 self.replace_history(&history);
             }
-            AgentEvent::Error(AgentError { message }) => {
+            AgentEvent::Error(error) => {
+                let terminal = error.is_terminal();
+                let message = error.message;
+                if terminal {
+                    self.finalize_streaming_assistant();
+                    self.turn_active = false;
+                    self.compaction_active = false;
+                    self.last_stop_reason = Some(StopReason::Error);
+                }
                 self.last_error = Some(message.clone());
                 self.push_message(TranscriptMessage {
                     role: MessageRole::System,
@@ -1357,6 +1369,7 @@ fn line_end(text: &str, cursor: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::AgentError;
     use crate::model::ModelAssistantItem;
 
     #[test]
@@ -1990,6 +2003,80 @@ mod tests {
             .messages()
             .iter()
             .any(|message| { message.content.contains("context compacted") }));
+    }
+
+    #[test]
+    fn terminal_agent_error_finalizes_partial_assistant_and_accepts_follow_up_completion() {
+        let mut state = AppState::new();
+        state.insert_text("prompt");
+        state.submit_input();
+        state.reduce(AgentEvent::TurnStarted);
+        state.reduce(AgentEvent::AssistantMessageStarted);
+        state.reduce(AgentEvent::AssistantThinkingDelta {
+            item_id: None,
+            text: "reasoning".to_owned(),
+        });
+        state.reduce(AgentEvent::AssistantTextDelta {
+            index: None,
+            text: "partial answer".to_owned(),
+        });
+
+        let message = "provider request failed";
+        state.reduce(AgentEvent::Error(AgentError::new(message)));
+
+        assert!(!state.is_busy());
+        assert!(state.streaming_assistant().is_none());
+        assert_eq!(state.last_error(), Some(message));
+        assert_eq!(state.last_stop_reason(), Some(&StopReason::Error));
+        assert_eq!(state.messages()[1].content, "partial answer");
+        assert_eq!(state.messages()[1].thinking.as_deref(), Some("reasoning"));
+        assert_eq!(state.messages()[2].content, format!("error: {message}"));
+
+        state.reduce(AgentEvent::TurnFinished {
+            reason: StopReason::Error,
+        });
+
+        assert!(!state.is_busy());
+        assert!(state.streaming_assistant().is_none());
+        assert_eq!(state.last_error(), Some(message));
+        assert_eq!(state.messages().len(), 3);
+    }
+
+    #[test]
+    fn terminal_agent_error_before_assistant_output_clears_the_turn() {
+        let mut state = AppState::new();
+        state.insert_text("prompt");
+        state.submit_input();
+        state.reduce(AgentEvent::TurnStarted);
+
+        state.reduce(AgentEvent::Error(AgentError::new("provider unavailable")));
+
+        assert!(!state.is_busy());
+        assert!(state.streaming_assistant().is_none());
+        assert_eq!(state.last_error(), Some("provider unavailable"));
+
+        state.reduce(AgentEvent::TurnFinished {
+            reason: StopReason::Error,
+        });
+        assert!(!state.is_busy());
+    }
+
+    #[test]
+    fn non_terminal_agent_error_does_not_end_the_active_turn() {
+        let mut state = AppState::new();
+        state.reduce(AgentEvent::TurnStarted);
+        state.reduce(AgentEvent::AssistantMessageStarted);
+
+        state.reduce(AgentEvent::Error(AgentError::non_terminal(
+            "a turn or compaction is already active",
+        )));
+
+        assert!(state.is_busy());
+        assert!(state.streaming_assistant().is_some());
+        assert_eq!(
+            state.last_error(),
+            Some("a turn or compaction is already active")
+        );
     }
 
     #[test]
