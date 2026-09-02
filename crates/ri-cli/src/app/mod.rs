@@ -7,7 +7,7 @@ use futures_util::StreamExt;
 use ri_core::{
     config::{
         default_state_path, load_default_models, load_default_settings, load_state,
-        persist_recent_model,
+        persist_recent_model, persist_recent_thinking,
     },
     context::{build_system_prompt, discover_project, load_context, ContextBundle},
     workspace_id, AgentCommand, AgentEvent, AgentRuntime, AgentRuntimeConfig, AppState,
@@ -31,6 +31,7 @@ const COMMAND_CHANNEL_CAPACITY: usize = 16;
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 const MAX_AGENT_EVENTS_PER_FRAME: usize = 64;
 const MOUSE_SCROLL_ROWS: usize = 3;
+const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Options {
@@ -226,7 +227,9 @@ struct AppSetup {
     reasoning_effort: Option<String>,
     cli_thinking_level: Option<ri_core::ThinkingLevel>,
     default_thinking_level: Option<ri_core::ThinkingLevel>,
+    recent_thinking_level: Option<ri_core::ThinkingLevel>,
     resume_requested: bool,
+    initial_session_resumed: bool,
     state_path: Option<std::path::PathBuf>,
     workspace_id: String,
 }
@@ -249,12 +252,18 @@ impl AppSetup {
             Some(path) => match load_state(path) {
                 Ok(state) => state,
                 Err(error) => {
-                    eprintln!("ri: warning: {error}; ignoring recent model state");
+                    eprintln!("ri: warning: {error}; ignoring recent state");
                     None
                 }
             },
             None => None,
         };
+
+        let recent_thinking_level = recent_state.as_ref().and_then(|state| {
+            state
+                .workspace_thinking_level(&workspace_id)
+                .or(state.last_thinking_level)
+        });
 
         let catalog = load_default_models()
             .map_err(|error| anyhow!(error.to_string()))?
@@ -313,14 +322,23 @@ impl AppSetup {
             initial_transcript,
             session_thinking_level,
             resume_requested,
+            initial_session_resumed,
         ) = if options.no_session {
-            (None, None, Vec::new(), Vec::new(), None, false)
+            (None, None, Vec::new(), Vec::new(), None, false, false)
         } else {
             let repository =
                 SessionRepository::for_workspace(&project.launch_cwd, &project.project_root)
                     .map_err(|error| anyhow!(error.to_string()))?;
             if options.resume_session {
-                (Some(repository), None, Vec::new(), Vec::new(), None, true)
+                (
+                    Some(repository),
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    true,
+                    false,
+                )
             } else if options.continue_session {
                 let summary = repository
                     .latest()
@@ -345,6 +363,7 @@ impl AppSetup {
                     opened.transcript,
                     thinking_level,
                     false,
+                    true,
                 )
             } else if let Some(selector) = options.session.as_deref() {
                 let opened = repository
@@ -361,6 +380,7 @@ impl AppSetup {
                     opened.transcript,
                     thinking_level,
                     false,
+                    true,
                 )
             } else {
                 let session = repository
@@ -373,6 +393,7 @@ impl AppSetup {
                     Vec::new(),
                     None,
                     false,
+                    false,
                 )
             }
         };
@@ -380,6 +401,7 @@ impl AppSetup {
         let (requested_thinking_level, unsupported_policy) = select_thinking_level(
             options.thinking,
             session_thinking_level,
+            recent_thinking_level,
             settings.settings.default_thinking_level,
         );
         let (thinking_level, reasoning_effort) = resolve_thinking_level(
@@ -410,7 +432,9 @@ impl AppSetup {
             reasoning_effort,
             cli_thinking_level: options.thinking,
             default_thinking_level: settings.settings.default_thinking_level,
+            recent_thinking_level,
             resume_requested,
+            initial_session_resumed,
             state_path,
             workspace_id,
         })
@@ -428,6 +452,14 @@ impl AppSetup {
             return Ok(());
         };
         persist_recent_model(path, &self.workspace_id, model).map_err(|error| error.to_string())
+    }
+
+    fn remember_thinking(&mut self, level: ri_core::ThinkingLevel) -> Result<(), String> {
+        self.recent_thinking_level = Some(level);
+        let Some(path) = self.state_path.as_ref() else {
+            return Ok(());
+        };
+        persist_recent_thinking(path, &self.workspace_id, level).map_err(|error| error.to_string())
     }
 
     fn runtime_config(&self) -> AgentRuntimeConfig {
@@ -452,12 +484,14 @@ impl AppSetup {
         self.initial_history = opened.history;
         self.initial_transcript = opened.transcript;
         self.resume_requested = false;
+        self.initial_session_resumed = true;
         for warning in opened.warnings {
             eprintln!("{warning}");
         }
         let (requested, policy) = select_thinking_level(
             self.cli_thinking_level,
             session_thinking_level,
+            self.recent_thinking_level,
             self.default_thinking_level,
         );
         let (level, effort) = resolve_thinking_level(
@@ -791,6 +825,16 @@ async fn run_json(prompt: String, setup: AppSetup) -> Result<()> {
     }
 }
 
+fn add_startup_diagnostics(state: &mut AppState, context: &ContextBundle, session_resumed: bool) {
+    if session_resumed {
+        return;
+    }
+    state.add_system_message(context.diagnostic());
+    if let Some(path) = crate::logging::path() {
+        state.add_system_message(format!("logging: {}", path.display()));
+    }
+}
+
 async fn run_tui(mut setup: AppSetup) -> Result<()> {
     tracing::info!(target: "ri", mode = "tui", "run started");
     let session_info = setup.session_info()?;
@@ -808,10 +852,7 @@ async fn run_tui(mut setup: AppSetup) -> Result<()> {
 
     let mut state = AppState::new();
     state.replace_history(&setup.initial_transcript);
-    state.add_system_message(setup.context.diagnostic());
-    if let Some(path) = crate::logging::path() {
-        state.add_system_message(format!("logging: {}", path.display()));
-    }
+    add_startup_diagnostics(&mut state, &setup.context, setup.initial_session_resumed);
     state.set_session_info(session_info);
     state.set_git_branch(resolve_git_head(&setup.context.project_root));
     state.reduce(AgentEvent::ModelChanged(setup.model_ref()));
@@ -868,6 +909,8 @@ async fn run_tui_loop(
     let mut preferred_column = None;
     let mut suggestions = CommandSuggestions::default();
     let mut terminal_events = EventStream::new();
+    let mut git_refresh = tokio::time::interval(GIT_REFRESH_INTERVAL);
+    git_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut exit = false;
     let mut shutdown_source_closed = false;
 
@@ -876,6 +919,7 @@ async fn run_tui_loop(
         Ok(None) => shutdown_source_closed = true,
         Err(_) => {}
     }
+    git_refresh.tick().await;
 
     while !exit {
         if redraw.take_ready(Instant::now()) {
@@ -897,6 +941,11 @@ async fn run_tui_loop(
                 }
             }
             _ = wait_for_redraw(redraw_deadline) => {}
+            _ = git_refresh.tick() => {
+                if refresh_git_branch(state, &setup.context.project_root) {
+                    redraw.request(RedrawUrgency::Immediate, Instant::now());
+                }
+            }
             terminal_event = terminal_events.next() => {
                 let terminal_event = terminal_event
                     .ok_or_else(|| anyhow!("terminal event stream disconnected"))?
@@ -1074,6 +1123,15 @@ fn move_editor_or_suggestion(
     }
 }
 
+fn refresh_git_branch(state: &mut AppState, project_root: &std::path::Path) -> bool {
+    let branch = resolve_git_head(project_root);
+    if state.git_branch() == branch.as_deref() {
+        return false;
+    }
+    state.set_git_branch(branch);
+    true
+}
+
 fn resolve_git_head(workspace: &std::path::Path) -> Option<String> {
     const MAX_GIT_METADATA_BYTES: u64 = 4 * 1024;
 
@@ -1116,18 +1174,14 @@ fn apply_agent_event(
 ) -> RedrawUrgency {
     let urgency = redraw_urgency(&event);
     log_agent_event(&event);
-    let session_loaded = matches!(event, AgentEvent::SessionLoaded { .. });
     let refresh_git = matches!(
         &event,
         AgentEvent::ToolExecutionFinished { name, result, .. }
             if name == "bash" && result.metadata.success
     );
     state.reduce(event);
-    if session_loaded {
-        state.add_system_message(context.diagnostic());
-    }
     if refresh_git {
-        state.set_git_branch(resolve_git_head(&context.project_root));
+        refresh_git_branch(state, &context.project_root);
     }
     urgency
 }
@@ -1376,7 +1430,6 @@ async fn handle_slash_command(
             state.replace_history(&setup.initial_transcript);
             state.set_session_info(setup.session_info()?);
             state.set_thinking_level(setup.thinking_level);
-            state.add_system_message(setup.context.diagnostic());
             Ok(SlashCommandOutcome::Continue)
         }
     }
@@ -1460,6 +1513,10 @@ async fn handle_thinking_command(
             )),
         }
     }
+    if let Err(error) = setup.remember_thinking(level) {
+        eprintln!("ri: warning: could not persist recent thinking level: {error}");
+        state.add_system_message(format!("could not persist recent thinking level: {error}"));
+    }
     state.add_system_message(format!("thinking level: {level}"));
     Ok(())
 }
@@ -1536,6 +1593,14 @@ async fn handle_model_command(
                         "could not persist recent model selection: {error}"
                     ));
                 }
+                if let Some(level) = effective_level {
+                    if let Err(error) = setup.remember_thinking(level) {
+                        eprintln!("ri: warning: could not persist recent thinking level: {error}");
+                        state.add_system_message(format!(
+                            "could not persist recent thinking level: {error}"
+                        ));
+                    }
+                }
                 state.reduce(AgentEvent::ModelChanged(model_ref));
                 state.reduce(AgentEvent::ContextLimitsUpdated(setup.provider.limits()));
                 command_tx
@@ -1566,12 +1631,15 @@ enum UnsupportedThinkingPolicy {
 fn select_thinking_level(
     cli: Option<ri_core::ThinkingLevel>,
     session: Option<ri_core::ThinkingLevel>,
+    recent: Option<ri_core::ThinkingLevel>,
     settings: Option<ri_core::ThinkingLevel>,
 ) -> (Option<ri_core::ThinkingLevel>, UnsupportedThinkingPolicy) {
     if cli.is_some() {
         (cli, UnsupportedThinkingPolicy::Reject)
     } else if session.is_some() {
         (session, UnsupportedThinkingPolicy::AdjustDown)
+    } else if recent.is_some() {
+        (recent, UnsupportedThinkingPolicy::AdjustDown)
     } else {
         (settings, UnsupportedThinkingPolicy::Reject)
     }
@@ -1929,25 +1997,101 @@ mod tests {
     }
 
     #[test]
-    fn session_thinking_precedence_is_cli_then_session_then_settings() {
+    fn thinking_precedence_is_cli_then_session_then_workspace_then_global_then_settings() {
         use ri_core::ThinkingLevel::{High, Low, Medium};
 
         assert_eq!(
-            select_thinking_level(Some(Low), Some(High), Some(Medium)),
+            select_thinking_level(Some(Low), Some(High), Some(Medium), Some(Medium)),
             (Some(Low), UnsupportedThinkingPolicy::Reject)
         );
         assert_eq!(
-            select_thinking_level(None, Some(High), Some(Medium)),
+            select_thinking_level(None, Some(High), Some(Medium), Some(Medium)),
             (Some(High), UnsupportedThinkingPolicy::AdjustDown)
         );
         assert_eq!(
-            select_thinking_level(None, None, Some(Medium)),
+            select_thinking_level(None, None, Some(High), Some(Medium)),
+            (Some(High), UnsupportedThinkingPolicy::AdjustDown)
+        );
+        assert_eq!(
+            select_thinking_level(None, None, None, Some(Medium)),
             (Some(Medium), UnsupportedThinkingPolicy::Reject)
         );
         assert_eq!(
-            select_thinking_level(None, None, None),
+            select_thinking_level(None, None, None, None),
             (None, UnsupportedThinkingPolicy::Reject)
         );
+    }
+
+    #[test]
+    fn changed_thinking_level_is_retained_when_resuming_session_without_one() {
+        use ri_core::ThinkingLevel::{High, Medium};
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ri-thinking-resume-{unique}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let repository = SessionRepository::new(root.join("sessions"), &root, &root).unwrap();
+        let session = repository.create().unwrap();
+        session
+            .append_message(&ModelMessage::user("older request"))
+            .unwrap();
+        let path = session.info().unwrap().path;
+        drop(session);
+
+        let opened = repository.open_path(path).unwrap();
+        assert_eq!(opened.info.thinking_level, None);
+
+        let catalog = ModelCatalog::from_json(
+            "models.json",
+            r#"{
+                "providers": {
+                    "provider": {
+                        "baseUrl": "https://example.test",
+                        "api": "openai-responses",
+                        "models": [{"id": "model", "reasoning": true}]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let selected = catalog.resolve(None, Some("model")).unwrap();
+        let mut setup = AppSetup {
+            provider: ConfiguredProvider::mock(),
+            catalog: Some(catalog),
+            selected: Some(selected),
+            tool_context: ToolContext::new(&root).unwrap(),
+            context: ContextBundle::disabled(root.clone(), root.clone()),
+            system_prompt: String::new(),
+            repository: Some(repository),
+            session: None,
+            initial_history: Vec::new(),
+            initial_transcript: Vec::new(),
+            compaction_enabled: false,
+            thinking_level: Some(Medium),
+            reasoning_effort: Some("medium".to_owned()),
+            cli_thinking_level: None,
+            default_thinking_level: None,
+            recent_thinking_level: Some(Medium),
+            resume_requested: false,
+            initial_session_resumed: false,
+            state_path: None,
+            workspace_id: "workspace".to_owned(),
+        };
+
+        setup.remember_thinking(High).unwrap();
+        setup.apply_opened(opened).unwrap();
+
+        assert_eq!(setup.recent_thinking_level, Some(High));
+        assert_eq!(setup.thinking_level, Some(High));
+        assert_eq!(
+            setup.session_info().unwrap().unwrap().thinking_level,
+            Some(High)
+        );
+
+        drop(setup);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2219,6 +2363,94 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolve_git_head(&root).as_deref(), Some("worktree-branch"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_diagnostics_are_kept_for_fresh_sessions_only() {
+        let context = ContextBundle::disabled(PathBuf::new(), PathBuf::new());
+        let mut fresh = AppState::new();
+        add_startup_diagnostics(&mut fresh, &context, false);
+        assert!(fresh
+            .messages()
+            .iter()
+            .any(|message| message.content == "context: disabled"));
+
+        let mut resumed = AppState::new();
+        add_startup_diagnostics(&mut resumed, &context, true);
+        assert!(resumed.messages().is_empty());
+    }
+
+    #[test]
+    fn session_loaded_replaces_transcript_without_startup_diagnostics() {
+        let context = ContextBundle::disabled(PathBuf::new(), PathBuf::new());
+        let info = SessionInfo {
+            id: "session".into(),
+            path: PathBuf::new(),
+            name: None,
+            thinking_level: None,
+            created_at: "created".to_owned(),
+            updated_at: "updated".to_owned(),
+            workspace_root: PathBuf::new(),
+            project_root: PathBuf::new(),
+            message_count: 2,
+            first_user_preview: None,
+            materialized: false,
+        };
+        let history = vec![
+            ModelMessage::user("question"),
+            ModelMessage::Assistant {
+                items: vec![ri_core::ModelAssistantItem::Text {
+                    content: "answer".to_owned(),
+                }],
+            },
+        ];
+        let mut state = AppState::new();
+        state.add_system_message("old startup diagnostic");
+
+        apply_agent_event(
+            AgentEvent::SessionLoaded {
+                info,
+                history: history.clone(),
+            },
+            &mut state,
+            &context,
+        );
+
+        assert_eq!(state.messages().len(), 2);
+        assert_eq!(state.messages()[0].content, "question");
+        assert_eq!(state.messages()[1].content, "answer");
+        assert!(state
+            .messages()
+            .iter()
+            .all(|message| !message.content.contains("diagnostic")));
+    }
+
+    #[test]
+    fn git_branch_refresh_only_reports_displayed_branch_changes() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ri-git-refresh-helper-{unique}"));
+        let git_dir = root.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let mut state = AppState::new();
+        assert!(refresh_git_branch(&mut state, &root));
+        assert_eq!(state.git_branch(), Some("main"));
+        assert!(!refresh_git_branch(&mut state, &root));
+
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/changed\n").unwrap();
+        assert!(refresh_git_branch(&mut state, &root));
+        assert_eq!(state.git_branch(), Some("changed"));
+
+        std::fs::remove_file(git_dir.join("HEAD")).unwrap();
+        assert!(refresh_git_branch(&mut state, &root));
+        assert_eq!(state.git_branch(), None);
+        assert!(!refresh_git_branch(&mut state, &root));
 
         std::fs::remove_dir_all(root).unwrap();
     }

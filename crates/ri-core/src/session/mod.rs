@@ -2094,7 +2094,7 @@ fn sha256(input: &[u8]) -> [u8; 32] {
         data.push(0);
     }
     data.extend_from_slice(&bit_length.to_be_bytes());
-    for chunk in data.chunks_exact(64) {
+    for chunk in data.as_chunks::<64>().0 {
         let mut words = [0u32; 64];
         for (index, word) in words[..16].iter_mut().enumerate() {
             let start = index * 4;

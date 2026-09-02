@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use crate::fs::{atomic_write, AtomicWriteOptions};
 
-use super::ModelRef;
+use super::{ModelRef, ThinkingLevel};
 
 pub const STATE_VERSION: u32 = 1;
 
@@ -39,6 +39,8 @@ impl From<RecentModel> for ModelRef {
 pub struct WorkspaceRecentModel {
     #[serde(rename = "lastModel", default)]
     pub last_model: Option<RecentModel>,
+    #[serde(rename = "lastThinkingLevel", default)]
+    pub last_thinking_level: Option<ThinkingLevel>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +48,8 @@ pub struct RecentModelState {
     pub version: u32,
     #[serde(rename = "lastModel", default)]
     pub last_model: Option<RecentModel>,
+    #[serde(rename = "lastThinkingLevel", default)]
+    pub last_thinking_level: Option<ThinkingLevel>,
     #[serde(default)]
     pub workspaces: BTreeMap<String, WorkspaceRecentModel>,
 }
@@ -55,6 +59,7 @@ impl Default for RecentModelState {
         Self {
             version: STATE_VERSION,
             last_model: None,
+            last_thinking_level: None,
             workspaces: BTreeMap::new(),
         }
     }
@@ -65,6 +70,12 @@ impl RecentModelState {
         self.workspaces
             .get(workspace_id)
             .and_then(|workspace| workspace.last_model.as_ref())
+    }
+
+    pub fn workspace_thinking_level(&self, workspace_id: &str) -> Option<ThinkingLevel> {
+        self.workspaces
+            .get(workspace_id)
+            .and_then(|workspace| workspace.last_thinking_level)
     }
 }
 
@@ -114,6 +125,36 @@ pub fn persist_recent_model(
     workspace_id: &str,
     model: &ModelRef,
 ) -> Result<(), StateError> {
+    let recent = RecentModel::from(model);
+    update_state(path, |state| {
+        state.last_model = Some(recent.clone());
+        state
+            .workspaces
+            .entry(workspace_id.to_owned())
+            .or_default()
+            .last_model = Some(recent);
+    })
+}
+
+pub fn persist_recent_thinking(
+    path: impl AsRef<Path>,
+    workspace_id: &str,
+    thinking_level: ThinkingLevel,
+) -> Result<(), StateError> {
+    update_state(path, |state| {
+        state.last_thinking_level = Some(thinking_level);
+        state
+            .workspaces
+            .entry(workspace_id.to_owned())
+            .or_default()
+            .last_thinking_level = Some(thinking_level);
+    })
+}
+
+fn update_state(
+    path: impl AsRef<Path>,
+    update: impl FnOnce(&mut RecentModelState),
+) -> Result<(), StateError> {
     let path = path.as_ref().to_path_buf();
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     create_state_directory(parent, &path)?;
@@ -137,13 +178,7 @@ pub fn persist_recent_model(
     } else {
         RecentModelState::default()
     };
-    let recent = RecentModel::from(model);
-    state.last_model = Some(recent.clone());
-    state
-        .workspaces
-        .entry(workspace_id.to_owned())
-        .or_default()
-        .last_model = Some(recent);
+    update(&mut state);
     write_state_atomically(&path, &state)
 }
 
@@ -285,6 +320,72 @@ mod tests {
         assert_eq!(
             state.workspace_model(second_workspace),
             Some(&RecentModel::from(&second_model))
+        );
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn model_only_state_json_loads_without_thinking_values() {
+        let root = unique_test_dir("state-legacy-thinking");
+        let path = root.join("state.json");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "lastModel": {"provider": "provider", "model": "model"},
+                "workspaces": {
+                    "workspace": {
+                        "lastModel": {"provider": "provider", "model": "workspace-model"}
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let state = load_state(&path)
+            .expect("legacy state should load")
+            .expect("legacy state should exist");
+
+        assert_eq!(state.last_thinking_level, None);
+        assert_eq!(state.workspace_thinking_level("workspace"), None);
+        remove_test_dir(root);
+    }
+
+    #[test]
+    fn recent_thinking_updates_preserve_global_models_and_other_workspaces() {
+        let root = unique_test_dir("state-thinking-round-trip");
+        let path = root.join("state.json");
+        let first_model = ModelRef::new("local", "qwen");
+        let second_model = ModelRef::new("remote", "coder");
+
+        persist_recent_model(&path, "first", &first_model).expect("model should persist");
+        persist_recent_thinking(&path, "first", ThinkingLevel::High)
+            .expect("thinking should persist");
+        persist_recent_model(&path, "second", &second_model).expect("model should persist");
+        persist_recent_thinking(&path, "second", ThinkingLevel::Low)
+            .expect("thinking should persist");
+
+        let state = load_state(&path)
+            .expect("state should load")
+            .expect("state should exist");
+        assert_eq!(state.last_model, Some(RecentModel::from(&second_model)));
+        assert_eq!(state.last_thinking_level, Some(ThinkingLevel::Low));
+        assert_eq!(
+            state.workspace_model("first"),
+            Some(&RecentModel::from(&first_model))
+        );
+        assert_eq!(
+            state.workspace_thinking_level("first"),
+            Some(ThinkingLevel::High)
+        );
+        assert_eq!(
+            state.workspace_model("second"),
+            Some(&RecentModel::from(&second_model))
+        );
+        assert_eq!(
+            state.workspace_thinking_level("second"),
+            Some(ThinkingLevel::Low)
         );
         remove_test_dir(root);
     }

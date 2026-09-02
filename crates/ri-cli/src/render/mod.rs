@@ -1279,6 +1279,8 @@ fn footer_text(state: &AppState, width: u16, scroll_from_bottom: usize) -> Line<
     };
     let status = if state.last_error().is_some() {
         "error — see transcript".to_owned()
+    } else if state.is_compaction_active() {
+        "compacting".to_owned()
     } else if state.is_busy() {
         "busy".to_owned()
     } else {
@@ -2253,6 +2255,48 @@ mod tests {
         assert!(!at_bottom.contains("↑"));
         assert!(scrolled.contains("↑ 42 lines"));
         assert!(!scrolled.contains("PgDn"));
+    }
+
+    #[test]
+    fn footer_status_prioritizes_errors_then_compaction_then_busy_then_ready() {
+        let mut state = AppState::new();
+        let idle = footer_text(&state, 200, 0)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(idle.contains("ready"));
+
+        state.reduce(AgentEvent::TurnStarted);
+        let busy = footer_text(&state, 200, 0)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(busy.contains("busy"));
+
+        state.reduce(AgentEvent::TurnFinished {
+            reason: ri_core::StopReason::Stop,
+        });
+        state.set_compaction_active(true);
+        let compacting = footer_text(&state, 200, 0)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(compacting.contains("compacting"));
+        assert!(!compacting.contains("busy"));
+
+        state.reduce(AgentEvent::Error(ri_core::AgentError::non_terminal(
+            "temporary command error",
+        )));
+        let error = footer_text(&state, 200, 0)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(error.contains("error — see transcript"));
+        assert!(!error.contains("compacting"));
     }
 
     #[test]

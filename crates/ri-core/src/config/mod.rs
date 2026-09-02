@@ -21,8 +21,8 @@ pub use settings::{
     CompactionSettings, ContextSettings, ResolvedSettings, Settings, SettingsError, SettingsLoad,
 };
 pub use state::{
-    default_state_path, load_state, persist_recent_model, RecentModel, RecentModelState,
-    StateError, WorkspaceRecentModel,
+    default_state_path, load_state, persist_recent_model, persist_recent_thinking, RecentModel,
+    RecentModelState, StateError, WorkspaceRecentModel,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
