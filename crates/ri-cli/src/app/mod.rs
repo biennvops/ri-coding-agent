@@ -1019,6 +1019,7 @@ async fn run_tui_loop(
                                         exit = true;
                                     }
                                 }
+                                Action::ToggleToolOutput => renderer.toggle_tool_output(),
                                 Action::Insert(character) => state.insert_text(&character.to_string()),
                                 Action::Backspace => state.backspace(),
                                 Action::Delete => state.delete(),

@@ -46,9 +46,21 @@ fn main() {
     cached_renderer
         .draw(&mut cached_terminal, &cached_state, 0)
         .expect("warmup draw");
-    measure("cached redraw · 100k rows", 10, || {
+    measure("cached redraw · 100k rows · collapsed", 10, || {
         cached_renderer
             .draw(&mut cached_terminal, &cached_state, 0)
+            .expect("test backend draw");
+    });
+
+    let mut expanded_terminal = test_terminal(WIDTH, HEIGHT);
+    let mut expanded_renderer = TuiRenderer::new();
+    expanded_renderer.toggle_tool_output();
+    expanded_renderer
+        .draw(&mut expanded_terminal, &cached_state, 0)
+        .expect("expanded warmup draw");
+    measure("cached redraw · 100k rows · expanded", 10, || {
+        expanded_renderer
+            .draw(&mut expanded_terminal, &cached_state, 0)
             .expect("test backend draw");
     });
 
@@ -117,8 +129,25 @@ fn main() {
     tool_renderer
         .draw(&mut tool_terminal, &tool_state, 0)
         .expect("warmup draw");
-    measure("large live tool-output burst", 3, || {
+    measure("large live tool-output burst · collapsed", 3, || {
         for index in 0..100 {
+            tool_state.reduce(AgentEvent::ToolExecutionOutput {
+                call_id: "live-tool".to_owned(),
+                stream: ToolOutputStream::Stdout,
+                chunk: format!("output {index}\n"),
+            });
+            tool_renderer
+                .draw(&mut tool_terminal, &tool_state, 0)
+                .expect("test backend draw");
+        }
+    });
+
+    tool_renderer.toggle_tool_output();
+    tool_renderer
+        .draw(&mut tool_terminal, &tool_state, 0)
+        .expect("expanded tool warmup draw");
+    measure("large live tool-output burst · expanded", 3, || {
+        for index in 100..200 {
             tool_state.reduce(AgentEvent::ToolExecutionOutput {
                 call_id: "live-tool".to_owned(),
                 stream: ToolOutputStream::Stdout,
