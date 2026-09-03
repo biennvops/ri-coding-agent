@@ -11,6 +11,7 @@ pub enum Action {
     Complete,
     Escape,
     CtrlC,
+    ToggleToolOutput,
     Insert(char),
     Backspace,
     Delete,
@@ -32,6 +33,7 @@ pub fn action_for(key: KeyEvent) -> Option<Action> {
     if modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => Some(Action::CtrlC),
+            KeyCode::Char('o') => Some(Action::ToggleToolOutput),
             KeyCode::Char('u') => Some(Action::PageUp),
             KeyCode::Char('d') => Some(Action::PageDown),
             _ => None,
@@ -96,6 +98,14 @@ mod tests {
 
     #[test]
     fn maps_control_and_mouse_scrollback_actions() {
+        assert_eq!(
+            action_for(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(Action::CtrlC)
+        );
+        assert_eq!(
+            action_for(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+            Some(Action::ToggleToolOutput)
+        );
         assert_eq!(
             action_for(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
             Some(Action::PageUp)

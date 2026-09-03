@@ -26,6 +26,7 @@ use crate::redraw::{RedrawScheduler, RedrawUrgency};
 use crate::render::{TranscriptScroll, TuiRenderer};
 use crate::signals::ShutdownSignals;
 use crate::terminal::TerminalGuard;
+use crate::thinking_picker::{ThinkingPickerOutcome, ThinkingPickerState};
 
 const COMMAND_CHANNEL_CAPACITY: usize = 16;
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -908,6 +909,7 @@ async fn run_tui_loop(
         .max(1) as usize;
     let mut preferred_column = None;
     let mut suggestions = CommandSuggestions::default();
+    let mut thinking_picker = None;
     let mut terminal_events = EventStream::new();
     let mut git_refresh = tokio::time::interval(GIT_REFRESH_INTERVAL);
     git_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -926,7 +928,13 @@ async fn run_tui_loop(
             drain_ready_agent_events(state, event_rx, &setup.context, &mut redraw)?;
             redraw.mark_drawn();
             renderer
-                .draw_interactive(terminal.terminal_mut(), state, &mut scroll, &suggestions)
+                .draw_interactive(
+                    terminal.terminal_mut(),
+                    state,
+                    &mut scroll,
+                    &suggestions,
+                    thinking_picker.as_ref(),
+                )
                 .context("could not render terminal")?;
             state.acknowledge_transcript_changes();
         }
@@ -954,6 +962,22 @@ async fn run_tui_loop(
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         if let Some(action) = input::action_for(key) {
                             redraw.request(RedrawUrgency::Immediate, Instant::now());
+                            if thinking_picker.is_some() {
+                                let outcome = thinking_picker
+                                    .as_mut()
+                                    .expect("thinking picker should be active")
+                                    .handle_action(action);
+                                match outcome {
+                                    ThinkingPickerOutcome::Pending => {}
+                                    ThinkingPickerOutcome::Selected(level) => {
+                                        thinking_picker = None;
+                                        apply_thinking_level(level, state, setup, command_tx).await?;
+                                        scroll.follow_bottom();
+                                    }
+                                    ThinkingPickerOutcome::Cancelled => thinking_picker = None,
+                                }
+                                continue;
+                            }
                             if !matches!(action, Action::Up | Action::Down) {
                                 preferred_column = None;
                             }
@@ -974,8 +998,17 @@ async fn run_tui_loop(
                                                 setup,
                                             )
                                             .await?;
-                                            if matches!(outcome, SlashCommandOutcome::Quit) {
-                                                exit = true;
+                                            match outcome {
+                                                SlashCommandOutcome::Continue => {}
+                                                SlashCommandOutcome::Quit => exit = true,
+                                                SlashCommandOutcome::OpenThinkingPicker => {
+                                                    thinking_picker = setup.selected.as_ref().map(|model| {
+                                                        ThinkingPickerState::new(
+                                                            model,
+                                                            setup.thinking_level,
+                                                        )
+                                                    });
+                                                }
                                             }
                                             scroll.follow_bottom();
                                         } else {
@@ -1019,6 +1052,7 @@ async fn run_tui_loop(
                                         exit = true;
                                     }
                                 }
+                                Action::ToggleToolOutput => renderer.toggle_tool_output(),
                                 Action::Insert(character) => state.insert_text(&character.to_string()),
                                 Action::Backspace => state.backspace(),
                                 Action::Delete => state.delete(),
@@ -1046,7 +1080,7 @@ async fn run_tui_loop(
                             resume_live_after_editor_mutation(input_revision, state, &mut scroll);
                         }
                     }
-                    Event::Paste(text) => {
+                    Event::Paste(text) if thinking_picker.is_none() => {
                         let input_revision = state.input_revision();
                         state.insert_text(&text);
                         resume_live_after_editor_mutation(input_revision, state, &mut scroll);
@@ -1286,6 +1320,7 @@ enum SlashCommand {
 enum SlashCommandOutcome {
     Continue,
     Quit,
+    OpenThinkingPicker,
 }
 
 fn is_slash_input(input: &str) -> bool {
@@ -1333,9 +1368,7 @@ async fn handle_slash_command(
             Ok(SlashCommandOutcome::Continue)
         }
         SlashCommand::Thinking(argument) => {
-            handle_thinking_command(terminal, state, setup, command_tx, argument.as_deref())
-                .await?;
-            Ok(SlashCommandOutcome::Continue)
+            handle_thinking_command(state, setup, command_tx, argument.as_deref()).await
         }
         SlashCommand::Quit => Ok(SlashCommandOutcome::Quit),
         SlashCommand::Compact => {
@@ -1462,33 +1495,38 @@ fn model_command(input: &str) -> Option<Option<String>> {
 }
 
 async fn handle_thinking_command(
-    terminal: &mut TerminalGuard,
     state: &mut AppState,
     setup: &mut AppSetup,
     command_tx: &mpsc::Sender<AgentCommand>,
     argument: Option<&str>,
+) -> Result<SlashCommandOutcome> {
+    if setup.selected.is_none() {
+        state.add_system_message("no model is selected");
+        return Ok(SlashCommandOutcome::Continue);
+    }
+    let Some(argument) = argument else {
+        return Ok(SlashCommandOutcome::OpenThinkingPicker);
+    };
+    let level = match argument.parse::<ri_core::ThinkingLevel>() {
+        Ok(level) => level,
+        Err(error) => {
+            state.add_system_message(error.to_string());
+            return Ok(SlashCommandOutcome::Continue);
+        }
+    };
+    apply_thinking_level(level, state, setup, command_tx).await?;
+    Ok(SlashCommandOutcome::Continue)
+}
+
+async fn apply_thinking_level(
+    level: ri_core::ThinkingLevel,
+    state: &mut AppState,
+    setup: &mut AppSetup,
+    command_tx: &mpsc::Sender<AgentCommand>,
 ) -> Result<()> {
     let Some(model) = setup.selected.as_ref() else {
         state.add_system_message("no model is selected");
         return Ok(());
-    };
-    let level = if let Some(argument) = argument {
-        match argument.parse::<ri_core::ThinkingLevel>() {
-            Ok(level) => level,
-            Err(error) => {
-                state.add_system_message(error.to_string());
-                return Ok(());
-            }
-        }
-    } else {
-        match crate::thinking_picker::pick_thinking_level_in_terminal(
-            terminal,
-            model,
-            setup.thinking_level,
-        )? {
-            Some(level) => level,
-            None => return Ok(()),
-        }
     };
     let (thinking_level, effort) =
         match resolve_thinking_level(model, Some(level), UnsupportedThinkingPolicy::Reject) {

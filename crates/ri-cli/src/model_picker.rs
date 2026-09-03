@@ -32,6 +32,7 @@ pub(crate) fn pick_model_in_terminal(
             PickerAction::Down => picker.move_down(true),
             PickerAction::Confirm => return Ok(Some(catalog.models()[picker.selected()].clone())),
             PickerAction::Cancel => return Ok(None),
+            PickerAction::Redraw => {}
         }
     }
 }

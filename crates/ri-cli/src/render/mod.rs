@@ -20,8 +20,12 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::commands::{matching_commands, CommandSuggestions};
 use crate::input::VisualLayout;
+use crate::thinking_picker::ThinkingPickerState;
 
 const MAX_VISIBLE_COMMAND_SUGGESTIONS: usize = 6;
+const TOOL_RUNNING_BACKGROUND: Color = Color::Rgb(48, 42, 18);
+const TOOL_SUCCESS_BACKGROUND: Color = Color::Rgb(18, 48, 32);
+const TOOL_ERROR_BACKGROUND: Color = Color::Rgb(55, 22, 24);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RenderStats {
@@ -42,6 +46,7 @@ pub struct TuiRenderer {
     editor: EditorLayoutCache,
     last_stats: RenderStats,
     transcript_viewport_rows: usize,
+    tool_output_expanded: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -110,6 +115,7 @@ impl TuiRenderer {
             editor: EditorLayoutCache::default(),
             last_stats: RenderStats::default(),
             transcript_viewport_rows: 0,
+            tool_output_expanded: false,
         }
     }
 
@@ -133,6 +139,14 @@ impl TuiRenderer {
         self.transcript_viewport_rows.max(1)
     }
 
+    pub fn tool_output_expanded(&self) -> bool {
+        self.tool_output_expanded
+    }
+
+    pub fn toggle_tool_output(&mut self) {
+        self.tool_output_expanded = !self.tool_output_expanded;
+    }
+
     pub fn move_editor_vertical(
         &mut self,
         state: &AppState,
@@ -154,7 +168,13 @@ impl TuiRenderer {
     ) -> Result<(), B::Error> {
         self.last_stats = RenderStats::default();
         terminal.draw(|frame| {
-            self.render_frame(frame, state, Viewport::FromBottom(scroll_from_bottom), None);
+            self.render_frame(
+                frame,
+                state,
+                Viewport::FromBottom(scroll_from_bottom),
+                None,
+                None,
+            );
         })?;
         Ok(())
     }
@@ -165,6 +185,7 @@ impl TuiRenderer {
         state: &AppState,
         scroll: &mut TranscriptScroll,
         suggestions: &CommandSuggestions,
+        thinking_picker: Option<&ThinkingPickerState>,
     ) -> Result<(), B::Error> {
         self.last_stats = RenderStats::default();
         terminal.draw(|frame| {
@@ -173,6 +194,7 @@ impl TuiRenderer {
                 state,
                 Viewport::Interactive(scroll),
                 Some(suggestions),
+                thinking_picker,
             );
         })?;
         Ok(())
@@ -184,6 +206,7 @@ impl TuiRenderer {
         state: &AppState,
         viewport: Viewport<'_>,
         suggestions: Option<&CommandSuggestions>,
+        thinking_picker: Option<&ThinkingPickerState>,
     ) {
         let area = frame.area();
         let editor_width = area.width.saturating_sub(2).max(1) as usize;
@@ -210,8 +233,12 @@ impl TuiRenderer {
             .split(area);
 
         let transcript_width = chunks[0].width.saturating_sub(2).max(1) as usize;
-        self.transcript
-            .prepare(state, transcript_width, &mut self.last_stats);
+        self.transcript.prepare(
+            state,
+            transcript_width,
+            self.tool_output_expanded,
+            &mut self.last_stats,
+        );
         let visible_lines = chunks[0].height.saturating_sub(2) as usize;
         self.transcript_viewport_rows = visible_lines;
         let maximum_scroll = self.transcript.total_rows().saturating_sub(visible_lines);
@@ -260,14 +287,22 @@ impl TuiRenderer {
             .block(Block::default().borders(Borders::ALL).title(" input "))
             .scroll((editor_scroll.min(u16::MAX as usize) as u16, 0));
         frame.render_widget(editor, chunks[1]);
-        if let Some(suggestions) = suggestions {
+        if let Some(picker) = thinking_picker {
+            render_thinking_picker(frame, picker, chunks[1]);
+        } else if let Some(suggestions) = suggestions {
             render_command_suggestions(frame, state, suggestions, chunks[1]);
         }
 
-        let footer = footer_text(state, chunks[2].width, scroll_from_bottom);
+        let footer = footer_text(
+            state,
+            chunks[2].width,
+            scroll_from_bottom,
+            self.transcript.has_expandable_tool_output(),
+            self.tool_output_expanded,
+        );
         frame.render_widget(Paragraph::new(footer), chunks[2]);
 
-        if chunks[1].height > 2 {
+        if thinking_picker.is_none() && chunks[1].height > 2 {
             let x = chunks[1]
                 .x
                 .saturating_add(1)
@@ -285,6 +320,48 @@ impl TuiRenderer {
             frame.set_cursor_position((x.min(max_x), y.min(max_y)));
         }
     }
+}
+
+fn render_thinking_picker(frame: &mut Frame<'_>, picker: &ThinkingPickerState, editor_area: Rect) {
+    let Some((area, visible_rows)) = thinking_picker_layout(frame.area(), editor_area, picker)
+    else {
+        return;
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(picker.rows(visible_rows))
+            .block(Block::default().borders(Borders::ALL).title(" Thinking ")),
+        area,
+    );
+}
+
+fn thinking_picker_layout(
+    frame_area: Rect,
+    editor_area: Rect,
+    picker: &ThinkingPickerState,
+) -> Option<(Rect, usize)> {
+    let available_height = editor_area.y.saturating_sub(frame_area.y) as usize;
+    let available_width = editor_area.width.saturating_sub(2) as usize;
+    if picker.len() == 0 || available_height < 3 || available_width < 4 {
+        return None;
+    }
+
+    let visible_rows = picker.len().min(available_height.saturating_sub(2));
+    let desired_width = picker
+        .longest_level_width()
+        .saturating_add(4)
+        .max(UnicodeWidthStr::width(" Thinking ").saturating_add(2));
+    let width = desired_width.min(available_width) as u16;
+    let height = visible_rows.saturating_add(2) as u16;
+    Some((
+        Rect::new(
+            editor_area.x.saturating_add(1),
+            editor_area.y.saturating_sub(height),
+            width,
+            height,
+        ),
+        visible_rows,
+    ))
 }
 
 fn render_command_suggestions(
@@ -340,17 +417,25 @@ fn render_command_suggestions(
     );
 }
 
+#[derive(Clone, Copy, Debug)]
+struct StyledRange {
+    start: usize,
+    width: usize,
+    style: Style,
+}
+
 #[derive(Clone, Debug)]
 struct CachedRow {
     text: String,
     style: Style,
-    span_style: Option<(usize, usize, Style)>,
+    spans: Vec<StyledRange>,
 }
 
 #[derive(Clone, Debug)]
 struct CachedLayout {
     revision: u64,
     rows: Vec<CachedRow>,
+    has_expandable_tool_output: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -405,6 +490,8 @@ struct EntryLayoutIndex {
 struct TranscriptLayoutCache {
     epoch: Option<u64>,
     width: usize,
+    tool_output_expanded: bool,
+    expandable_tool_entries: usize,
     layouts: HashMap<TranscriptEntryId, CachedLayout>,
     indices: Vec<EntryLayoutIndex>,
     positions: HashMap<TranscriptEntryId, usize>,
@@ -448,11 +535,23 @@ impl TranscriptLayoutCache {
         }
     }
 
-    fn prepare(&mut self, state: &AppState, width: usize, stats: &mut RenderStats) {
+    fn has_expandable_tool_output(&self) -> bool {
+        self.expandable_tool_entries > 0
+    }
+
+    fn prepare(
+        &mut self,
+        state: &AppState,
+        width: usize,
+        tool_output_expanded: bool,
+        stats: &mut RenderStats,
+    ) {
         let width = width.max(1);
-        let cold = self.epoch != Some(state.transcript_epoch()) || self.width != width;
+        let cold = self.epoch != Some(state.transcript_epoch())
+            || self.width != width
+            || self.tool_output_expanded != tool_output_expanded;
         if cold {
-            self.reset(state.transcript_epoch(), width);
+            self.reset(state.transcript_epoch(), width, tool_output_expanded);
             for entry in state.transcript_display_entries() {
                 self.append_static_entry(entry, width, stats);
             }
@@ -463,7 +562,7 @@ impl TranscriptLayoutCache {
         }
 
         if state.transcript_display_entries().len() < self.indices.len() {
-            self.reset(state.transcript_epoch(), width);
+            self.reset(state.transcript_epoch(), width, tool_output_expanded);
             for entry in state.transcript_display_entries() {
                 self.append_static_entry(entry, width, stats);
             }
@@ -492,9 +591,11 @@ impl TranscriptLayoutCache {
         self.update_fallback(width, stats);
     }
 
-    fn reset(&mut self, epoch: u64, width: usize) {
+    fn reset(&mut self, epoch: u64, width: usize, tool_output_expanded: bool) {
         self.epoch = Some(epoch);
         self.width = width;
+        self.tool_output_expanded = tool_output_expanded;
+        self.expandable_tool_entries = 0;
         self.layouts = HashMap::new();
         self.indices = Vec::new();
         self.positions = HashMap::new();
@@ -682,7 +783,11 @@ impl TranscriptLayoutCache {
                     width,
                 );
                 stats.cache_misses = stats.cache_misses.saturating_add(1);
-                self.fallback = Some(CachedLayout { revision: 0, rows });
+                self.fallback = Some(CachedLayout {
+                    revision: 0,
+                    rows,
+                    has_expandable_tool_output: false,
+                });
             } else {
                 stats.cache_hits = stats.cache_hits.saturating_add(1);
             }
@@ -707,13 +812,34 @@ impl TranscriptLayoutCache {
             stats.cache_hits = stats.cache_hits.saturating_add(1);
             return;
         }
-        let rows = layout_entry(entry, width);
+        let rows = layout_entry(entry, width, self.tool_output_expanded);
+        let has_expandable_tool_output = matches!(
+            entry,
+            TranscriptEntry::Tool(tool) if !tool.output.is_empty()
+        );
+        if self
+            .layouts
+            .get(&id)
+            .is_some_and(|layout| layout.has_expandable_tool_output)
+        {
+            self.expandable_tool_entries = self.expandable_tool_entries.saturating_sub(1);
+        }
+        if has_expandable_tool_output {
+            self.expandable_tool_entries = self.expandable_tool_entries.saturating_add(1);
+        }
         stats.cache_misses = stats.cache_misses.saturating_add(1);
         stats.entries_reflowed = stats.entries_reflowed.saturating_add(1);
         stats.bytes_reflowed = stats
             .bytes_reflowed
             .saturating_add(entry_render_bytes(entry));
-        self.layouts.insert(id, CachedLayout { revision, rows });
+        self.layouts.insert(
+            id,
+            CachedLayout {
+                revision,
+                rows,
+                has_expandable_tool_output,
+            },
+        );
     }
 
     fn ensure_streaming_layout(
@@ -748,12 +874,12 @@ impl TranscriptLayoutCache {
                 header: CachedRow {
                     text: "▶ assistant · streaming".to_owned(),
                     style: Style::default().fg(Color::Green),
-                    span_style: None,
+                    spans: Vec::new(),
                 },
                 thinking_header: CachedRow {
                     text: "  thinking:".to_owned(),
                     style: Style::default().fg(Color::Cyan),
-                    span_style: None,
+                    spans: Vec::new(),
                 },
                 content_len: streaming.content.len(),
                 content_rows,
@@ -850,19 +976,15 @@ impl TranscriptLayoutCache {
                 continue;
             };
             buffer.set_stringn(area.x, y, row.text.as_str(), area.width as usize, row.style);
-            if let Some((span_start, span_width, style)) = row.span_style {
+            for span in &row.spans {
+                let start = span.start.min(area.width as usize);
+                let width = span
+                    .width
+                    .min(area.width as usize)
+                    .min(area.width as usize - start);
                 buffer.set_style(
-                    Rect::new(
-                        area.x
-                            .saturating_add(span_start.min(area.width as usize) as u16),
-                        y,
-                        (span_width
-                            .min(area.width as usize)
-                            .min(area.width as usize - span_start.min(area.width as usize)))
-                            as u16,
-                        1,
-                    ),
-                    style,
+                    Rect::new(area.x.saturating_add(start as u16), y, width as u16, 1),
+                    span.style,
                 );
             }
         }
@@ -950,7 +1072,11 @@ fn is_queued_layout(layout: &CachedLayout) -> bool {
         .is_some_and(|row| row.text == "▶ you · queued")
 }
 
-fn layout_entry(entry: &TranscriptEntry, width: usize) -> Vec<CachedRow> {
+fn layout_entry(
+    entry: &TranscriptEntry,
+    width: usize,
+    tool_output_expanded: bool,
+) -> Vec<CachedRow> {
     let mut rows = match entry {
         TranscriptEntry::Message(message) => layout_message(
             message.role,
@@ -969,14 +1095,14 @@ fn layout_entry(entry: &TranscriptEntry, width: usize) -> Vec<CachedRow> {
         ),
         TranscriptEntry::Tool(tool) => {
             let mut rows = Vec::new();
-            append_tool_entry(&mut rows, tool, width);
+            append_tool_entry(&mut rows, tool, width, tool_output_expanded);
             rows
         }
     };
     rows.push(CachedRow {
         text: String::new(),
         style: Style::default(),
-        span_style: None,
+        spans: Vec::new(),
     });
     rows
 }
@@ -1011,15 +1137,19 @@ fn layout_message(
     rows
 }
 
-fn append_tool_entry(lines: &mut Vec<CachedRow>, tool: &ToolTranscriptEntry, width: usize) {
-    let (marker, style) = match &tool.status {
-        ToolStatus::Running => ("▶", Style::default().fg(Color::Yellow)),
-        ToolStatus::Finished(metadata) if metadata.success => {
-            ("✓", Style::default().fg(Color::Green))
-        }
-        ToolStatus::Finished(_) => ("✗", Style::default().fg(Color::Red)),
+fn append_tool_entry(
+    lines: &mut Vec<CachedRow>,
+    tool: &ToolTranscriptEntry,
+    width: usize,
+    tool_output_expanded: bool,
+) {
+    let (marker, background) = match &tool.status {
+        ToolStatus::Running => ("▶", TOOL_RUNNING_BACKGROUND),
+        ToolStatus::Finished(metadata) if metadata.success => ("✓", TOOL_SUCCESS_BACKGROUND),
+        ToolStatus::Finished(_) => ("✗", TOOL_ERROR_BACKGROUND),
     };
-    let mut header = layout_styled_lines(&format!("{marker} {}", tool.summary), style, width);
+    let state_style = Style::default().bg(background);
+    let mut header = layout_styled_lines(&format!("{marker} {}", tool.summary), state_style, width);
     if let ToolSummaryKind::Range { start: range_start } = tool.summary_kind {
         apply_first_line_span(
             &mut header,
@@ -1031,41 +1161,41 @@ fn append_tool_entry(lines: &mut Vec<CachedRow>, tool: &ToolTranscriptEntry, wid
     }
     lines.extend(header);
     for preview in &tool.preview {
-        let style = match preview.kind {
+        let content_style = match preview.kind {
             ToolPreviewKind::Normal => Style::default(),
             ToolPreviewKind::Added => Style::default().fg(Color::Green),
             ToolPreviewKind::Removed => Style::default().fg(Color::Red),
             ToolPreviewKind::Dim => Style::default().fg(Color::DarkGray),
             ToolPreviewKind::Command => Style::default().fg(Color::Cyan),
         };
-        append_layout_content(lines, &preview.text, style, width);
-    }
-    if tool.output.is_empty() && matches!(tool.status, ToolStatus::Running) {
-        lines.extend(layout_styled_lines(
-            "  running...",
-            Style::default().fg(Color::DarkGray),
+        append_layout_content(
+            lines,
+            &preview.text,
+            state_style.patch(content_style),
             width,
-        ));
-    } else if !tool.output.is_empty() {
+        );
+    }
+    if tool_output_expanded && !tool.output.is_empty() {
         if !tool.preview.is_empty() {
             lines.push(CachedRow {
-                text: String::new(),
-                style: Style::default(),
-                span_style: None,
+                text: "  ".to_owned(),
+                style: state_style,
+                spans: Vec::new(),
             });
         }
         if tool.output_chunks.is_empty() {
-            append_layout_content(lines, &tool.output, Style::default(), width);
+            append_layout_content(lines, &tool.output, state_style, width);
         } else {
             for chunk in &tool.output_chunks {
-                let style = match (chunk.stream, chunk.kind) {
+                let content_style = match (chunk.stream, chunk.kind) {
                     (Some(ToolOutputStream::Stderr), _) => Style::default().fg(Color::Red),
                     (_, ToolOutputKind::Truncation) => Style::default().fg(Color::DarkGray),
                     (Some(ToolOutputStream::Stdout) | None, _) => Style::default(),
                 };
+                let style = state_style.patch(content_style);
                 match chunk.kind {
                     ToolOutputKind::NumberedLines => {
-                        append_numbered_output(lines, &chunk.text, &chunk.prefixes, width)
+                        append_numbered_output(lines, &chunk.text, &chunk.prefixes, style, width)
                     }
                     ToolOutputKind::Normal | ToolOutputKind::Truncation => {
                         append_layout_content(lines, &chunk.text, style, width);
@@ -1074,34 +1204,42 @@ fn append_tool_entry(lines: &mut Vec<CachedRow>, tool: &ToolTranscriptEntry, wid
             }
         }
     }
-    if let ToolStatus::Finished(metadata) = &tool.status {
-        let status = if metadata.cancelled {
-            "cancelled".to_owned()
-        } else if metadata.timed_out {
-            "timed out".to_owned()
-        } else if let Some(exit_code) = metadata.exit_code {
-            format!("exited {exit_code}")
-        } else if metadata.success {
-            "completed".to_owned()
-        } else {
-            "failed".to_owned()
-        };
-        lines.extend(layout_styled_lines(
-            &format!("  {status} · {:.1}s", metadata.duration.as_secs_f64()),
-            Style::default().fg(Color::DarkGray),
+    match &tool.status {
+        ToolStatus::Running => lines.extend(layout_styled_lines(
+            "  running...",
+            state_style.patch(Style::default().fg(Color::DarkGray)),
             width,
-        ));
-        if metadata.truncated || tool.output_truncated {
-            let spill = metadata
-                .full_output_path
-                .as_ref()
-                .map(|path| format!(" · full output: {}", path.display()))
-                .unwrap_or_default();
+        )),
+        ToolStatus::Finished(metadata) => {
+            let status = if metadata.cancelled {
+                "cancelled".to_owned()
+            } else if metadata.timed_out {
+                "timed out".to_owned()
+            } else if let Some(exit_code) = metadata.exit_code {
+                format!("exited {exit_code}")
+            } else if metadata.success {
+                "completed".to_owned()
+            } else {
+                "failed".to_owned()
+            };
+            let status_style = state_style.patch(Style::default().fg(Color::DarkGray));
             lines.extend(layout_styled_lines(
-                &format!("  output truncated{spill}"),
-                Style::default().fg(Color::DarkGray),
+                &format!("  {status} · {:.1}s", metadata.duration.as_secs_f64()),
+                status_style,
                 width,
             ));
+            if metadata.truncated || tool.output_truncated {
+                let spill = metadata
+                    .full_output_path
+                    .as_ref()
+                    .map(|path| format!(" · full output: {}", path.display()))
+                    .unwrap_or_default();
+                lines.extend(layout_styled_lines(
+                    &format!("  output truncated{spill}"),
+                    status_style,
+                    width,
+                ));
+            }
         }
     }
 }
@@ -1124,7 +1262,11 @@ fn apply_first_line_span(
         let source_end = starts.get(row_index + 1).copied().unwrap_or(text.len());
         let span_start = UnicodeWidthStr::width(&text[row_start..source_offset]);
         let span_width = UnicodeWidthStr::width(&text[source_offset..source_end]);
-        row.span_style = Some((span_start, span_width, style));
+        row.spans.push(StyledRange {
+            start: span_start,
+            width: span_width,
+            style,
+        });
     }
 }
 
@@ -1132,12 +1274,17 @@ fn append_numbered_output(
     lines: &mut Vec<CachedRow>,
     output: &str,
     prefixes: &[Option<usize>],
+    style: Style,
     width: usize,
 ) {
     for (line, prefix_width) in output.split('\n').zip(prefixes.iter().copied()) {
-        let mut rows = layout_styled_lines(&format!("  {line}"), Style::default(), width);
+        let mut rows = layout_styled_lines(&format!("  {line}"), style, width);
         if let (Some(first), Some(prefix_width)) = (rows.first_mut(), prefix_width) {
-            first.span_style = Some((2, prefix_width, Style::default().fg(Color::Cyan)));
+            first.spans.push(StyledRange {
+                start: 2,
+                width: prefix_width,
+                style: Style::default().fg(Color::Cyan),
+            });
         }
         lines.extend(rows);
     }
@@ -1179,7 +1326,7 @@ fn layout_content_section_from(
             rows.push(CachedRow {
                 text: row.clone(),
                 style,
-                span_style: None,
+                spans: Vec::new(),
             });
             starts.push(
                 source_offset.saturating_add(start.saturating_sub(prefix_len).min(line.len())),
@@ -1229,7 +1376,7 @@ fn layout_styled_lines(text: &str, style: Style, width: usize) -> Vec<CachedRow>
         .map(|row| CachedRow {
             text: row,
             style,
-            span_style: None,
+            spans: Vec::new(),
         })
         .collect()
 }
@@ -1256,7 +1403,13 @@ fn entry_render_bytes(entry: &TranscriptEntry) -> usize {
     }
 }
 
-fn footer_text(state: &AppState, width: u16, scroll_from_bottom: usize) -> Line<'static> {
+fn footer_text(
+    state: &AppState,
+    width: u16,
+    scroll_from_bottom: usize,
+    has_expandable_tool_output: bool,
+    tool_output_expanded: bool,
+) -> Line<'static> {
     let model = state
         .active_model()
         .map(ModelRef::display_name)
@@ -1277,39 +1430,95 @@ fn footer_text(state: &AppState, width: u16, scroll_from_bottom: usize) -> Line<
         Some(window) => format!("ctx ~{current}/{}", format_token_count(window)),
         None => format!("ctx ~{current}"),
     };
-    let status = if state.last_error().is_some() {
-        "error — see transcript".to_owned()
+    let (status, critical_status) = if scroll_from_bottom > 0 {
+        (format!("↑ {scroll_from_bottom} lines"), true)
+    } else if state.last_error().is_some() {
+        ("error — see transcript".to_owned(), true)
     } else if state.is_compaction_active() {
-        "compacting".to_owned()
+        ("compacting".to_owned(), true)
     } else if state.is_busy() {
-        "busy".to_owned()
+        ("busy".to_owned(), true)
     } else {
-        "ready".to_owned()
+        ("ready".to_owned(), false)
     };
-    let mut components = vec![model];
-    if let Some(level) = state.thinking_level() {
-        components.push(format!("think {level}"));
-    }
-    components.push(context);
-    let critical_components = components.len();
-    if let Some(branch) = state.git_branch() {
-        components.push(branch.to_owned());
-    }
-    components.push(session);
-    components.push(if scroll_from_bottom > 0 {
-        format!("↑ {scroll_from_bottom} lines")
-    } else {
-        status
-    });
 
-    let limit = width.saturating_sub(1) as usize;
-    while components.len() > critical_components && components.join(" · ").chars().count() > limit
-    {
-        components.pop();
+    let mut core = vec![model];
+    if let Some(level) = state.thinking_level() {
+        core.push(format!("think {level}"));
     }
-    let text = components.join(" · ");
-    let truncated: String = text.chars().take(limit).collect();
-    Line::from(Span::styled(truncated, Style::default().fg(Color::Gray)))
+    core.push(context);
+    let mut branch = state.git_branch().map(str::to_owned);
+    let mut session = Some(session);
+    let mut hint = has_expandable_tool_output.then(|| {
+        if tool_output_expanded {
+            "Ctrl+O collapse tools".to_owned()
+        } else {
+            "Ctrl+O expand tools".to_owned()
+        }
+    });
+    let mut status = Some(status);
+    let limit = width.saturating_sub(1) as usize;
+
+    loop {
+        let text = footer_components(&core, &branch, &session, &hint, &status);
+        if UnicodeWidthStr::width(text.as_str()) <= limit {
+            return Line::from(Span::styled(text, Style::default().fg(Color::Gray)));
+        }
+        if hint.take().is_some() {
+            continue;
+        }
+        if branch.take().is_some() {
+            continue;
+        }
+        if session.take().is_some() {
+            continue;
+        }
+        if !critical_status && status.take().is_some() {
+            continue;
+        }
+        if critical_status {
+            let status = status.as_deref().unwrap_or_default();
+            return Line::from(Span::styled(
+                truncate_display_width(status, limit),
+                Style::default().fg(Color::Gray),
+            ));
+        }
+        return Line::from(Span::styled(
+            truncate_display_width(&text, limit),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+}
+
+fn footer_components(
+    core: &[String],
+    branch: &Option<String>,
+    session: &Option<String>,
+    hint: &Option<String>,
+    status: &Option<String>,
+) -> String {
+    core.iter()
+        .chain(branch.iter())
+        .chain(session.iter())
+        .chain(hint.iter())
+        .chain(status.iter())
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn truncate_display_width(text: &str, limit: usize) -> String {
+    let mut rendered = String::new();
+    let mut width: usize = 0;
+    for character in text.chars() {
+        let character_width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+        if width.saturating_add(character_width) > limit {
+            break;
+        }
+        rendered.push(character);
+        width = width.saturating_add(character_width);
+    }
+    rendered
 }
 
 fn format_token_count(value: u64) -> String {
@@ -1330,12 +1539,32 @@ fn trim_decimal(value: String) -> String {
 mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
-    use ri_core::{AgentEvent, AppState, ModelMessage};
+    use ri_core::{AgentEvent, AppState, ModelCatalog, ModelMessage, ThinkingLevel};
 
     use super::*;
 
     fn terminal() -> Terminal<TestBackend> {
         Terminal::new(TestBackend::new(20, 10)).expect("test terminal")
+    }
+
+    fn thinking_picker() -> ThinkingPickerState {
+        let catalog = ModelCatalog::from_json(
+            "models.json",
+            r#"{
+                "providers": {
+                    "provider": {
+                        "baseUrl": "https://example.test",
+                        "api": "openai-responses",
+                        "models": [{"id": "model", "reasoning": true}]
+                    }
+                }
+            }"#,
+        )
+        .expect("thinking model catalog");
+        let model = catalog
+            .resolve(None, Some("model"))
+            .expect("thinking model");
+        ThinkingPickerState::new(&model, Some(ThinkingLevel::High))
     }
 
     #[test]
@@ -1387,6 +1616,46 @@ mod tests {
         scroll.scroll_down(usize::MAX);
         assert_eq!(scroll.top_row, 40);
         assert_eq!(scroll.from_bottom(), 0);
+    }
+
+    #[test]
+    fn cached_rows_patch_multiple_display_column_spans_over_the_base_style() {
+        let cache = TranscriptLayoutCache {
+            fallback: Some(CachedLayout {
+                revision: 0,
+                rows: vec![CachedRow {
+                    text: "界abcde".to_owned(),
+                    style: Style::default().bg(TOOL_SUCCESS_BACKGROUND),
+                    spans: vec![
+                        StyledRange {
+                            start: 2,
+                            width: 2,
+                            style: Style::default().fg(Color::Cyan),
+                        },
+                        StyledRange {
+                            start: 5,
+                            width: 1,
+                            style: Style::default().fg(Color::Red),
+                        },
+                    ],
+                }],
+                has_expandable_tool_output: false,
+            }),
+            ..TranscriptLayoutCache::default()
+        };
+        let area = Rect::new(0, 0, 10, 1);
+        let mut buffer = Buffer::empty(area);
+        let mut stats = RenderStats::default();
+
+        cache.render_visible(area, 0, &mut stats, &mut buffer);
+
+        assert_eq!(buffer[(2, 0)].symbol(), "a");
+        assert_eq!(buffer[(2, 0)].fg, Color::Cyan);
+        assert_eq!(buffer[(2, 0)].bg, TOOL_SUCCESS_BACKGROUND);
+        assert_eq!(buffer[(3, 0)].fg, Color::Cyan);
+        assert_eq!(buffer[(5, 0)].symbol(), "d");
+        assert_eq!(buffer[(5, 0)].fg, Color::Red);
+        assert_eq!(buffer[(5, 0)].bg, TOOL_SUCCESS_BACKGROUND);
     }
 
     #[test]
@@ -1693,8 +1962,54 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(8, 5)).expect("test terminal");
 
         renderer
-            .draw_interactive(&mut terminal, &state, &mut scroll, &suggestions)
+            .draw_interactive(&mut terminal, &state, &mut scroll, &suggestions, None)
             .expect("narrow suggestion draw should succeed");
+    }
+
+    #[test]
+    fn thinking_picker_overlay_stays_content_sized() {
+        let picker = thinking_picker();
+        let frame_area = Rect::new(0, 0, 80, 24);
+        let editor_area = Rect::new(0, 20, 80, 3);
+
+        let (area, visible_rows) = thinking_picker_layout(frame_area, editor_area, &picker)
+            .expect("thinking picker should fit");
+
+        assert_eq!(visible_rows, picker.len());
+        assert_eq!(area.width, 12);
+        assert_eq!(area.height as usize, picker.len() + 2);
+        assert!(area.width < frame_area.width);
+        assert!(area.height < frame_area.height);
+        assert_eq!(area.bottom(), editor_area.y);
+    }
+
+    #[test]
+    fn thinking_picker_hides_command_suggestions() {
+        let mut state = AppState::new();
+        state.insert_text("/");
+        let suggestions = CommandSuggestions::default();
+        let picker = thinking_picker();
+        let mut scroll = TranscriptScroll::default();
+        let mut renderer = TuiRenderer::new();
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).expect("test terminal");
+
+        renderer
+            .draw_interactive(&mut terminal, &state, &mut scroll, &suggestions, None)
+            .expect("suggestion draw should succeed");
+        assert!(buffer_contains(terminal.backend().buffer(), "commands"));
+
+        renderer
+            .draw_interactive(
+                &mut terminal,
+                &state,
+                &mut scroll,
+                &suggestions,
+                Some(&picker),
+            )
+            .expect("thinking picker draw should succeed");
+        let buffer = terminal.backend().buffer();
+        assert!(buffer_contains(buffer, "Thinking"));
+        assert!(!buffer_contains(buffer, "commands"));
     }
 
     #[test]
@@ -1907,7 +2222,7 @@ mod tests {
         state.insert_text("also add tests");
         state.queue_input().expect("queued input");
         let entry_id = state.transcript_display_entries()[0].id;
-        let queued = layout_entry(&state.transcript_display_entries()[0].entry, 80);
+        let queued = layout_entry(&state.transcript_display_entries()[0].entry, 80, false);
         assert!(queued.iter().any(|row| row.text == "▶ you · queued"));
 
         state.reduce(AgentEvent::SteeringMessageDelivered {
@@ -1915,13 +2230,13 @@ mod tests {
         });
         assert_eq!(state.transcript_display_entries().len(), 1);
         assert_eq!(state.transcript_display_entries()[0].id, entry_id);
-        let delivered = layout_entry(&state.transcript_display_entries()[0].entry, 80);
+        let delivered = layout_entry(&state.transcript_display_entries()[0].entry, 80, false);
         assert!(delivered.iter().any(|row| row.text == "▶ you"));
         assert!(!delivered.iter().any(|row| row.text.contains("queued")));
     }
 
     #[test]
-    fn tool_layout_renders_cached_semantic_presentation_and_result() {
+    fn tool_layout_collapses_raw_output_but_keeps_previews_and_status() {
         let cases = [
             (
                 "read",
@@ -1959,24 +2274,118 @@ mod tests {
             state.reduce(AgentEvent::ToolExecutionFinished {
                 call_id: name.to_owned(),
                 name: name.to_owned(),
-                result: ri_core::ToolExecutionResult::success("tool result"),
+                result: ri_core::ToolExecutionResult::success("raw tool result"),
             });
-            let rendered = layout_entry(&state.transcript_display_entries()[0].entry, 200)
+            let collapsed = layout_entry(&state.transcript_display_entries()[0].entry, 200, false)
+                .into_iter()
+                .map(|row| row.text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let expanded = layout_entry(&state.transcript_display_entries()[0].entry, 200, true)
                 .into_iter()
                 .map(|row| row.text)
                 .collect::<Vec<_>>()
                 .join("\n");
 
-            assert!(rendered.contains(expected_title), "{rendered}");
+            assert!(collapsed.contains(expected_title), "{collapsed}");
             assert!(
                 expected_preview
                     .lines()
-                    .all(|line| rendered.contains(&format!("  {line}"))),
-                "{rendered}"
+                    .all(|line| collapsed.contains(&format!("  {line}"))),
+                "{collapsed}"
             );
-            assert!(rendered.contains("tool result"), "{rendered}");
-            assert!(!rendered.contains("{\""), "{rendered}");
+            assert!(collapsed.contains("completed"), "{collapsed}");
+            assert!(!collapsed.contains("raw tool result"), "{collapsed}");
+            assert!(expanded.contains("raw tool result"), "{expanded}");
+            assert!(expanded.contains("completed"), "{expanded}");
+            assert!(!expanded.contains("{\""), "{expanded}");
         }
+    }
+
+    #[test]
+    fn running_tool_status_stays_visible_when_output_is_collapsed_or_expanded() {
+        let mut state = AppState::new();
+        state.reduce(AgentEvent::ToolExecutionStarted {
+            call_id: "bash".to_owned(),
+            name: "bash".to_owned(),
+            arguments: r#"{"command":"run tests"}"#.to_owned(),
+        });
+        state.reduce(AgentEvent::ToolExecutionOutput {
+            call_id: "bash".to_owned(),
+            stream: ToolOutputStream::Stdout,
+            chunk: "raw streaming output".to_owned(),
+        });
+
+        let collapsed = layout_entry(&state.transcript_display_entries()[0].entry, 200, false)
+            .into_iter()
+            .map(|row| row.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let expanded = layout_entry(&state.transcript_display_entries()[0].entry, 200, true)
+            .into_iter()
+            .map(|row| row.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(collapsed.contains("  run tests"));
+        assert!(collapsed.contains("running..."));
+        assert!(!collapsed.contains("raw streaming output"));
+        assert!(expanded.contains("running..."));
+        assert!(expanded.contains("raw streaming output"));
+    }
+
+    #[test]
+    fn renderer_defaults_to_collapsed_and_toggle_reflows_once() {
+        let mut state = AppState::new();
+        for (call_id, command, output, success) in [
+            ("one", "echo one", "RAW_ONE", true),
+            ("two", "echo two", "RAW_TWO", false),
+        ] {
+            state.reduce(AgentEvent::ToolExecutionStarted {
+                call_id: call_id.to_owned(),
+                name: "bash".to_owned(),
+                arguments: format!(r#"{{"command":"{command}"}}"#),
+            });
+            state.reduce(AgentEvent::ToolExecutionFinished {
+                call_id: call_id.to_owned(),
+                name: "bash".to_owned(),
+                result: if success {
+                    ri_core::ToolExecutionResult::success(output)
+                } else {
+                    ri_core::ToolExecutionResult::failure(output)
+                },
+            });
+        }
+        let mut renderer = TuiRenderer::new();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("test terminal");
+
+        assert!(!renderer.tool_output_expanded());
+        renderer.draw(&mut terminal, &state, 0).unwrap();
+        let collapsed_rows = renderer.transcript_total_rows();
+        let collapsed = buffer_text(terminal.backend().buffer());
+        assert!(collapsed.contains("echo one"));
+        assert!(collapsed.contains("completed"));
+        assert!(collapsed.contains("failed"));
+        assert!(!collapsed.contains("RAW_ONE"));
+        assert!(!collapsed.contains("RAW_TWO"));
+        assert_eq!(collapsed.matches("Ctrl+O").count(), 1);
+        assert!(collapsed.contains("Ctrl+O expand tools"));
+
+        renderer.toggle_tool_output();
+        renderer.draw(&mut terminal, &state, 0).unwrap();
+        let expanded_rows = renderer.transcript_total_rows();
+        let expanded = buffer_text(terminal.backend().buffer());
+        assert!(renderer.tool_output_expanded());
+        assert!(expanded_rows > collapsed_rows);
+        assert!(renderer.stats().entries_reflowed >= 2);
+        assert!(expanded.contains("RAW_ONE"));
+        assert!(expanded.contains("RAW_TWO"));
+        assert_eq!(expanded.matches("Ctrl+O").count(), 1);
+        assert!(expanded.contains("Ctrl+O collapse tools"));
+
+        renderer.draw(&mut terminal, &state, 0).unwrap();
+        assert_eq!(renderer.stats().entries_reflowed, 0);
+        assert_eq!(renderer.stats().cache_misses, 0);
     }
 
     #[test]
@@ -1992,26 +2401,30 @@ mod tests {
             name: "read".to_owned(),
             result: ri_core::ToolExecutionResult::success("18 | fn foo() {"),
         });
-        let read_rows = layout_entry(&state.transcript_display_entries()[0].entry, 200);
+        let read_rows = layout_entry(&state.transcript_display_entries()[0].entry, 200, true);
         let read_header = read_rows.first().expect("read header");
-        assert_eq!(read_header.style.fg, Some(Color::Green));
+        assert_eq!(read_header.style.fg, None);
+        assert_eq!(read_header.style.bg, Some(TOOL_SUCCESS_BACKGROUND));
         assert_eq!(
             read_header
-                .span_style
-                .map(|(start, width, style)| (start, width, style.fg)),
+                .spans
+                .first()
+                .map(|span| (span.start, span.width, span.style.fg)),
             Some((
                 UnicodeWidthStr::width("✓ read src/foo.rs"),
                 UnicodeWidthStr::width(" · lines 10–29"),
                 Some(Color::Cyan)
             ))
         );
-        let wrapped_header = layout_entry(&state.transcript_display_entries()[0].entry, 12);
+        let wrapped_header = layout_entry(&state.transcript_display_entries()[0].entry, 12, true);
         assert_eq!(
             wrapped_header
                 .iter()
-                .filter(|row| row
-                    .span_style
-                    .is_some_and(|(_, _, style)| style.fg == Some(Color::Cyan)))
+                .filter(|row| {
+                    row.spans
+                        .iter()
+                        .any(|span| span.style.fg == Some(Color::Cyan))
+                })
                 .count(),
             3
         );
@@ -2020,10 +2433,14 @@ mod tests {
             .find(|row| row.text == "  18 | fn foo() {")
             .expect("read output");
         assert_eq!(read_output.style.fg, None);
+        assert_eq!(read_output.style.bg, Some(TOOL_SUCCESS_BACKGROUND));
         assert_eq!(
-            read_output
-                .span_style
-                .map(|(start, width, style)| (&read_output.text[start..start + width], style.fg)),
+            read_output.spans.first().map(|span| {
+                (
+                    &read_output.text[span.start..span.start + span.width],
+                    span.style.fg,
+                )
+            }),
             Some(("18 | ", Some(Color::Cyan)))
         );
 
@@ -2033,25 +2450,23 @@ mod tests {
             name: "edit".to_owned(),
             arguments: r#"{"path":"src/foo.rs","old_text":"old","new_text":"new"}"#.to_owned(),
         });
-        let edit_rows = layout_entry(&edit_state.transcript_display_entries()[0].entry, 200);
-        assert_eq!(
-            edit_rows
-                .iter()
-                .find(|row| row.text == "  -old")
-                .expect("removed line")
-                .style
-                .fg,
-            Some(Color::Red)
+        let edit_rows = layout_entry(
+            &edit_state.transcript_display_entries()[0].entry,
+            200,
+            false,
         );
-        assert_eq!(
-            edit_rows
-                .iter()
-                .find(|row| row.text == "  +new")
-                .expect("added line")
-                .style
-                .fg,
-            Some(Color::Green)
-        );
+        let removed = edit_rows
+            .iter()
+            .find(|row| row.text == "  -old")
+            .expect("removed line");
+        assert_eq!(removed.style.fg, Some(Color::Red));
+        assert_eq!(removed.style.bg, Some(TOOL_RUNNING_BACKGROUND));
+        let added = edit_rows
+            .iter()
+            .find(|row| row.text == "  +new")
+            .expect("added line");
+        assert_eq!(added.style.fg, Some(Color::Green));
+        assert_eq!(added.style.bg, Some(TOOL_RUNNING_BACKGROUND));
 
         let mut bash_state = AppState::new();
         bash_state.reduce(AgentEvent::ToolExecutionStarted {
@@ -2069,34 +2484,124 @@ mod tests {
             stream: ToolOutputStream::Stderr,
             chunk: "error output".to_owned(),
         });
-        let bash_rows = layout_entry(&bash_state.transcript_display_entries()[0].entry, 200);
-        assert_eq!(
-            bash_rows
-                .iter()
-                .find(|row| row.text == "  run tests")
-                .expect("command")
-                .style
-                .fg,
-            Some(Color::Cyan)
-        );
-        assert_eq!(
-            bash_rows
-                .iter()
-                .find(|row| row.text == "  normal output")
-                .expect("stdout")
-                .style
-                .fg,
-            None
-        );
-        assert_eq!(
-            bash_rows
-                .iter()
-                .find(|row| row.text == "  error output")
-                .expect("stderr")
-                .style
-                .fg,
-            Some(Color::Red)
-        );
+        let bash_rows = layout_entry(&bash_state.transcript_display_entries()[0].entry, 200, true);
+        let command = bash_rows
+            .iter()
+            .find(|row| row.text == "  run tests")
+            .expect("command");
+        assert_eq!(command.style.fg, Some(Color::Cyan));
+        assert_eq!(command.style.bg, Some(TOOL_RUNNING_BACKGROUND));
+        let stdout = bash_rows
+            .iter()
+            .find(|row| row.text == "  normal output")
+            .expect("stdout");
+        assert_eq!(stdout.style.fg, None);
+        assert_eq!(stdout.style.bg, Some(TOOL_RUNNING_BACKGROUND));
+        let stderr = bash_rows
+            .iter()
+            .find(|row| row.text == "  error output")
+            .expect("stderr");
+        assert_eq!(stderr.style.fg, Some(Color::Red));
+        assert_eq!(stderr.style.bg, Some(TOOL_RUNNING_BACKGROUND));
+    }
+
+    #[test]
+    fn test_backend_preserves_tool_foregrounds_over_distinct_state_backgrounds() {
+        let mut state = AppState::new();
+        state.reduce(AgentEvent::ToolExecutionStarted {
+            call_id: "running".to_owned(),
+            name: "bash".to_owned(),
+            arguments: r#"{"command":"still running"}"#.to_owned(),
+        });
+        state.reduce(AgentEvent::ToolExecutionOutput {
+            call_id: "running".to_owned(),
+            stream: ToolOutputStream::Stdout,
+            chunk: "live output".to_owned(),
+        });
+        state.reduce(AgentEvent::ToolExecutionStarted {
+            call_id: "edit".to_owned(),
+            name: "edit".to_owned(),
+            arguments: r#"{"path":"src/foo.rs","old_text":"old","new_text":"new"}"#.to_owned(),
+        });
+        state.reduce(AgentEvent::ToolExecutionFinished {
+            call_id: "edit".to_owned(),
+            name: "edit".to_owned(),
+            result: ri_core::ToolExecutionResult::success("edited"),
+        });
+        state.reduce(AgentEvent::ToolExecutionStarted {
+            call_id: "success".to_owned(),
+            name: "bash".to_owned(),
+            arguments: r#"{"command":"successful command"}"#.to_owned(),
+        });
+        state.reduce(AgentEvent::ToolExecutionOutput {
+            call_id: "success".to_owned(),
+            stream: ToolOutputStream::Stderr,
+            chunk: "stderr survives success".to_owned(),
+        });
+        state.reduce(AgentEvent::ToolExecutionFinished {
+            call_id: "success".to_owned(),
+            name: "bash".to_owned(),
+            result: ri_core::ToolExecutionResult::success("stderr survives success"),
+        });
+        state.reduce(AgentEvent::ToolExecutionStarted {
+            call_id: "failure".to_owned(),
+            name: "bash".to_owned(),
+            arguments: r#"{"command":"failing command"}"#.to_owned(),
+        });
+        state.reduce(AgentEvent::ToolExecutionOutput {
+            call_id: "failure".to_owned(),
+            stream: ToolOutputStream::Stderr,
+            chunk: "stderr survives failure".to_owned(),
+        });
+        state.reduce(AgentEvent::ToolExecutionFinished {
+            call_id: "failure".to_owned(),
+            name: "bash".to_owned(),
+            result: ri_core::ToolExecutionResult::failure("stderr survives failure"),
+        });
+        state.reduce(AgentEvent::ToolExecutionStarted {
+            call_id: "read".to_owned(),
+            name: "read".to_owned(),
+            arguments: r#"{"path":"src/foo.rs","offset":10,"limit":20}"#.to_owned(),
+        });
+        state.reduce(AgentEvent::ToolExecutionFinished {
+            call_id: "read".to_owned(),
+            name: "read".to_owned(),
+            result: ri_core::ToolExecutionResult::success("10 | line"),
+        });
+
+        let mut renderer = TuiRenderer::new();
+        renderer.toggle_tool_output();
+        let mut terminal = Terminal::new(TestBackend::new(100, 60)).expect("test terminal");
+        renderer.draw(&mut terminal, &state, 0).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let running = find_text_cell(buffer, "▶ bash").expect("running header");
+        let success = find_text_cell(buffer, "✓ edit").expect("success header");
+        let failure = find_text_cell(buffer, "✗ bash").expect("failure header");
+        assert_eq!(buffer[running].bg, TOOL_RUNNING_BACKGROUND);
+        assert_eq!(buffer[success].bg, TOOL_SUCCESS_BACKGROUND);
+        assert_eq!(buffer[failure].bg, TOOL_ERROR_BACKGROUND);
+        assert_ne!(buffer[running].bg, buffer[success].bg);
+        assert_ne!(buffer[success].bg, buffer[failure].bg);
+
+        let removed = find_text_cell(buffer, "-old").expect("removed diff line");
+        let added = find_text_cell(buffer, "+new").expect("added diff line");
+        assert_eq!(buffer[removed].fg, Color::Red);
+        assert_eq!(buffer[removed].bg, TOOL_SUCCESS_BACKGROUND);
+        assert_eq!(buffer[added].fg, Color::Green);
+        assert_eq!(buffer[added].bg, TOOL_SUCCESS_BACKGROUND);
+
+        let success_stderr = find_text_cell(buffer, "stderr survives success").expect("stderr");
+        let failure_stderr = find_text_cell(buffer, "stderr survives failure").expect("stderr");
+        assert_eq!(buffer[success_stderr].fg, Color::Red);
+        assert_eq!(buffer[success_stderr].bg, TOOL_SUCCESS_BACKGROUND);
+        assert_eq!(buffer[failure_stderr].fg, Color::Red);
+        assert_eq!(buffer[failure_stderr].bg, TOOL_ERROR_BACKGROUND);
+
+        let range = find_text_cell(buffer, "· lines 10–29").expect("range highlight");
+        assert_eq!(buffer[range].fg, Color::Cyan);
+        assert_eq!(buffer[range].bg, TOOL_SUCCESS_BACKGROUND);
+        assert_eq!(buffer[(98, success.1)].bg, Color::Reset);
     }
 
     #[test]
@@ -2218,7 +2723,7 @@ mod tests {
         }));
         state.set_git_branch(Some("feature/footer".to_owned()));
 
-        let wide = footer_text(&state, 120, 0)
+        let wide = footer_text(&state, 120, 0, false, false)
             .spans
             .iter()
             .map(|span| span.content.as_ref())
@@ -2228,7 +2733,7 @@ mod tests {
         assert!(!wide.contains("Enter"));
         assert!(!wide.contains("Esc"));
 
-        let narrow = footer_text(&state, 24, 0)
+        let narrow = footer_text(&state, 24, 0, false, false)
             .spans
             .iter()
             .map(|span| span.content.as_ref())
@@ -2239,14 +2744,32 @@ mod tests {
     }
 
     #[test]
+    fn footer_tool_hint_is_global_and_lower_priority_than_critical_status() {
+        let mut state = AppState::new();
+        let collapsed = footer_text(&state, 120, 0, true, false).to_string();
+        let expanded = footer_text(&state, 120, 0, true, true).to_string();
+        assert_eq!(collapsed.matches("Ctrl+O").count(), 1);
+        assert!(collapsed.contains("Ctrl+O expand tools"));
+        assert_eq!(expanded.matches("Ctrl+O").count(), 1);
+        assert!(expanded.contains("Ctrl+O collapse tools"));
+
+        state.reduce(AgentEvent::Error(ri_core::AgentError::non_terminal(
+            "temporary command error",
+        )));
+        let narrow = footer_text(&state, 24, 0, true, false).to_string();
+        assert!(!narrow.contains("Ctrl+O"));
+        assert!(narrow.contains("error"));
+    }
+
+    #[test]
     fn scroll_indicator_only_appears_away_from_the_bottom() {
         let state = AppState::new();
-        let at_bottom = footer_text(&state, 200, 0)
+        let at_bottom = footer_text(&state, 200, 0, false, false)
             .spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
-        let scrolled = footer_text(&state, 200, 42)
+        let scrolled = footer_text(&state, 200, 42, false, false)
             .spans
             .iter()
             .map(|span| span.content.as_ref())
@@ -2260,7 +2783,7 @@ mod tests {
     #[test]
     fn footer_status_prioritizes_errors_then_compaction_then_busy_then_ready() {
         let mut state = AppState::new();
-        let idle = footer_text(&state, 200, 0)
+        let idle = footer_text(&state, 200, 0, false, false)
             .spans
             .iter()
             .map(|span| span.content.as_ref())
@@ -2268,7 +2791,7 @@ mod tests {
         assert!(idle.contains("ready"));
 
         state.reduce(AgentEvent::TurnStarted);
-        let busy = footer_text(&state, 200, 0)
+        let busy = footer_text(&state, 200, 0, false, false)
             .spans
             .iter()
             .map(|span| span.content.as_ref())
@@ -2279,7 +2802,7 @@ mod tests {
             reason: ri_core::StopReason::Stop,
         });
         state.set_compaction_active(true);
-        let compacting = footer_text(&state, 200, 0)
+        let compacting = footer_text(&state, 200, 0, false, false)
             .spans
             .iter()
             .map(|span| span.content.as_ref())
@@ -2290,7 +2813,7 @@ mod tests {
         state.reduce(AgentEvent::Error(ri_core::AgentError::non_terminal(
             "temporary command error",
         )));
-        let error = footer_text(&state, 200, 0)
+        let error = footer_text(&state, 200, 0, false, false)
             .spans
             .iter()
             .map(|span| span.content.as_ref())
@@ -2307,7 +2830,7 @@ mod tests {
             provider_message,
         )));
 
-        let footer = footer_text(&state, 200, 0);
+        let footer = footer_text(&state, 200, 0, false, false);
         let text = footer
             .spans
             .iter()
@@ -2317,6 +2840,31 @@ mod tests {
         assert!(text.contains("error — see transcript"));
         assert!(!text.contains(provider_message));
         assert!(text.len() < 120);
+    }
+
+    fn buffer_text(buffer: &Buffer) -> String {
+        (buffer.area.y..buffer.area.bottom())
+            .map(|y| {
+                (buffer.area.x..buffer.area.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn find_text_cell(buffer: &Buffer, needle: &str) -> Option<(u16, u16)> {
+        for y in buffer.area.y..buffer.area.bottom() {
+            for x in buffer.area.x..buffer.area.right() {
+                let suffix = (x..buffer.area.right())
+                    .map(|column| buffer[(column, y)].symbol())
+                    .collect::<String>();
+                if suffix.starts_with(needle) {
+                    return Some((x, y));
+                }
+            }
+        }
+        None
     }
 
     fn buffer_contains(buffer: &Buffer, needle: &str) -> bool {

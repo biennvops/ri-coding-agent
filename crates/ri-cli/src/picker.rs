@@ -12,6 +12,7 @@ pub(crate) enum PickerAction {
     Down,
     Confirm,
     Cancel,
+    Redraw,
 }
 
 pub(crate) fn action_for(key: KeyEvent) -> Option<PickerAction> {
@@ -27,12 +28,17 @@ pub(crate) fn action_for(key: KeyEvent) -> Option<PickerAction> {
     }
 }
 
+fn action_for_event(event: Event) -> Option<PickerAction> {
+    match event {
+        Event::Key(key) => action_for(key),
+        Event::Resize(..) => Some(PickerAction::Redraw),
+        _ => None,
+    }
+}
+
 pub(crate) fn read_action() -> Result<PickerAction> {
     loop {
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-        if let Some(action) = action_for(key) {
+        if let Some(action) = action_for_event(event::read()?) {
             return Ok(action);
         }
     }
@@ -152,6 +158,14 @@ pub(crate) fn draw_picker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resize_events_request_a_redraw() {
+        assert_eq!(
+            action_for_event(Event::Resize(120, 40)),
+            Some(PickerAction::Redraw)
+        );
+    }
 
     #[test]
     fn picker_selection_clamps_or_wraps() {
