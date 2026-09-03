@@ -20,6 +20,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::commands::{matching_commands, CommandSuggestions};
 use crate::input::VisualLayout;
+use crate::thinking_picker::ThinkingPickerState;
 
 const MAX_VISIBLE_COMMAND_SUGGESTIONS: usize = 6;
 const TOOL_RUNNING_BACKGROUND: Color = Color::Rgb(48, 42, 18);
@@ -167,7 +168,13 @@ impl TuiRenderer {
     ) -> Result<(), B::Error> {
         self.last_stats = RenderStats::default();
         terminal.draw(|frame| {
-            self.render_frame(frame, state, Viewport::FromBottom(scroll_from_bottom), None);
+            self.render_frame(
+                frame,
+                state,
+                Viewport::FromBottom(scroll_from_bottom),
+                None,
+                None,
+            );
         })?;
         Ok(())
     }
@@ -178,6 +185,7 @@ impl TuiRenderer {
         state: &AppState,
         scroll: &mut TranscriptScroll,
         suggestions: &CommandSuggestions,
+        thinking_picker: Option<&ThinkingPickerState>,
     ) -> Result<(), B::Error> {
         self.last_stats = RenderStats::default();
         terminal.draw(|frame| {
@@ -186,6 +194,7 @@ impl TuiRenderer {
                 state,
                 Viewport::Interactive(scroll),
                 Some(suggestions),
+                thinking_picker,
             );
         })?;
         Ok(())
@@ -197,6 +206,7 @@ impl TuiRenderer {
         state: &AppState,
         viewport: Viewport<'_>,
         suggestions: Option<&CommandSuggestions>,
+        thinking_picker: Option<&ThinkingPickerState>,
     ) {
         let area = frame.area();
         let editor_width = area.width.saturating_sub(2).max(1) as usize;
@@ -277,7 +287,9 @@ impl TuiRenderer {
             .block(Block::default().borders(Borders::ALL).title(" input "))
             .scroll((editor_scroll.min(u16::MAX as usize) as u16, 0));
         frame.render_widget(editor, chunks[1]);
-        if let Some(suggestions) = suggestions {
+        if let Some(picker) = thinking_picker {
+            render_thinking_picker(frame, picker, chunks[1]);
+        } else if let Some(suggestions) = suggestions {
             render_command_suggestions(frame, state, suggestions, chunks[1]);
         }
 
@@ -290,7 +302,7 @@ impl TuiRenderer {
         );
         frame.render_widget(Paragraph::new(footer), chunks[2]);
 
-        if chunks[1].height > 2 {
+        if thinking_picker.is_none() && chunks[1].height > 2 {
             let x = chunks[1]
                 .x
                 .saturating_add(1)
@@ -308,6 +320,48 @@ impl TuiRenderer {
             frame.set_cursor_position((x.min(max_x), y.min(max_y)));
         }
     }
+}
+
+fn render_thinking_picker(frame: &mut Frame<'_>, picker: &ThinkingPickerState, editor_area: Rect) {
+    let Some((area, visible_rows)) = thinking_picker_layout(frame.area(), editor_area, picker)
+    else {
+        return;
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(picker.rows(visible_rows))
+            .block(Block::default().borders(Borders::ALL).title(" Thinking ")),
+        area,
+    );
+}
+
+fn thinking_picker_layout(
+    frame_area: Rect,
+    editor_area: Rect,
+    picker: &ThinkingPickerState,
+) -> Option<(Rect, usize)> {
+    let available_height = editor_area.y.saturating_sub(frame_area.y) as usize;
+    let available_width = editor_area.width.saturating_sub(2) as usize;
+    if picker.len() == 0 || available_height < 3 || available_width < 4 {
+        return None;
+    }
+
+    let visible_rows = picker.len().min(available_height.saturating_sub(2));
+    let desired_width = picker
+        .longest_level_width()
+        .saturating_add(4)
+        .max(UnicodeWidthStr::width(" Thinking ").saturating_add(2));
+    let width = desired_width.min(available_width) as u16;
+    let height = visible_rows.saturating_add(2) as u16;
+    Some((
+        Rect::new(
+            editor_area.x.saturating_add(1),
+            editor_area.y.saturating_sub(height),
+            width,
+            height,
+        ),
+        visible_rows,
+    ))
 }
 
 fn render_command_suggestions(
@@ -1485,12 +1539,32 @@ fn trim_decimal(value: String) -> String {
 mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
-    use ri_core::{AgentEvent, AppState, ModelMessage};
+    use ri_core::{AgentEvent, AppState, ModelCatalog, ModelMessage, ThinkingLevel};
 
     use super::*;
 
     fn terminal() -> Terminal<TestBackend> {
         Terminal::new(TestBackend::new(20, 10)).expect("test terminal")
+    }
+
+    fn thinking_picker() -> ThinkingPickerState {
+        let catalog = ModelCatalog::from_json(
+            "models.json",
+            r#"{
+                "providers": {
+                    "provider": {
+                        "baseUrl": "https://example.test",
+                        "api": "openai-responses",
+                        "models": [{"id": "model", "reasoning": true}]
+                    }
+                }
+            }"#,
+        )
+        .expect("thinking model catalog");
+        let model = catalog
+            .resolve(None, Some("model"))
+            .expect("thinking model");
+        ThinkingPickerState::new(&model, Some(ThinkingLevel::High))
     }
 
     #[test]
@@ -1888,8 +1962,54 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(8, 5)).expect("test terminal");
 
         renderer
-            .draw_interactive(&mut terminal, &state, &mut scroll, &suggestions)
+            .draw_interactive(&mut terminal, &state, &mut scroll, &suggestions, None)
             .expect("narrow suggestion draw should succeed");
+    }
+
+    #[test]
+    fn thinking_picker_overlay_stays_content_sized() {
+        let picker = thinking_picker();
+        let frame_area = Rect::new(0, 0, 80, 24);
+        let editor_area = Rect::new(0, 20, 80, 3);
+
+        let (area, visible_rows) = thinking_picker_layout(frame_area, editor_area, &picker)
+            .expect("thinking picker should fit");
+
+        assert_eq!(visible_rows, picker.len());
+        assert_eq!(area.width, 12);
+        assert_eq!(area.height as usize, picker.len() + 2);
+        assert!(area.width < frame_area.width);
+        assert!(area.height < frame_area.height);
+        assert_eq!(area.bottom(), editor_area.y);
+    }
+
+    #[test]
+    fn thinking_picker_hides_command_suggestions() {
+        let mut state = AppState::new();
+        state.insert_text("/");
+        let suggestions = CommandSuggestions::default();
+        let picker = thinking_picker();
+        let mut scroll = TranscriptScroll::default();
+        let mut renderer = TuiRenderer::new();
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).expect("test terminal");
+
+        renderer
+            .draw_interactive(&mut terminal, &state, &mut scroll, &suggestions, None)
+            .expect("suggestion draw should succeed");
+        assert!(buffer_contains(terminal.backend().buffer(), "commands"));
+
+        renderer
+            .draw_interactive(
+                &mut terminal,
+                &state,
+                &mut scroll,
+                &suggestions,
+                Some(&picker),
+            )
+            .expect("thinking picker draw should succeed");
+        let buffer = terminal.backend().buffer();
+        assert!(buffer_contains(buffer, "Thinking"));
+        assert!(!buffer_contains(buffer, "commands"));
     }
 
     #[test]
