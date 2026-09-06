@@ -134,10 +134,17 @@ pub struct ToolDefinition {
     pub parameters: Value,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolChoice {
+    Auto,
+    None,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelRequest {
     pub messages: Vec<ModelMessage>,
     pub tools: Vec<ToolDefinition>,
+    pub tool_choice: Option<ToolChoice>,
     pub max_tokens: Option<u64>,
     pub reasoning_effort: Option<String>,
     pub sampling_params: BTreeMap<String, Value>,
@@ -148,6 +155,7 @@ impl ModelRequest {
         Self {
             messages: vec![ModelMessage::user(text)],
             tools: Vec::new(),
+            tool_choice: None,
             max_tokens: None,
             reasoning_effort: None,
             sampling_params: BTreeMap::new(),
