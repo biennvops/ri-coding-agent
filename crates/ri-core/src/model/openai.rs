@@ -1228,13 +1228,13 @@ fn responses_body(model: &ResolvedModel, request: &ModelRequest) -> Value {
             body.insert("reasoning".to_owned(), json!({"effort": effort}));
         }
     }
-    if let Some(tool_choice) = request.tool_choice {
-        body.insert(
-            "tool_choice".to_owned(),
-            Value::String(openai_tool_choice(tool_choice).to_owned()),
-        );
-    }
     if !request.tools.is_empty() {
+        if let Some(tool_choice) = request.tool_choice {
+            body.insert(
+                "tool_choice".to_owned(),
+                Value::String(openai_tool_choice(tool_choice).to_owned()),
+            );
+        }
         body.insert(
             "tools".to_owned(),
             Value::Array(request.tools.iter().map(responses_tool).collect()),
@@ -1299,13 +1299,13 @@ fn completions_body(model: &ResolvedModel, request: &ModelRequest) -> Value {
             );
         }
     }
-    if let Some(tool_choice) = request.tool_choice {
-        body.insert(
-            "tool_choice".to_owned(),
-            Value::String(openai_tool_choice(tool_choice).to_owned()),
-        );
-    }
     if !request.tools.is_empty() {
+        if let Some(tool_choice) = request.tool_choice {
+            body.insert(
+                "tool_choice".to_owned(),
+                Value::String(openai_tool_choice(tool_choice).to_owned()),
+            );
+        }
         body.insert(
             "tools".to_owned(),
             Value::Array(request.tools.iter().map(completions_tool).collect()),
@@ -2170,7 +2170,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_explicit_no_tools_serializes_tool_choice_none() {
+    fn responses_explicit_no_tools_omits_tool_choice() {
         let model = test_model(
             ApiKind::OpenAiResponses,
             "https://example.test/v1".to_owned(),
@@ -2179,12 +2179,12 @@ mod tests {
         request.tool_choice = Some(ToolChoice::None);
         let (_, body) = request_for(&model, &request).expect("request should build");
 
-        assert_eq!(body["tool_choice"], "none");
+        assert!(body.get("tool_choice").is_none());
         assert!(body.get("tools").is_none());
     }
 
     #[test]
-    fn completions_explicit_no_tools_serializes_tool_choice_none() {
+    fn completions_explicit_no_tools_omits_tool_choice() {
         let model = test_model(
             ApiKind::OpenAiCompletions,
             "https://example.test/v1".to_owned(),
@@ -2193,7 +2193,7 @@ mod tests {
         request.tool_choice = Some(ToolChoice::None);
         let (_, body) = request_for(&model, &request).expect("request should build");
 
-        assert_eq!(body["tool_choice"], "none");
+        assert!(body.get("tool_choice").is_none());
         assert!(body.get("tools").is_none());
     }
 
