@@ -12,7 +12,8 @@ use crate::config::{ApiKind, ResolvedModel};
 
 use super::{
     ModelAssistantItem, ModelEvent, ModelLimits, ModelMessage, ModelProvider, ModelRequest,
-    ModelResponse, ModelThinking, ModelToolCall, ProviderError, StopReason, ToolDefinition, Usage,
+    ModelResponse, ModelThinking, ModelToolCall, ProviderError, StopReason, ToolChoice,
+    ToolDefinition, Usage,
 };
 
 const MAX_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
@@ -1228,6 +1229,12 @@ fn responses_body(model: &ResolvedModel, request: &ModelRequest) -> Value {
         }
     }
     if !request.tools.is_empty() {
+        if let Some(tool_choice) = request.tool_choice {
+            body.insert(
+                "tool_choice".to_owned(),
+                Value::String(openai_tool_choice(tool_choice).to_owned()),
+            );
+        }
         body.insert(
             "tools".to_owned(),
             Value::Array(request.tools.iter().map(responses_tool).collect()),
@@ -1293,6 +1300,12 @@ fn completions_body(model: &ResolvedModel, request: &ModelRequest) -> Value {
         }
     }
     if !request.tools.is_empty() {
+        if let Some(tool_choice) = request.tool_choice {
+            body.insert(
+                "tool_choice".to_owned(),
+                Value::String(openai_tool_choice(tool_choice).to_owned()),
+            );
+        }
         body.insert(
             "tools".to_owned(),
             Value::Array(request.tools.iter().map(completions_tool).collect()),
@@ -1373,6 +1386,13 @@ fn completions_message(message: &ModelMessage, model: &ResolvedModel) -> Value {
             "tool_call_id": tool_call_id,
             "content": content,
         }),
+    }
+}
+
+fn openai_tool_choice(tool_choice: ToolChoice) -> &'static str {
+    match tool_choice {
+        ToolChoice::Auto => "auto",
+        ToolChoice::None => "none",
     }
 }
 
@@ -1646,6 +1666,7 @@ mod tests {
                 items: response.items,
             }],
             tools: Vec::new(),
+            tool_choice: None,
             max_tokens: None,
             reasoning_effort: None,
             sampling_params: BTreeMap::new(),
@@ -1759,6 +1780,7 @@ mod tests {
                 items: response.items,
             }],
             tools: Vec::new(),
+            tool_choice: None,
             max_tokens: None,
             reasoning_effort: None,
             sampling_params: BTreeMap::new(),
@@ -1962,6 +1984,7 @@ mod tests {
                 },
             ],
             tools: Vec::new(),
+            tool_choice: None,
             max_tokens: None,
             reasoning_effort: None,
             sampling_params: BTreeMap::new(),
@@ -2049,6 +2072,7 @@ mod tests {
                 },
             ],
             tools: Vec::new(),
+            tool_choice: None,
             max_tokens: None,
             reasoning_effort: None,
             sampling_params: BTreeMap::new(),
@@ -2135,6 +2159,84 @@ mod tests {
     }
 
     #[test]
+    fn unspecified_tool_choice_is_omitted_from_openai_payloads() {
+        for api in [ApiKind::OpenAiResponses, ApiKind::OpenAiCompletions] {
+            let model = test_model(api, "https://example.test/v1".to_owned());
+            let (_, body) = request_for(&model, &ModelRequest::single_user("hello"))
+                .expect("request should build");
+
+            assert!(body.get("tool_choice").is_none());
+        }
+    }
+
+    #[test]
+    fn responses_explicit_no_tools_omits_tool_choice() {
+        let model = test_model(
+            ApiKind::OpenAiResponses,
+            "https://example.test/v1".to_owned(),
+        );
+        let mut request = ModelRequest::single_user("hello");
+        request.tool_choice = Some(ToolChoice::None);
+        let (_, body) = request_for(&model, &request).expect("request should build");
+
+        assert!(body.get("tool_choice").is_none());
+        assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn completions_explicit_no_tools_omits_tool_choice() {
+        let model = test_model(
+            ApiKind::OpenAiCompletions,
+            "https://example.test/v1".to_owned(),
+        );
+        let mut request = ModelRequest::single_user("hello");
+        request.tool_choice = Some(ToolChoice::None);
+        let (_, body) = request_for(&model, &request).expect("request should build");
+
+        assert!(body.get("tool_choice").is_none());
+        assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn ordinary_tool_requests_keep_existing_payload_shape() {
+        let tool = ToolDefinition {
+            name: "read".to_owned(),
+            description: Some("Read a file".to_owned()),
+            parameters: json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+        };
+
+        for api in [ApiKind::OpenAiResponses, ApiKind::OpenAiCompletions] {
+            let model = test_model(api, "https://example.test/v1".to_owned());
+            let mut request = ModelRequest::single_user("inspect a file");
+            request.tools.push(tool.clone());
+            let (_, body) = request_for(&model, &request).expect("request should build");
+
+            assert!(body.get("tool_choice").is_none());
+            let expected = match api {
+                ApiKind::OpenAiResponses => json!([{
+                    "type": "function",
+                    "name": "read",
+                    "description": "Read a file",
+                    "parameters": tool.parameters
+                }]),
+                ApiKind::OpenAiCompletions => json!([{
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "description": "Read a file",
+                        "parameters": tool.parameters
+                    }
+                }]),
+            };
+            assert_eq!(body["tools"], expected);
+        }
+    }
+
+    #[test]
     fn replays_assistant_tool_call_and_result_for_completions() {
         let model = test_model(
             ApiKind::OpenAiCompletions,
@@ -2159,6 +2261,7 @@ mod tests {
                 },
             ],
             tools: Vec::new(),
+            tool_choice: None,
             max_tokens: None,
             reasoning_effort: None,
             sampling_params: BTreeMap::new(),
@@ -2200,6 +2303,7 @@ mod tests {
                 }],
             }],
             tools: Vec::new(),
+            tool_choice: None,
             max_tokens: None,
             reasoning_effort: None,
             sampling_params: BTreeMap::new(),
@@ -2240,6 +2344,7 @@ mod tests {
                 },
             ],
             tools: Vec::new(),
+            tool_choice: None,
             max_tokens: None,
             reasoning_effort: None,
             sampling_params: BTreeMap::new(),
@@ -2303,6 +2408,7 @@ mod tests {
                     content: "instructions".to_owned(),
                 }],
                 tools: Vec::new(),
+                tool_choice: None,
                 max_tokens: None,
                 reasoning_effort: None,
                 sampling_params: BTreeMap::new(),
@@ -2750,6 +2856,7 @@ mod tests {
                 },
             ],
             tools: Vec::new(),
+            tool_choice: None,
             max_tokens: None,
             reasoning_effort: None,
             sampling_params: BTreeMap::new(),

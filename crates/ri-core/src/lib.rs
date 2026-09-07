@@ -30,7 +30,7 @@ pub use conversation::{segment_history, CompactionSummary, ConversationHistory, 
 pub use model::{
     ConfiguredProvider, MockProvider, ModelAssistantItem, ModelEvent, ModelLimits, ModelMessage,
     ModelProvider, ModelRequest, ModelResponse, ModelThinking, ModelToolCall, ProviderError,
-    StopReason, ToolDefinition, Usage,
+    StopReason, ToolChoice, ToolDefinition, Usage,
 };
 pub use session::{
     read_session, validate_name, workspace_id, MessageId, OpenedSession, SessionAssistantItem,
