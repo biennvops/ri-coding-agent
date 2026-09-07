@@ -1421,12 +1421,6 @@ fn footer_text(
     let usage = state.context_usage();
     let current = format_token_count(usage.current_tokens());
     let context = match usage.context_window {
-        Some(window)
-            if matches!(usage.source, ri_core::UsageSource::Provider)
-                && usage.input_tokens.is_some() =>
-        {
-            format!("ctx {current}/{}", format_token_count(window))
-        }
         Some(window) => format!("ctx ~{current}/{}", format_token_count(window)),
         None => format!("ctx ~{current}"),
     };
@@ -1539,12 +1533,28 @@ fn trim_decimal(value: String) -> String {
 mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
-    use ri_core::{AgentEvent, AppState, ModelCatalog, ModelMessage, ThinkingLevel};
+    use ri_core::{
+        AgentEvent, AppState, ContextUsage, ModelCatalog, ModelLimits, ModelMessage, ThinkingLevel,
+        Usage,
+    };
 
     use super::*;
 
     fn terminal() -> Terminal<TestBackend> {
         Terminal::new(TestBackend::new(20, 10)).expect("test terminal")
+    }
+
+    fn assert_footer_context(state: &AppState, tokens: u64, context_window: u64) {
+        let text = footer_text(state, 200, 0, false, false).to_string();
+        let expected = format!(
+            "ctx ~{}/{}",
+            format_token_count(tokens),
+            format_token_count(context_window)
+        );
+        assert!(
+            text.contains(&expected),
+            "footer `{text}` did not contain `{expected}`"
+        );
     }
 
     fn thinking_picker() -> ThinkingPickerState {
@@ -2712,6 +2722,56 @@ mod tests {
             .expect("append stream draw should succeed");
         assert_eq!(renderer.stats().entries_reflowed, 1);
         assert!(renderer.stats().bytes_reflowed < 500);
+    }
+
+    #[test]
+    fn footer_keeps_provider_usage_separate_from_estimated_context() {
+        let mut state = AppState::new();
+        let limits = ModelLimits {
+            context_window: Some(200_000),
+            max_output_tokens: Some(32_000),
+        };
+        state.reduce(AgentEvent::ContextUsageUpdated(ContextUsage::estimated(
+            42_000, limits,
+        )));
+        assert_footer_context(&state, 42_000, 200_000);
+
+        state.reduce(AgentEvent::UsageUpdated(Usage {
+            input_tokens: Some(90_000),
+            output_tokens: Some(100),
+            ..Usage::default()
+        }));
+        assert_footer_context(&state, 42_000, 200_000);
+
+        state.reduce(AgentEvent::ContextUsageUpdated(ContextUsage::estimated(
+            44_000, limits,
+        )));
+        assert_footer_context(&state, 44_000, 200_000);
+    }
+
+    #[test]
+    fn footer_allows_estimated_context_to_decrease_after_compaction() {
+        let mut state = AppState::new();
+        let limits = ModelLimits {
+            context_window: Some(200_000),
+            max_output_tokens: Some(32_000),
+        };
+        state.reduce(AgentEvent::ContextUsageUpdated(ContextUsage::estimated(
+            100_000, limits,
+        )));
+        assert_footer_context(&state, 100_000, 200_000);
+
+        state.set_compaction_active(true);
+        state.reduce(AgentEvent::ContextUsageUpdated(ContextUsage::estimated(
+            45_000, limits,
+        )));
+        state.reduce(AgentEvent::CompactionFinished {
+            automatic: true,
+            before_tokens: 100_000,
+            after_tokens: 45_000,
+        });
+
+        assert_footer_context(&state, 45_000, 200_000);
     }
 
     #[test]

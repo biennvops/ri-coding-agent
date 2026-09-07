@@ -729,11 +729,7 @@ impl AppState {
             | AgentEvent::AssistantThinkingItem { .. }
             | AgentEvent::ToolCallDelta { .. } => {}
             AgentEvent::UsageUpdated(usage) => {
-                self.latest_usage = Some(usage.clone());
-                if let Some(input_tokens) = usage.input_tokens {
-                    self.context_usage.input_tokens = Some(input_tokens);
-                    self.context_usage.source = crate::context::UsageSource::Provider;
-                }
+                self.latest_usage = Some(usage);
             }
             AgentEvent::ContextUsageUpdated(usage) => {
                 self.context_usage = usage;
@@ -1935,42 +1931,44 @@ mod tests {
     }
 
     #[test]
-    fn context_usage_reducer_keeps_provider_and_estimated_signals() {
+    fn context_usage_reducer_keeps_provider_usage_separate_from_estimate() {
         let mut state = AppState::new();
-        state.reduce(AgentEvent::ContextLimitsUpdated(
-            crate::model::ModelLimits {
-                context_window: Some(200_000),
-                max_output_tokens: Some(32_000),
-            },
-        ));
+        let limits = crate::model::ModelLimits {
+            context_window: Some(200_000),
+            max_output_tokens: Some(32_000),
+        };
+        state.reduce(AgentEvent::ContextLimitsUpdated(limits));
         state.reduce(AgentEvent::ContextUsageUpdated(ContextUsage::estimated(
-            42_000,
-            crate::model::ModelLimits {
-                context_window: Some(200_000),
-                max_output_tokens: Some(32_000),
-            },
+            42_000, limits,
         )));
-        assert_eq!(state.context_usage().estimated_input_tokens, 42_000);
+        assert_eq!(state.context_usage().current_tokens(), 42_000);
         assert_eq!(state.context_usage().input_tokens, None);
+
         state.reduce(AgentEvent::UsageUpdated(crate::model::Usage {
-            input_tokens: Some(43_000),
+            input_tokens: Some(90_000),
             output_tokens: Some(100),
             ..crate::model::Usage::default()
         }));
-        assert_eq!(state.context_usage().input_tokens, Some(43_000));
+
+        assert_eq!(state.context_usage().current_tokens(), 42_000);
+        assert_eq!(state.context_usage().input_tokens, None);
         assert_eq!(state.context_usage().context_window, Some(200_000));
+        assert_eq!(
+            state.latest_usage().and_then(|usage| usage.input_tokens),
+            Some(90_000)
+        );
         assert_eq!(
             state.latest_usage().and_then(|usage| usage.output_tokens),
             Some(100)
         );
-        state.reduce(AgentEvent::ModelChanged(crate::config::ModelRef {
-            provider: "test".to_owned(),
-            model: "new-model".to_owned(),
-        }));
-        assert_eq!(state.context_usage().input_tokens, None);
+
+        state.reduce(AgentEvent::ContextUsageUpdated(ContextUsage::estimated(
+            44_000, limits,
+        )));
+        assert_eq!(state.context_usage().current_tokens(), 44_000);
         assert_eq!(
-            state.context_usage().source,
-            crate::context::UsageSource::Estimated
+            state.latest_usage().and_then(|usage| usage.input_tokens),
+            Some(90_000)
         );
     }
 
