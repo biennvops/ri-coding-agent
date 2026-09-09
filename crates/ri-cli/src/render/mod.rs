@@ -1,6 +1,9 @@
 mod fixtures;
+mod markdown;
 
-pub use fixtures::{append_streaming_delta, synthetic_transcript};
+pub use fixtures::{
+    append_streaming_delta, markdown_transcript, synthetic_transcript, MARKDOWN_REPORT,
+};
 
 use std::collections::{HashMap, HashSet};
 
@@ -445,7 +448,6 @@ struct StreamingCachedLayout {
     thinking_header: CachedRow,
     content_len: usize,
     content_rows: Vec<CachedRow>,
-    content_starts: Vec<usize>,
     thinking_len: usize,
     thinking_rows: Vec<CachedRow>,
     thinking_starts: Vec<usize>,
@@ -850,8 +852,7 @@ impl TranscriptLayoutCache {
     ) {
         let previous = self.streaming_layout.take();
         let Some(mut layout) = previous else {
-            let (content_rows, content_starts) =
-                layout_content_section(&streaming.content, Style::default(), width);
+            let content_rows = markdown::layout_markdown(&streaming.content, width);
             let (thinking_rows, thinking_starts) = if streaming.thinking.is_empty() {
                 (Vec::new(), Vec::new())
             } else {
@@ -883,7 +884,6 @@ impl TranscriptLayoutCache {
                 },
                 content_len: streaming.content.len(),
                 content_rows,
-                content_starts,
                 thinking_len: streaming.thinking.len(),
                 thinking_rows,
                 thinking_starts,
@@ -902,16 +902,8 @@ impl TranscriptLayoutCache {
             && streaming.thinking.len() >= layout.thinking_len;
         if append_only {
             if streaming.content.len() > layout.content_len {
-                let (rows, starts, bytes) = append_content_section(
-                    layout.content_rows,
-                    layout.content_starts,
-                    &streaming.content,
-                    Style::default(),
-                    width,
-                );
-                layout.content_rows = rows;
-                layout.content_starts = starts;
-                bytes_reflowed = bytes_reflowed.saturating_add(bytes);
+                layout.content_rows = markdown::layout_markdown(&streaming.content, width);
+                bytes_reflowed = bytes_reflowed.saturating_add(streaming.content.len());
             }
             if streaming.thinking.len() > layout.thinking_len {
                 let (rows, starts, bytes) = append_content_section(
@@ -926,8 +918,7 @@ impl TranscriptLayoutCache {
                 bytes_reflowed = bytes_reflowed.saturating_add(bytes);
             }
         } else {
-            let (content_rows, content_starts) =
-                layout_content_section(&streaming.content, Style::default(), width);
+            let content_rows = markdown::layout_markdown(&streaming.content, width);
             let (thinking_rows, thinking_starts) = if streaming.thinking.is_empty() {
                 (Vec::new(), Vec::new())
             } else {
@@ -938,7 +929,6 @@ impl TranscriptLayoutCache {
                 )
             };
             layout.content_rows = content_rows;
-            layout.content_starts = content_starts;
             layout.thinking_rows = thinking_rows;
             layout.thinking_starts = thinking_starts;
             bytes_reflowed = streaming
@@ -1133,7 +1123,11 @@ fn layout_message(
             width,
         );
     }
-    append_layout_content(&mut rows, content, Style::default(), width);
+    if role == MessageRole::Assistant {
+        rows.extend(markdown::layout_markdown(content, width));
+    } else {
+        append_layout_content(&mut rows, content, Style::default(), width);
+    }
     rows
 }
 
@@ -1578,6 +1572,104 @@ mod tests {
     }
 
     #[test]
+    fn markdown_history_and_streaming_cache_lifecycle() {
+        let mut state = markdown_transcript(100);
+        let mut renderer = TuiRenderer::new();
+        let mut terminal = Terminal::new(TestBackend::new(80, 28)).unwrap();
+        renderer.draw(&mut terminal, &state, 0).unwrap();
+        assert_eq!(renderer.stats().entries_reflowed, 100);
+        state.acknowledge_transcript_changes();
+        for scroll in [0, 100, 300] {
+            renderer.draw(&mut terminal, &state, scroll).unwrap();
+            assert_eq!(renderer.stats().bytes_reflowed, 0);
+            assert_eq!(renderer.stats().cache_misses, 0);
+        }
+        state.reduce(AgentEvent::AssistantMessageStarted);
+        for chunk in ["*", "*bold", "**\n\n`", "``rust\nfn main()", " {}\n```"] {
+            append_streaming_delta(&mut state, chunk);
+            renderer.draw(&mut terminal, &state, 0).unwrap();
+            assert_eq!(renderer.stats().entries_reflowed, 1);
+            let source = &state.streaming_assistant_state().unwrap().content;
+            assert_eq!(renderer.stats().bytes_reflowed, source.len());
+            let cached = &renderer
+                .transcript
+                .streaming_layout
+                .as_ref()
+                .unwrap()
+                .content_rows;
+            let expected = markdown::layout_markdown(source, 78);
+            assert_eq!(format!("{cached:?}"), format!("{expected:?}"));
+            renderer.draw(&mut terminal, &state, 0).unwrap();
+            assert_eq!(renderer.stats().bytes_reflowed, 0);
+        }
+        state.reduce(AgentEvent::AssistantThinkingDelta {
+            item_id: None,
+            text: "unchanged answer".into(),
+        });
+        renderer.draw(&mut terminal, &state, 0).unwrap();
+        assert_eq!(renderer.stats().bytes_reflowed, "unchanged answer".len());
+        let source = state.streaming_assistant_state().unwrap().content.clone();
+        let active = renderer
+            .transcript
+            .streaming_layout
+            .as_ref()
+            .unwrap()
+            .content_rows
+            .clone();
+        state.reduce(AgentEvent::AssistantMessageFinished { items: Vec::new() });
+        renderer.draw(&mut terminal, &state, 0).unwrap();
+        assert_eq!(renderer.stats().entries_reflowed, 1);
+        let entry = &state.transcript_entries().last().unwrap().entry;
+        if let TranscriptEntry::Message(message) = entry {
+            assert_eq!(message.content, source);
+        } else {
+            panic!("expected message");
+        }
+        let settled = layout_entry(entry, 78, false);
+        assert_eq!(
+            format!("{:?}", &settled[3..settled.len() - 1]),
+            format!("{active:?}")
+        );
+        renderer.draw(&mut terminal, &state, 0).unwrap();
+        assert_eq!(renderer.stats().bytes_reflowed, 0);
+        terminal.backend_mut().resize(60, 28);
+        renderer.draw(&mut terminal, &state, 0).unwrap();
+        assert_eq!(renderer.stats().entries_reflowed, 101);
+        renderer.draw(&mut terminal, &state, 0).unwrap();
+        assert_eq!(renderer.stats().bytes_reflowed, 0);
+    }
+
+    #[test]
+    fn markdown_does_not_change_tool_output_or_backgrounds() {
+        let mut state = AppState::new();
+        let literal = "# not a heading\n**not bold**\n[foo](bar)";
+        state.reduce(AgentEvent::ToolExecutionStarted {
+            call_id: "markdown-output".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        });
+        state.reduce(AgentEvent::ToolExecutionFinished {
+            call_id: "markdown-output".into(),
+            name: "bash".into(),
+            result: ri_core::ToolExecutionResult::success(literal),
+        });
+        let rows = layout_entry(&state.transcript_entries()[0].entry, 80, true);
+        for text in literal.lines() {
+            let row = rows.iter().find(|r| r.text.contains(text)).unwrap();
+            assert_eq!(row.style.bg, Some(TOOL_SUCCESS_BACKGROUND));
+        }
+    }
+
+    #[test]
+    fn markdown_is_not_applied_to_user_or_system_messages() {
+        for role in [MessageRole::User, MessageRole::System] {
+            let rows = layout_message(role, "# literal **text** `code`", None, 80, "label");
+            assert_eq!(rows[1].text, "  # literal **text** `code`");
+            assert!(rows[1].spans.is_empty());
+        }
+    }
+
+    #[test]
     fn transcript_scroll_follows_growth_only_at_the_bottom() {
         let mut scroll = TranscriptScroll::default();
         scroll.update_maximum(100);
@@ -1715,7 +1807,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_incremental_layout_matches_cold_layout_for_unicode_chunks() {
+    fn streaming_markdown_layout_matches_cold_layout_for_unicode_chunks() {
         let mut state = AppState::new();
         state.reduce(AgentEvent::AssistantMessageStarted);
         let mut renderer = TuiRenderer::new();
@@ -1736,8 +1828,7 @@ mod tests {
                 .streaming_layout
                 .as_ref()
                 .expect("stream layout should be cached");
-            let (expected_rows, expected_starts) =
-                layout_content_section(&streaming.content, Style::default(), width);
+            let expected_rows = markdown::layout_markdown(&streaming.content, width);
             assert_eq!(
                 cached
                     .content_rows
@@ -1749,7 +1840,6 @@ mod tests {
                     .map(|row| row.text.as_str())
                     .collect::<Vec<_>>()
             );
-            assert_eq!(cached.content_starts, expected_starts);
         }
 
         state.reduce(AgentEvent::AssistantThinkingDelta {
@@ -1844,8 +1934,7 @@ mod tests {
                 "  thinking:",
                 "  thinking A",
                 "  thinking B",
-                "  answer A",
-                "  answer B",
+                "  answer A answer B",
             ]
         );
     }
@@ -1915,7 +2004,7 @@ mod tests {
     }
 
     #[test]
-    fn resize_during_streaming_cold_reflows_once_then_returns_to_incremental() {
+    fn resize_during_streaming_reflows_history_once_then_only_active_message() {
         let mut state = synthetic_transcript(1_000, 100);
         state.reduce(AgentEvent::AssistantMessageStarted);
         append_streaming_delta(&mut state, &"x".repeat(500));
@@ -1939,7 +2028,7 @@ mod tests {
             .draw(&mut terminal, &state, 0)
             .expect("post-resize stream draw should succeed");
         assert_eq!(renderer.stats().entries_reflowed, 1);
-        assert!(renderer.stats().bytes_reflowed < 500);
+        assert_eq!(renderer.stats().bytes_reflowed, 508);
     }
 
     #[test]
@@ -2686,8 +2775,7 @@ mod tests {
                     .streaming_layout
                     .as_ref()
                     .expect("stream layout should be cached");
-                let (expected_rows, expected_starts) =
-                    layout_content_section(&streaming.content, Style::default(), width as usize);
+                let expected_rows = markdown::layout_markdown(&streaming.content, width as usize);
                 assert_eq!(
                     cached
                         .content_rows
@@ -2699,13 +2787,12 @@ mod tests {
                         .map(|row| row.text.as_str())
                         .collect::<Vec<_>>()
                 );
-                assert_eq!(cached.content_starts, expected_starts);
             }
         }
     }
 
     #[test]
-    fn streaming_append_reflows_only_the_active_entry_suffix() {
+    fn streaming_append_reflows_only_the_active_entry() {
         let mut state = synthetic_transcript(1_000, 100);
         state.reduce(AgentEvent::AssistantMessageStarted);
         append_streaming_delta(&mut state, &"x".repeat(500));
@@ -2721,7 +2808,7 @@ mod tests {
             .draw(&mut terminal, &state, 0)
             .expect("append stream draw should succeed");
         assert_eq!(renderer.stats().entries_reflowed, 1);
-        assert!(renderer.stats().bytes_reflowed < 500);
+        assert_eq!(renderer.stats().bytes_reflowed, 508);
     }
 
     #[test]

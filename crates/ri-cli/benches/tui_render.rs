@@ -10,6 +10,7 @@ const WIDTH: u16 = 100;
 const HEIGHT: u16 = 28;
 
 fn main() {
+    markdown_workloads();
     let fresh_state = render::synthetic_transcript(20, 4);
     measure("fresh first frame", 10, || {
         let mut terminal = test_terminal(WIDTH, HEIGHT);
@@ -187,5 +188,58 @@ fn format_duration(duration: Duration) -> String {
         format!("{:.3}s", duration.as_secs_f64())
     } else {
         format!("{}µs", duration.as_micros())
+    }
+}
+
+fn markdown_workloads() {
+    let history = render::markdown_transcript(100);
+    measure("Markdown history · cold ~40 KiB", 3, || {
+        let mut terminal = test_terminal(WIDTH, HEIGHT);
+        let mut renderer = TuiRenderer::new();
+        renderer.draw(&mut terminal, &history, 0).unwrap();
+        assert_eq!(renderer.stats().entries_reflowed, 100);
+    });
+    let mut terminal = test_terminal(WIDTH, HEIGHT);
+    let mut renderer = TuiRenderer::new();
+    renderer.draw(&mut terminal, &history, 0).unwrap();
+    for scroll in [0, 300] {
+        measure(
+            &format!("Markdown history · cached scroll={scroll}"),
+            10,
+            || {
+                renderer.draw(&mut terminal, &history, scroll).unwrap();
+                assert_eq!(renderer.stats().bytes_reflowed, 0);
+                assert_eq!(renderer.stats().cache_misses, 0);
+            },
+        );
+    }
+    measure("Markdown history · resize", 3, || {
+        for width in [80, WIDTH] {
+            terminal.backend_mut().resize(width, HEIGHT);
+            renderer.draw(&mut terminal, &history, 0).unwrap();
+            assert_eq!(renderer.stats().entries_reflowed, 100);
+            renderer.draw(&mut terminal, &history, 0).unwrap();
+            assert_eq!(renderer.stats().bytes_reflowed, 0);
+        }
+    });
+    let mut state = history;
+    state.acknowledge_transcript_changes();
+    state.reduce(AgentEvent::AssistantMessageStarted);
+    let mut size = 0;
+    for target in [1_024usize, 8_192, 32_768, 65_536] {
+        let source = render::MARKDOWN_REPORT.repeat(target.div_ceil(render::MARKDOWN_REPORT.len()));
+        let mut end = target - size;
+        while !source.is_char_boundary(end) {
+            end += 1;
+        }
+        render::append_streaming_delta(&mut state, &source[..end]);
+        size += end;
+        measure(&format!("Markdown stream · {target} bytes"), 1, || {
+            renderer.draw(&mut terminal, &state, 0).unwrap();
+            assert_eq!(renderer.stats().entries_reflowed, 1);
+            assert_eq!(renderer.stats().bytes_reflowed, size);
+        });
+        renderer.draw(&mut terminal, &state, 0).unwrap();
+        assert_eq!(renderer.stats().bytes_reflowed, 0);
     }
 }
