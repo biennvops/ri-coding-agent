@@ -13,6 +13,7 @@ The current baseline is intended for dogfooding. It is not a hosted service and 
 - persistent JSONL sessions, resume, crash repair, and compaction
 - interactive model picker and recent-model state
 - anchored transcript scrollback and slash-command suggestions
+- streaming assistant Markdown: emphasis, lists, quotes, links, and code blocks
 - plain print mode and versioned JSON streaming mode
 - private file logging through `RI_LOG`
 
@@ -87,6 +88,8 @@ Use PgUp/PgDn or Ctrl+U/Ctrl+D to move through transcript scrollback; mouse-whee
 
 `Esc` cancels an active operation when command suggestions are not visible. `Ctrl+C` cancels a busy turn and exits when the TUI is idle.
 
+Assistant responses render CommonMark plus strikethrough and task markers while streaming. Code fences show their language without syntax highlighting; links show their destination. HTML and images have text-only fallbacks. Thinking, user/system messages, and tool output remain literal. Session/model text and print/JSON modes retain raw Markdown.
+
 ## Sessions
 
 Sessions are workspace-scoped and stored below `~/.ri/agent/sessions`. The session history is append-only JSONL; interrupted tool calls are repaired when possible.
@@ -156,6 +159,8 @@ cargo build --release --locked -p ri
 cargo bench -p ri --bench tui_render
 ```
 
+Markdown benchmarks cover ~40 KiB of completed history, cached redraw/scroll, resize, and active responses growing from 1 to 64 KiB. Assertions protect cache behavior: only the active answer is reparsed on a content delta, unchanged frames and scrolling reuse rows, and resize reflows once. Full active-message parsing is deliberately O(active message), not an incremental Markdown parser.
+
 The benchmark is a manual performance check, not a timing-sensitive CI gate. CI validates formatting, compilation, tests, Clippy, release builds, and source-install smoke tests on Linux, macOS, and Windows. Provider tests use mocks or local scripted HTTP servers; CI does not require model credentials.
 
 ## Dogfood smoke checklist
@@ -175,4 +180,4 @@ A live provider smoke is deliberately manual. It is not part of CI and must be r
 
 ## Current non-goals
 
-Plugins, web search, Codex integration, MCP, skills, themes, Markdown rendering, session branching, new provider protocols, OAuth, remote execution, sandboxing, permission prompts, and public release automation are outside this baseline.
+Plugins, web search, Codex integration, MCP, skills, themes, syntax highlighting, session branching, new provider protocols, OAuth, remote execution, sandboxing, permission prompts, and public release automation are outside this baseline.
