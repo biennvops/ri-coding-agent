@@ -310,7 +310,8 @@ impl Renderer {
                 }
             }
             Event::Code(text) => self.line.push(&text, self.style().patch(self.palette.code)),
-            Event::SoftBreak | Event::HardBreak => self.flush(true),
+            Event::SoftBreak => self.text(" "),
+            Event::HardBreak => self.flush(true),
             Event::Rule => {
                 self.flush(false);
                 self.line.push("───", self.palette.dim);
@@ -403,7 +404,7 @@ mod tests {
             visible(r"\*literal\* &amp; <https://example.com>", 100),
             "  *literal* & https://example.com"
         );
-        assert_eq!(visible("a  \nb\nc", 20), "  a\n  b\n  c");
+        assert_eq!(visible("a  \nb\nc", 20), "  a\n  b c");
     }
 
     #[test]

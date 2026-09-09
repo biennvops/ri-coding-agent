@@ -1934,8 +1934,7 @@ mod tests {
                 "  thinking:",
                 "  thinking A",
                 "  thinking B",
-                "  answer A",
-                "  answer B",
+                "  answer A answer B",
             ]
         );
     }
