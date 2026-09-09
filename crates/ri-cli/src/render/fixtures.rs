@@ -78,3 +78,25 @@ fn synthetic_body(index: usize, rows: usize) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+/// Shared Markdown workload for layout tests and renderer benchmarks.
+pub const MARKDOWN_REPORT: &str = "# Implementation report\n\n\
+The **renderer** supports *Markdown*, ***nested emphasis*** and `inline code`.\n\n\
+## Changes\n\n\
+1. Added parsing.\n\
+2. Added wrapping.\n\
+   - Unicode aware: 世界 🦀 e\u{301}\n\
+   - Cached\n\n\
+> Markdown is presentation-only.\n\n\
+```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n\n\
+See [the documentation](https://example.com).\n\n";
+
+pub fn markdown_transcript(entry_count: usize) -> AppState {
+    let mut state = AppState::new();
+    for _ in 0..entry_count {
+        state.reduce(AgentEvent::AssistantMessageStarted);
+        append_streaming_delta(&mut state, MARKDOWN_REPORT);
+        state.reduce(AgentEvent::AssistantMessageFinished { items: Vec::new() });
+    }
+    state
+}
