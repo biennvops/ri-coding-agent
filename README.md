@@ -88,7 +88,7 @@ Use PgUp/PgDn or Ctrl+U/Ctrl+D to move through transcript scrollback; mouse-whee
 
 `Esc` cancels an active operation when command suggestions are not visible. `Ctrl+C` cancels a busy turn and exits when the TUI is idle.
 
-Assistant responses render CommonMark plus strikethrough and task markers while streaming. Recognized code fences receive foreground syntax highlighting, including Rust, TypeScript/TSX, TOML, Dockerfile, and diff. Fence labels and code prefixes remain visible; unknown, unlabeled, indented, and explicit plaintext blocks remain plain. Inline code is not syntax-highlighted; links show their destination. HTML and images have text-only fallbacks. Thinking, user/system messages, and tool output remain literal. Session/model text and print/JSON modes retain raw Markdown.
+Assistant responses render CommonMark plus strikethrough and task markers while streaming. Recognized code fences receive foreground syntax highlighting, including Rust, TypeScript/TSX, TOML, Dockerfile, and diff. To keep streaming responsive, an active fence over 16 KiB temporarily renders as plain code until the turn completes; finalized messages are highlighted without that limit. Fence labels and code prefixes remain visible; unknown, unlabeled, indented, and explicit plaintext blocks remain plain. Inline code is not syntax-highlighted; links show their destination. HTML and images have text-only fallbacks. Thinking, user/system messages, and tool output remain literal. Session/model text and print/JSON modes retain raw Markdown.
 
 ## Sessions
 
@@ -159,7 +159,7 @@ cargo build --release --locked -p ri
 cargo bench -p ri --bench tui_render
 ```
 
-Markdown benchmarks cover mixed prose/list/Rust/TypeScript/TOML history, cached redraw/scroll, resize, active responses growing from 1 to 64 KiB, and a separate prose/list workload. Code-heavy benchmarks cover completed Rust fences at 8/32/64 KiB and streaming Rust growing through 1/8/32/64 KiB against cached history. Assertions protect cache behavior: only the active answer is reparsed on a content delta, unchanged frames and scrolling reuse rows, and resize reflows once. Full active-message parsing is deliberately O(active message), not an incremental Markdown parser.
+Markdown benchmarks cover mixed prose/list/Rust/TypeScript/TOML history, cached redraw/scroll, resize, active responses growing from 1 to 64 KiB, and a separate prose/list workload. Code-heavy benchmarks cover completed Rust fences at 8/32/64 KiB and streaming Rust growing through 1/8/32/64 KiB against cached history; the streaming labels identify the deliberate plain-code fallback above 16 KiB. Assertions protect cache behavior: only the active answer is reparsed on a content delta, unchanged frames and scrolling reuse rows, and resize reflows once. Full active-message parsing is deliberately O(active message), not an incremental Markdown parser.
 
 The benchmark is a manual performance check, not a timing-sensitive CI gate. CI validates formatting, compilation, tests, Clippy, release builds, and source-install smoke tests on Linux, macOS, and Windows. Provider tests use mocks or local scripted HTTP servers; CI does not require model credentials.
 
@@ -169,17 +169,17 @@ Local run on `aarch64-apple-darwin`, Rust 1.98.0 (Homebrew), using the repositor
 
 | Workload | Time per draw |
 | --- | ---: |
-| First Rust highlight, 1 KiB (includes lazy setup) | 23.83 ms |
-| Completed Rust, 8 / 32 / 64 KiB | 13.65 / 53.41 / 106.05 ms |
-| Streaming Rust, 1 / 8 / 32 / 64 KiB | ~1.83 / 13.5 / 53.3 / 106.6 ms |
+| First Rust highlight, 1 KiB (includes lazy setup) | 24.49 ms |
+| Completed Rust, 8 / 32 / 64 KiB | 14.00 / 56.36 / 107.65 ms |
+| Streaming Rust, 1 / 8 / 32 / 64 KiB (highlighted / highlighted / plain / plain) | ~1.9 / 13.6 / 3.3 / 6.6 ms |
 | Cached Rust redraw / scroll, 8–64 KiB history | 0.12 ms |
-| Mixed Markdown history, 100 entries, cold layout | 74.99 ms |
+| Mixed Markdown history, 100 entries, cold layout | 80.22 ms |
 | Mixed history cached redraw / scroll | 0.11 ms |
-| Mixed history resize (80 and 100 columns, two layouts) | 66.12 ms |
-| Mixed active Markdown, 64 KiB | 47.60 ms |
-| Prose/list Markdown, ~64 KiB | 5.10 ms |
+| Mixed history resize (80 and 100 columns, two layouts) | 71.64 ms |
+| Mixed active Markdown, 64 KiB | 51.43 ms |
+| Prose/list Markdown, ~64 KiB | 5.17 ms |
 
-Large active code blocks can therefore noticeably slow streaming; unchanged frames and historical entries remain cached. No incremental syntax state across deltas is maintained. The first mixed-history measurement also encounters languages not warmed by the Rust workload.
+Large active fences are capped at 16 KiB for syntax highlighting: in this run, 1 and 8 KiB fences were highlighted, while 32 and 64 KiB fences used the plain-code fallback until turn completion. That keeps large active fences around 3.3 and 6.6 ms instead of paying the completed-highlight costs of about 56.36 and 107.65 ms; finalized messages and historical entries remain highlighted/cached. No incremental syntax state across deltas is maintained. The first mixed-history measurement also encounters languages not warmed by the Rust workload.
 
 `cargo build --release -p ri` produced **4,967,184 bytes before** and **7,474,320 bytes after** highlighting: **+2,507,136 bytes (50.5%, ~2.39 MiB)** on the same toolchain/profile. The bat-curated `two-face` bundle deliberately buys broad coding-agent language coverage, including TypeScript/TOML/Dockerfile, rather than stock syntect alone. Syntax assets and ri's foreground-only palette initialize lazily once. Feature inspection (`cargo tree -p ri -e features`) confirms only `two-face`'s `syntect-fancy` backend, with syntect parsing/dump support and pure-Rust regex support; no Oniguruma or separate theme crate is enabled. The binary increase includes the highlighting/regex implementation, not just embedded grammar data.
 

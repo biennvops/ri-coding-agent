@@ -290,8 +290,13 @@ fn syntax_workloads() {
         for target in [1_024, 8_192, 32_768, 65_536] {
             render::append_streaming_delta(&mut history, &source[previous..target]);
             previous = target;
+            let mode = if target > 16 * 1024 {
+                "plain fallback >16 KiB"
+            } else {
+                "syntax-highlighted"
+            };
             measure(
-                &format!("Rust stream · {target} · history={size}"),
+                &format!("Rust stream · {target} · {mode} · history={size}"),
                 1,
                 || {
                     renderer.draw(&mut terminal, &history, 0).unwrap();
