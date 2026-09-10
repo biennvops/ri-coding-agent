@@ -67,6 +67,7 @@ struct CodeBlockState {
 }
 
 struct Renderer {
+    max_streaming_code_bytes: Option<usize>,
     code_block: Option<CodeBlockState>,
     rows: Vec<CachedRow>,
     line: LogicalLine,
@@ -179,21 +180,32 @@ impl Renderer {
         let Some(block) = self.code_block.take() else {
             return;
         };
-        if let Some(lines) = super::syntax::highlight_code(&block.info, &block.source) {
-            for segments in lines {
-                for (text, style) in segments {
-                    self.line.push(text, self.style().patch(style));
+        let highlight = self
+            .max_streaming_code_bytes
+            .is_none_or(|limit| block.source.len() <= limit);
+        if highlight {
+            if let Some(lines) = super::syntax::highlight_code(&block.info, &block.source) {
+                for segments in lines {
+                    for (text, style) in segments {
+                        self.line.push(text, self.style().patch(style));
+                    }
+                    self.flush(true);
                 }
-                self.flush(true);
+            } else {
+                self.render_plain_code(&block.source);
             }
         } else {
-            for line in block.source.split_terminator('\n') {
-                self.text(line);
-                self.flush(true);
-            }
+            self.render_plain_code(&block.source);
         }
         self.prefixes.pop();
         self.separate();
+    }
+
+    fn render_plain_code(&mut self, source: &str) {
+        for line in source.split_terminator('\n') {
+            self.text(line);
+            self.flush(true);
+        }
     }
 
     fn event(&mut self, event: Event<'_>) {
@@ -358,7 +370,23 @@ impl Renderer {
 }
 
 pub(super) fn layout_markdown(source: &str, width: usize) -> Vec<CachedRow> {
+    layout_markdown_with_code_limit(source, width, None)
+}
+
+pub(super) fn layout_streaming_markdown(source: &str, width: usize) -> Vec<CachedRow> {
+    layout_markdown_with_code_limit(source, width, Some(MAX_STREAMING_CODE_BYTES))
+}
+
+// Keep active large fences responsive; finalized messages use the uncapped highlighting path.
+const MAX_STREAMING_CODE_BYTES: usize = 16 * 1024;
+
+fn layout_markdown_with_code_limit(
+    source: &str,
+    width: usize,
+    max_streaming_code_bytes: Option<usize>,
+) -> Vec<CachedRow> {
     let mut renderer = Renderer {
+        max_streaming_code_bytes,
         code_block: None,
         rows: Vec::new(),
         line: LogicalLine::default(),
@@ -553,9 +581,23 @@ mod tests {
             assert_eq!(format!("{open:?}"), format!("{closed:?}"));
             if let Some((_, body)) = source.split_once('\n') {
                 assert_eq!(open.last().unwrap().text, format!("  │ {body}"));
-                assert!(matches!(style_at(&open, "fn").fg, Some(Color::Rgb(..))));
+                assert!(style_at(&open, "fn").fg.is_some());
             }
         }
+    }
+
+    #[test]
+    fn large_streaming_fences_use_plain_code_until_final_layout() {
+        let source = format!(
+            "```rust\n{}",
+            "fn main() { let value = 1; }\n"
+                .repeat(MAX_STREAMING_CODE_BYTES / "fn main() { let value = 1; }\n".len() + 1)
+        );
+        let streaming = layout_streaming_markdown(&source, 80);
+        assert_eq!(style_at(&streaming, "fn"), Style::default());
+
+        let completed = layout_markdown(&source, 80);
+        assert_ne!(style_at(&completed, "fn"), Style::default());
     }
 
     #[test]

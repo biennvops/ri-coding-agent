@@ -12,7 +12,6 @@ use two_face::re_exports::syntect::{
 static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(two_face::syntax::extra_newlines);
 static THEME: LazyLock<Theme> = LazyLock::new(|| {
     let mut theme = Theme::default();
-    theme.settings.foreground = Some(rgb(220, 220, 220));
     for (scope, color, font_style) in [
         ("comment", rgb(130, 140, 150), FontStyle::ITALIC),
         ("string", rgb(150, 200, 140), FontStyle::empty()),
@@ -50,7 +49,7 @@ static THEME: LazyLock<Theme> = LazyLock::new(|| {
     theme
 });
 
-fn rgb(r: u8, g: u8, b: u8) -> highlighting::Color {
+const fn rgb(r: u8, g: u8, b: u8) -> highlighting::Color {
     highlighting::Color { r, g, b, a: 255 }
 }
 
@@ -79,11 +78,10 @@ fn resolve(info: &str) -> Option<&'static SyntaxReference> {
 }
 
 fn terminal_style(style: highlighting::Style) -> Style {
-    let mut result = Style::default().fg(Color::Rgb(
-        style.foreground.r,
-        style.foreground.g,
-        style.foreground.b,
-    ));
+    let mut result = Style::default();
+    if let Some(foreground) = terminal_foreground(style.foreground) {
+        result = result.fg(foreground);
+    }
     for (syntax, terminal) in [
         (FontStyle::BOLD, Modifier::BOLD),
         (FontStyle::ITALIC, Modifier::ITALIC),
@@ -94,6 +92,25 @@ fn terminal_style(style: highlighting::Style) -> Style {
         }
     }
     result
+}
+
+// Syntect themes use RGB colors, so translate ri's semantic markers to the terminal palette.
+fn terminal_foreground(color: highlighting::Color) -> Option<Color> {
+    match (color.r, color.g, color.b) {
+        // The default syntect foreground is black when the theme leaves it unset. Preserve the
+        // terminal's existing foreground instead of emitting black or a fixed RGB color.
+        (0, 0, 0) | (175, 185, 195) => None,
+        (130, 140, 150) => Some(Color::DarkGray),
+        (150, 200, 140) => Some(Color::Green),
+        (190, 150, 220) => Some(Color::Magenta),
+        (225, 180, 120) => Some(Color::Yellow),
+        (120, 190, 220) => Some(Color::Cyan),
+        (110, 200, 190) => Some(Color::Blue),
+        (130, 180, 220) => Some(Color::Blue),
+        (215, 200, 170) => Some(Color::Yellow),
+        (225, 140, 140) => Some(Color::Red),
+        _ => None,
+    }
 }
 
 // None asks the caller to preserve its existing plain code style for the whole block.
@@ -209,6 +226,9 @@ mod tests {
                 lines.iter().flatten().map(|(_, style)| *style).collect();
             assert!(styles.len() >= 2, "{language}");
             assert!(styles.iter().all(|style| style.bg.is_none()));
+            assert!(styles
+                .iter()
+                .all(|style| !matches!(style.fg, Some(Color::Rgb(..)))));
         }
         let lines = highlight_code(
             "rust",
@@ -224,17 +244,26 @@ mod tests {
     }
 
     #[test]
-    fn conversion_ignores_background_and_maps_modifiers() {
+    fn conversion_uses_terminal_palette_and_maps_modifiers() {
+        assert_eq!(THEME.settings.foreground, None);
         let style = terminal_style(highlighting::Style {
-            foreground: rgb(1, 2, 3),
+            foreground: highlighting::Color::BLACK,
             background: rgb(4, 5, 6),
             font_style: FontStyle::BOLD | FontStyle::ITALIC | FontStyle::UNDERLINE,
         });
-        assert_eq!(style.fg, Some(Color::Rgb(1, 2, 3)));
+        assert_eq!(style.fg, None);
         assert_eq!(style.bg, None);
         assert_eq!(
             style.add_modifier,
             Modifier::BOLD | Modifier::ITALIC | Modifier::UNDERLINED
         );
+
+        let style = terminal_style(highlighting::Style {
+            foreground: rgb(150, 200, 140),
+            background: rgb(4, 5, 6),
+            font_style: FontStyle::empty(),
+        });
+        assert_eq!(style.fg, Some(Color::Green));
+        assert_eq!(style.bg, None);
     }
 }
