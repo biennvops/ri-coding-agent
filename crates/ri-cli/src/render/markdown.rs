@@ -61,7 +61,13 @@ struct Prefix {
     pending: bool,
 }
 
+struct CodeBlockState {
+    info: String,
+    source: String,
+}
+
 struct Renderer {
+    code_block: Option<CodeBlockState>,
     rows: Vec<CachedRow>,
     line: LogicalLine,
     prefixes: Vec<Prefix>,
@@ -169,7 +175,32 @@ impl Renderer {
         }
     }
 
+    fn finish_code_block(&mut self) {
+        let Some(block) = self.code_block.take() else {
+            return;
+        };
+        if let Some(lines) = super::syntax::highlight_code(&block.info, &block.source) {
+            for segments in lines {
+                for (text, style) in segments {
+                    self.line.push(text, self.style().patch(style));
+                }
+                self.flush(true);
+            }
+        } else {
+            for line in block.source.split_terminator('\n') {
+                self.text(line);
+                self.flush(true);
+            }
+        }
+        self.prefixes.pop();
+        self.separate();
+    }
+
     fn event(&mut self, event: Event<'_>) {
+        if let (Some(block), Event::Text(text)) = (&mut self.code_block, &event) {
+            block.source.push_str(text);
+            return;
+        }
         match event {
             Event::Start(tag) => match tag {
                 Tag::Paragraph => {
@@ -217,12 +248,18 @@ impl Renderer {
                 }
                 Tag::CodeBlock(kind) => {
                     self.flush(false);
-                    if let CodeBlockKind::Fenced(info) = kind {
-                        if !info.is_empty() {
-                            self.line.push(&info, self.palette.dim);
-                            self.flush(false);
-                        }
+                    let info = match kind {
+                        CodeBlockKind::Fenced(info) => info.into_string(),
+                        CodeBlockKind::Indented => String::new(),
+                    };
+                    if !info.is_empty() {
+                        self.line.push(&info, self.palette.dim);
+                        self.flush(false);
                     }
+                    self.code_block = Some(CodeBlockState {
+                        info,
+                        source: String::new(),
+                    });
                     self.prefixes.push(Prefix {
                         first: "│ ".into(),
                         rest: "│ ".into(),
@@ -281,11 +318,7 @@ impl Renderer {
                         self.separate();
                     }
                 }
-                TagEnd::CodeBlock => {
-                    self.flush(false);
-                    self.prefixes.pop();
-                    self.separate();
-                }
+                TagEnd::CodeBlock => self.finish_code_block(),
                 TagEnd::Link | TagEnd::Image => {
                     self.styles.pop();
                     if let Some((url, auto, image)) = self.links.pop() {
@@ -326,6 +359,7 @@ impl Renderer {
 
 pub(super) fn layout_markdown(source: &str, width: usize) -> Vec<CachedRow> {
     let mut renderer = Renderer {
+        code_block: None,
         rows: Vec::new(),
         line: LogicalLine::default(),
         prefixes: vec![Prefix {
@@ -346,6 +380,7 @@ pub(super) fn layout_markdown(source: &str, width: usize) -> Vec<CachedRow> {
     ) {
         renderer.event(event);
     }
+    renderer.finish_code_block();
     renderer.flush(false);
     while renderer.rows.last().is_some_and(|r| r.text.is_empty()) {
         renderer.rows.pop();
@@ -455,6 +490,70 @@ mod tests {
                 for span in row.spans.iter().filter(|s| s.width > 0 && s.start >= 2) {
                     assert!(span.style.add_modifier.contains(Modifier::BOLD));
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn highlighted_wrapping_preserves_text_styles_and_safety() {
+        let source = "let long_name = \"世界 🦀 e\u{301} a very long string\";";
+        let markdown = format!("```rust\n{source}\n```");
+        let reference = layout_markdown(&markdown, 200);
+        let string_style = style_at(&reference, "世界");
+        let keyword_style = style_at(&reference, "let");
+        assert_ne!(string_style, keyword_style);
+        for width in 1..50 {
+            let rows = layout_markdown(&markdown, width);
+            for row in &rows {
+                assert!(row.text.width() <= width);
+                assert!(row
+                    .spans
+                    .iter()
+                    .all(|s| s.start + s.width <= row.text.width()));
+            }
+            if width >= 6 {
+                let code = &rows[1..];
+                assert!(code.iter().all(|r| r.text.starts_with("  │ ")));
+                assert_eq!(
+                    code.iter()
+                        .map(|r| &r.text["  │ ".len()..])
+                        .collect::<String>(),
+                    source
+                );
+                assert_eq!(style_at(code, "世"), string_style);
+                assert!(code
+                    .iter()
+                    .flat_map(|r| &r.spans)
+                    .filter(|s| s.style == string_style || s.style == keyword_style)
+                    .all(|s| s.start >= 4));
+            }
+        }
+        let rows = layout_markdown("```rust\n\tlet x = \"\u{1b}[31m\u{7}\";\n\n```", 100);
+        assert!(rows.iter().all(|r| !r.text.chars().any(char::is_control)));
+        assert!(rows.iter().any(|r| r.text == "  │ "));
+        assert!(rows.iter().any(|r| r.text.starts_with("  │     let")));
+    }
+
+    #[test]
+    fn plain_fallback_and_incomplete_fences() {
+        for language in ["ri-weird", "", "text", "plaintext"] {
+            let rows = layout_markdown(&format!("```{language}\nfoo **bar**\n```"), 80);
+            assert_eq!(rows.last().unwrap().text, "  │ foo **bar**");
+            assert_eq!(style_at(&rows, "foo"), Style::default());
+        }
+        for source in [
+            "```r",
+            "```rust",
+            "```rust\nfn",
+            "```rust\nfn main(",
+            "```rust\nfn main() {",
+        ] {
+            let open = layout_markdown(source, 80);
+            let closed = layout_markdown(&format!("{source}\n```"), 80);
+            assert_eq!(format!("{open:?}"), format!("{closed:?}"));
+            if let Some((_, body)) = source.split_once('\n') {
+                assert_eq!(open.last().unwrap().text, format!("  │ {body}"));
+                assert!(matches!(style_at(&open, "fn").fg, Some(Color::Rgb(..))));
             }
         }
     }

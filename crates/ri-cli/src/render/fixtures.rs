@@ -89,6 +89,10 @@ The **renderer** supports *Markdown*, ***nested emphasis*** and `inline code`.\n
    - Cached\n\n\
 > Markdown is presentation-only.\n\n\
 ```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n\n\
+## Config\n\n\
+```toml\n[package]\nname = \"ri\"\n```\n\n\
+```ts\nconst value: string = \"hello\";\n```\n\n\
+```ri-example\nfoo => bar\n```\n\n\
 See [the documentation](https://example.com).\n\n";
 
 pub fn markdown_transcript(entry_count: usize) -> AppState {

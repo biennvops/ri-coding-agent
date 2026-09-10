@@ -1,5 +1,6 @@
 mod fixtures;
 mod markdown;
+mod syntax;
 
 pub use fixtures::{
     append_streaming_delta, markdown_transcript, synthetic_transcript, MARKDOWN_REPORT,
