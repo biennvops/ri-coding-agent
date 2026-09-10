@@ -198,10 +198,10 @@ Run these checks with a real configured provider after installation:
 - Command suggestions: type `/` and `/mo`, then verify Up/Down, Tab, Esc, exact-command Enter behavior, and `/model` and `/name` arguments.
 - Forced failures: start with `RI_LOG=debug ri`, try a bad command, a missing file, and an intentionally invalid temporary credential, then verify the full provider error is in the transcript and the sanitized status/body diagnostic is in `~/.ri/agent/logs/`.
 
+- Highlighted Markdown: request Rust, TypeScript/TSX, Python, Bash, JSON, TOML, YAML, Dockerfile, SQL, diff, unknown and unlabeled fences. Include multiline comments/strings, 100+ source lines, long lines, and wide Unicode. Resize narrowly during an unfinished streaming fence and scroll through completed responses; check prefixes, colors, alignment, flicker, and streaming CPU/latency.
+
 A live provider smoke is deliberately manual. It is not part of CI and must be reported as skipped when no usable credentials or endpoint are configured.
 
 ## Current non-goals
 
-Plugins, web search, Codex integration, MCP, skills, themes, syntax highlighting, session branching, new provider protocols, OAuth, remote execution, sandboxing, permission prompts, and public release automation are outside this baseline.
-
-- Highlighted Markdown: request Rust, TypeScript/TSX, Python, Bash, JSON, TOML, YAML, Dockerfile, SQL, diff, unknown and unlabeled fences. Include multiline comments/strings, 100+ source lines, long lines, and wide Unicode. Resize narrowly during an unfinished streaming fence and scroll through completed responses; check prefixes, colors, alignment, flicker, and streaming CPU/latency.
+Plugins, web search, Codex integration, MCP, skills, user-selectable themes, semantic/LSP highlighting, session branching, new provider protocols, OAuth, remote execution, sandboxing, permission prompts, and public release automation are outside this baseline.
