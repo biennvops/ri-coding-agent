@@ -629,9 +629,19 @@ mod tests {
                 "result": 42,
             })
             .to_string();
+            let acknowledgement_lines = (0..notification_count)
+                .map(|index| {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": index + 3,
+                        "result": null,
+                    })
+                    .to_string()
+                })
+                .collect::<Vec<_>>();
             let shutdown = serde_json::json!({
                 "jsonrpc": "2.0",
-                "id": 3,
+                "id": notification_count + 3,
                 "result": null,
             })
             .to_string();
@@ -647,38 +657,48 @@ mod tests {
                 .collect::<Vec<_>>();
             #[cfg(unix)]
             {
-                let notifications = notification_lines
-                    .iter()
-                    .map(|line| format!("printf '%s\\n' '{line}'"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let mut interaction =
+                    format!("printf '%s\\n' '{}'\n", notification_lines.first().unwrap());
+                for (index, acknowledgement) in acknowledgement_lines.iter().enumerate() {
+                    interaction.push_str("IFS= read -r acknowledgement\n");
+                    interaction.push_str(&format!("printf '%s\\n' '{acknowledgement}'\n"));
+                    if let Some(notification) = notification_lines.get(index + 1) {
+                        interaction.push_str(&format!("printf '%s\\n' '{notification}'\n"));
+                    }
+                }
                 format!(
-                    "IFS= read -r initialize\nprintf '%s\\n' '{initialize}'\nIFS= read -r request\n{notifications}\nprintf '%s\\n' '{response}'\nIFS= read -r shutdown\nprintf '%s\\n' '{shutdown}'\n"
+                    "IFS= read -r initialize\nprintf '%s\\n' '{initialize}'\nIFS= read -r request\n{interaction}printf '%s\\n' '{response}'\nIFS= read -r shutdown\nprintf '%s\\n' '{shutdown}'\n"
                 )
             }
             #[cfg(windows)]
             {
-                let notifications = notification_lines
-                    .iter()
-                    .map(|line| format!("echo {line}\r\n"))
-                    .collect::<String>();
+                let mut interaction = format!("echo {}\r\n", notification_lines.first().unwrap());
+                for (index, acknowledgement) in acknowledgement_lines.iter().enumerate() {
+                    interaction.push_str("set /p ACK=\r\n");
+                    interaction.push_str(&format!("echo {acknowledgement}\r\n"));
+                    if let Some(notification) = notification_lines.get(index + 1) {
+                        interaction.push_str(&format!("echo {notification}\r\n"));
+                    }
+                }
                 format!(
-                    "@echo off\r\nset /p INITIALIZE=\r\necho {initialize}\r\nset /p REQUEST=\r\n{notifications}echo {response}\r\nset /p SHUTDOWN=\r\necho {shutdown}\r\nexit /b 0\r\n"
+                    "@echo off\r\nset /p INITIALIZE=\r\necho {initialize}\r\nset /p REQUEST=\r\n{interaction}echo {response}\r\nset /p SHUTDOWN=\r\necho {shutdown}\r\nexit /b 0\r\n"
                 )
             }
         });
         let process = PluginProcess::start(fixture.load()).await.unwrap();
         let drain = async {
-            let mut received = 0;
-            while received < notification_count {
+            for index in 0..notification_count {
                 let notification = process.recv_notification().await.unwrap();
                 assert_eq!(notification.method, "event/progress");
-                assert_eq!(notification.params["index"], received);
-                received += 1;
+                assert_eq!(notification.params["index"], index);
+                process
+                    .request("notification/ack", Value::Null)
+                    .await
+                    .unwrap();
             }
-            received
+            notification_count
         };
-        let (result, received) = timeout(Duration::from_secs(1), async {
+        let (result, received) = timeout(Duration::from_secs(2), async {
             tokio::join!(process.request("pending", Value::Null), drain)
         })
         .await
