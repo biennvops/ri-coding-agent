@@ -5,6 +5,7 @@ pub mod context;
 pub mod conversation;
 mod fs;
 pub mod model;
+pub mod plugin;
 pub mod session;
 pub mod tools;
 
@@ -32,6 +33,7 @@ pub use model::{
     ModelProvider, ModelRequest, ModelResponse, ModelThinking, ModelToolCall, ProviderError,
     StopReason, ToolChoice, ToolDefinition, Usage,
 };
+pub use plugin::{builtin_plugins, PluginRegistry};
 pub use session::{
     read_session, validate_name, workspace_id, MessageId, OpenedSession, SessionAssistantItem,
     SessionError, SessionHandle, SessionHeader, SessionId, SessionInfo, SessionMessage,
@@ -39,8 +41,8 @@ pub use session::{
     MAX_SESSION_RECORD_BYTES, SESSION_VERSION,
 };
 pub use tools::{
-    Tool, ToolCallPresentation, ToolContext, ToolError, ToolEvent, ToolEventSender,
-    ToolExecutionMetadata, ToolExecutionResult, ToolOutputKind, ToolOutputStream, ToolPreviewKind,
-    ToolPreviewLine, ToolRegistry, ToolSummaryKind, DEFAULT_BASH_TIMEOUT_MS, MAX_TOOL_OUTPUT_BYTES,
-    MAX_TOOL_PREVIEW_BYTES, MAX_TOOL_PREVIEW_LINES,
+    builtin_tool_registry, Tool, ToolCallPresentation, ToolContext, ToolError, ToolEvent,
+    ToolEventSender, ToolExecutionMetadata, ToolExecutionResult, ToolOutputKind, ToolOutputStream,
+    ToolPreviewKind, ToolPreviewLine, ToolRegistry, ToolRegistryError, ToolSummaryKind,
+    DEFAULT_BASH_TIMEOUT_MS, MAX_TOOL_OUTPUT_BYTES, MAX_TOOL_PREVIEW_BYTES, MAX_TOOL_PREVIEW_LINES,
 };
