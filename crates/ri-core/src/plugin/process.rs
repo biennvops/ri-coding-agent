@@ -10,6 +10,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::codec::{FramedRead, LinesCodec};
+use tokio_util::sync::CancellationToken;
 
 use super::manifest::{LoadedPluginManifest, PluginManifest, PluginManifestError};
 use super::protocol::*;
@@ -323,16 +324,20 @@ impl Transport {
         }));
         let (notifications_tx, notifications) = mpsc::channel(PLUGIN_NOTIFICATION_CHANNEL_CAPACITY);
         let (outgoing, mut outgoing_rx) = mpsc::channel::<String>(MAX_PENDING_REQUESTS);
+        let writer_failed = CancellationToken::new();
+        let failure_signal = writer_failed.clone();
         let state = dispatch.clone();
         let writer = tokio::spawn(async move {
             while let Some(line) = outgoing_rx.recv().await {
                 if let Err(error) = write.write_all(line.as_bytes()).await {
                     state.lock().unwrap().fail(error.to_string());
+                    failure_signal.cancel();
                     return;
                 }
             }
             let _ = write.shutdown().await;
         });
+        let writer_abort = writer.abort_handle();
         let state = dispatch.clone();
         let reader = tokio::spawn(async move {
             let mut frames = FramedRead::new(
@@ -340,7 +345,11 @@ impl Transport {
                 LinesCodec::new_with_max_length(MAX_PLUGIN_FRAME_BYTES),
             );
             let reason = loop {
-                let message = match frames.next().await {
+                let frame = tokio::select! {
+                    frame = frames.next() => frame,
+                    _ = writer_failed.cancelled() => break "plugin stdin writer failed".into(),
+                };
+                let message = match frame {
                     Some(Ok(line)) => match decode_plugin_message(&line) {
                         Ok(message) => message,
                         Err(error) => break error.to_string(),
@@ -369,6 +378,7 @@ impl Transport {
                 }
             };
             state.lock().unwrap().fail(reason);
+            writer_abort.abort();
         });
         Self {
             outgoing: Some(outgoing),
@@ -480,6 +490,40 @@ mod tests {
             let path = self.directory.join(name);
             std::fs::write(&path, change(std::fs::read_to_string(&path).unwrap())).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn stdout_failure_resolves_requests_even_when_stdin_is_blocked() {
+        let (host, peer) = tokio::io::duplex(1);
+        let (read, write) = tokio::io::split(host);
+        let transport = Transport::new(read, write);
+        let (_peer_read, mut peer_write) = tokio::io::split(peer);
+        transport
+            .outgoing
+            .as_ref()
+            .unwrap()
+            .send("blocked\n".into())
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        for _ in 0..MAX_PENDING_REQUESTS {
+            transport
+                .outgoing
+                .as_ref()
+                .unwrap()
+                .try_send("queued\n".into())
+                .unwrap();
+        }
+        let result = timeout(Duration::from_secs(1), async {
+            let (result, _) = tokio::join!(transport.request("test", Value::Null), async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                peer_write.write_all(b"invalid\n").await.unwrap();
+            });
+            result
+        })
+        .await
+        .expect("stdout failure must unblock requests");
+        assert!(matches!(result, Err(PluginProcessError::Transport(_))));
     }
 
     #[tokio::test]
