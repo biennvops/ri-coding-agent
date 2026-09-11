@@ -202,6 +202,24 @@ Run these checks with a real configured provider after installation:
 
 A live provider smoke is deliberately manual. It is not part of CI and must be reported as skipped when no usable credentials or endpoint are configured.
 
+## Internal capability architecture
+
+`ri-core` has an internal plugin/capability foundation; it does **not** load external plugins.
+
+```text
+Application bootstrap → PluginRegistry → AgentRuntimeConfig → AgentRuntime
+                            └─ ToolRegistry: read, write, edit, bash
+```
+
+- A `Tool` is one model-callable capability. `ToolRegistry` provides ordered definitions, presentation, lookup, and execution.
+- `ToolRegistry::new()` (and `Default`) creates an empty registry. `register(Arc<dyn Tool>)` derives the canonical name from the tool definition and rejects duplicate names with `ToolRegistryError::DuplicateTool`, without replacing the existing tool. Definitions retain registration order.
+- `builtin_tool_registry()` registers the statically compiled `read`, `write`, `edit`, and `bash` tools through that same boundary, with unchanged schemas and behavior. `builtin_plugins()` wraps them in the host-side `PluginRegistry` capability container.
+- The application supplies `AgentRuntimeConfig.plugins`. Convenience runtime constructors and `AgentRuntimeConfig::new()` use the built-in bootstrap; `PluginRegistry::default()` is empty. Custom callers can register tools, wrap the registry with `PluginRegistry::new(Arc::new(tools))`, and inject it through configuration.
+
+Capability composition lives outside `AgentRuntime` so the agent loop only consumes the prepared tool registry, rather than deciding which tools exist or how they are supplied. `PluginRegistry` currently contains only tools; no speculative provider, command, context, or hook interfaces are defined.
+
+Third-party/external plugins, discovery and installation, a subprocess protocol, MCP, and web search are not implemented. A future external-plugin milestone is intended to use a versioned, language-neutral subprocess protocol, not a Rust dynamic-library ABI.
+
 ## Current non-goals
 
-Plugins, web search, Codex integration, MCP, skills, user-selectable themes, semantic/LSP highlighting, session branching, new provider protocols, OAuth, remote execution, sandboxing, permission prompts, and public release automation are outside this baseline.
+External plugins (including discovery/install and subprocess execution), web search, Codex integration, MCP, skills, user-selectable themes, semantic/LSP highlighting, session branching, new provider protocols, OAuth, remote execution, sandboxing, permission prompts, and public release automation are outside this baseline.
