@@ -10,6 +10,7 @@ const WIDTH: u16 = 100;
 const HEIGHT: u16 = 28;
 
 fn main() {
+    syntax_workloads();
     markdown_workloads();
     let fresh_state = render::synthetic_transcript(20, 4);
     measure("fresh first frame", 10, || {
@@ -193,7 +194,7 @@ fn format_duration(duration: Duration) -> String {
 
 fn markdown_workloads() {
     let history = render::markdown_transcript(100);
-    measure("Markdown history · cold ~40 KiB", 3, || {
+    measure("Markdown mixed history · cold · 100 entries", 3, || {
         let mut terminal = test_terminal(WIDTH, HEIGHT);
         let mut renderer = TuiRenderer::new();
         renderer.draw(&mut terminal, &history, 0).unwrap();
@@ -242,4 +243,77 @@ fn markdown_workloads() {
         renderer.draw(&mut terminal, &state, 0).unwrap();
         assert_eq!(renderer.stats().bytes_reflowed, 0);
     }
+}
+
+fn syntax_workloads() {
+    let snippet = "// A representative Rust function\nfn greeting(name: &str) -> String {\n    let prefix = \"hello\";\n    format!(\"{prefix}, {name}!\")\n}\n";
+    let source = format!(
+        "```rust\n{}",
+        snippet.repeat(65_536usize.div_ceil(snippet.len()))
+    );
+    let mut state = ri_core::AppState::new();
+    state.reduce(AgentEvent::AssistantMessageStarted);
+    render::append_streaming_delta(&mut state, &source[..1_024]);
+    measure("Rust first highlight · 1 KiB · lazy setup", 1, || {
+        let mut terminal = test_terminal(WIDTH, HEIGHT);
+        TuiRenderer::new().draw(&mut terminal, &state, 0).unwrap();
+    });
+
+    for size in [8_192, 32_768, 65_536] {
+        let mut history = ri_core::AppState::new();
+        history.reduce(AgentEvent::AssistantMessageStarted);
+        render::append_streaming_delta(&mut history, &format!("{}\n```", &source[..size]));
+        history.reduce(AgentEvent::AssistantMessageFinished { items: Vec::new() });
+        measure(&format!("Rust completed · {size} bytes"), 3, || {
+            let mut terminal = test_terminal(WIDTH, HEIGHT);
+            let mut renderer = TuiRenderer::new();
+            renderer.draw(&mut terminal, &history, 0).unwrap();
+            assert_eq!(renderer.stats().entries_reflowed, 1);
+        });
+        let mut terminal = test_terminal(WIDTH, HEIGHT);
+        let mut renderer = TuiRenderer::new();
+        renderer.draw(&mut terminal, &history, 0).unwrap();
+        history.acknowledge_transcript_changes();
+        for scroll in [0, 100] {
+            measure(
+                &format!("Rust cached · {size} · scroll={scroll}"),
+                10,
+                || {
+                    renderer.draw(&mut terminal, &history, scroll).unwrap();
+                    assert_eq!(renderer.stats().bytes_reflowed, 0);
+                    assert_eq!(renderer.stats().cache_misses, 0);
+                },
+            );
+        }
+        history.reduce(AgentEvent::AssistantMessageStarted);
+        let mut previous = 0;
+        for target in [1_024, 8_192, 32_768, 65_536] {
+            render::append_streaming_delta(&mut history, &source[previous..target]);
+            previous = target;
+            let mode = if target > 16 * 1024 {
+                "plain fallback >16 KiB"
+            } else {
+                "syntax-highlighted"
+            };
+            measure(
+                &format!("Rust stream · {target} · {mode} · history={size}"),
+                1,
+                || {
+                    renderer.draw(&mut terminal, &history, 0).unwrap();
+                    assert_eq!(renderer.stats().entries_reflowed, 1);
+                    assert_eq!(renderer.stats().bytes_reflowed, target);
+                },
+            );
+            renderer.draw(&mut terminal, &history, 0).unwrap();
+            assert_eq!(renderer.stats().bytes_reflowed, 0);
+        }
+    }
+
+    let mut prose = ri_core::AppState::new();
+    prose.reduce(AgentEvent::AssistantMessageStarted);
+    render::append_streaming_delta(&mut prose, &"## Report\n\nSome **bold** prose and `inline code`.\n\n- First change\n- Second change\n\n".repeat(800));
+    measure("Markdown prose/lists · ~64 KiB", 3, || {
+        let mut terminal = test_terminal(WIDTH, HEIGHT);
+        TuiRenderer::new().draw(&mut terminal, &prose, 0).unwrap();
+    });
 }

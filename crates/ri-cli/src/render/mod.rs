@@ -1,5 +1,6 @@
 mod fixtures;
 mod markdown;
+mod syntax;
 
 pub use fixtures::{
     append_streaming_delta, markdown_transcript, synthetic_transcript, MARKDOWN_REPORT,
@@ -852,7 +853,7 @@ impl TranscriptLayoutCache {
     ) {
         let previous = self.streaming_layout.take();
         let Some(mut layout) = previous else {
-            let content_rows = markdown::layout_markdown(&streaming.content, width);
+            let content_rows = markdown::layout_streaming_markdown(&streaming.content, width);
             let (thinking_rows, thinking_starts) = if streaming.thinking.is_empty() {
                 (Vec::new(), Vec::new())
             } else {
@@ -902,7 +903,8 @@ impl TranscriptLayoutCache {
             && streaming.thinking.len() >= layout.thinking_len;
         if append_only {
             if streaming.content.len() > layout.content_len {
-                layout.content_rows = markdown::layout_markdown(&streaming.content, width);
+                layout.content_rows =
+                    markdown::layout_streaming_markdown(&streaming.content, width);
                 bytes_reflowed = bytes_reflowed.saturating_add(streaming.content.len());
             }
             if streaming.thinking.len() > layout.thinking_len {
@@ -918,7 +920,7 @@ impl TranscriptLayoutCache {
                 bytes_reflowed = bytes_reflowed.saturating_add(bytes);
             }
         } else {
-            let content_rows = markdown::layout_markdown(&streaming.content, width);
+            let content_rows = markdown::layout_streaming_markdown(&streaming.content, width);
             let (thinking_rows, thinking_starts) = if streaming.thinking.is_empty() {
                 (Vec::new(), Vec::new())
             } else {
