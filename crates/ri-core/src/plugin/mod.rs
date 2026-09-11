@@ -22,3 +22,5 @@ impl PluginRegistry {
 pub fn builtin_plugins() -> PluginRegistry {
     PluginRegistry::new(Arc::new(builtin_tool_registry()))
 }
+
+pub mod manifest;
