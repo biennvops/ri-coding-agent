@@ -24,3 +24,5 @@ pub fn builtin_plugins() -> PluginRegistry {
 }
 
 pub mod manifest;
+
+pub mod protocol;

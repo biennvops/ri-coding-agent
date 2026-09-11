@@ -63,7 +63,7 @@ impl PluginManifest {
                 value: self.manifest_version,
             });
         }
-        if self.protocol_version != "ri.plugin.v1" {
+        if self.protocol_version != super::protocol::PLUGIN_PROTOCOL_VERSION {
             return Err(PluginManifestError::UnsupportedProtocolVersion {
                 path: path.into(),
                 value: self.protocol_version.clone(),
