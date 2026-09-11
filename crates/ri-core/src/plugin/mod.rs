@@ -1,4 +1,4 @@
-//! Host-side capability composition, not external plugin loading.
+//! Built-in capability composition and explicitly invoked external-plugin lifecycle.
 
 use std::sync::Arc;
 
@@ -24,12 +24,29 @@ pub fn builtin_plugins() -> PluginRegistry {
 }
 
 pub mod manifest;
-
+mod process;
 pub mod protocol;
 
-mod process;
-
+pub use manifest::{
+    load_plugin_manifest, LoadedPluginManifest, PluginEntrypoint, PluginManifest,
+    PluginManifestError, PLUGIN_MANIFEST_VERSION,
+};
 pub use process::{
     PluginDiagnostics, PluginProcess, PluginProcessError, MAX_PLUGIN_STDERR_BYTES,
-    PLUGIN_STARTUP_TIMEOUT,
+    PLUGIN_SHUTDOWN_TIMEOUT, PLUGIN_STARTUP_TIMEOUT,
 };
+pub use protocol::{
+    PluginCapabilities, PluginIdentity, MAX_PLUGIN_FRAME_BYTES, PLUGIN_PROTOCOL_VERSION,
+};
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn normal_bootstrap_remains_builtin_only() {
+        assert_eq!(
+            super::builtin_plugins().tools().names(),
+            ["read", "write", "edit", "bash"]
+        );
+        assert!(super::PluginRegistry::default().tools().names().is_empty());
+    }
+}
