@@ -20,11 +20,16 @@ use ri_core::{
     ToolPreviewKind, ToolStatus, ToolSummaryKind, ToolTranscriptEntry, TranscriptEntry,
     TranscriptEntryId, TranscriptEntryState, UserMessageStatus,
 };
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::commands::{matching_commands, CommandSuggestions};
 use crate::input::VisualLayout;
 use crate::thinking_picker::ThinkingPickerState;
+
+const COMPOSER_RULE_COLOR: Color = Color::DarkGray;
+const CONTEXT_WARNING_PERCENT: u128 = 70;
+const CONTEXT_CRITICAL_PERCENT: u128 = 90;
 
 const MAX_VISIBLE_COMMAND_SUGGESTIONS: usize = 6;
 const TOOL_RUNNING_BACKGROUND: Color = Color::Rgb(48, 42, 18);
@@ -213,7 +218,7 @@ impl TuiRenderer {
         thinking_picker: Option<&ThinkingPickerState>,
     ) {
         let area = frame.area();
-        let editor_width = area.width.saturating_sub(2).max(1) as usize;
+        let editor_width = area.width.max(1) as usize;
         let (editor_rows, editor_cursor_row) = {
             let editor_layout = self
                 .editor
@@ -236,14 +241,14 @@ impl TuiRenderer {
             ])
             .split(area);
 
-        let transcript_width = chunks[0].width.saturating_sub(2).max(1) as usize;
+        let transcript_width = chunks[0].width.max(1) as usize;
         self.transcript.prepare(
             state,
             transcript_width,
             self.tool_output_expanded,
             &mut self.last_stats,
         );
-        let visible_lines = chunks[0].height.saturating_sub(2) as usize;
+        let visible_lines = chunks[0].height as usize;
         self.transcript_viewport_rows = visible_lines;
         let maximum_scroll = self.transcript.total_rows().saturating_sub(visible_lines);
         let (scroll, scroll_from_bottom) = match viewport {
@@ -256,17 +261,10 @@ impl TuiRenderer {
                 (state.top_row, state.from_bottom())
             }
         };
-        let transcript_block = Block::default().borders(Borders::ALL).title(" transcript ");
-        let transcript_inner = transcript_block.inner(chunks[0]);
-        frame.render_widget(transcript_block, chunks[0]);
-        self.transcript.render_visible(
-            transcript_inner,
-            scroll,
-            &mut self.last_stats,
-            frame.buffer_mut(),
-        );
+        self.transcript
+            .render_visible(chunks[0], scroll, &mut self.last_stats, frame.buffer_mut());
 
-        let editor_width = chunks[1].width.saturating_sub(2).max(1) as usize;
+        let editor_width = chunks[1].width.max(1) as usize;
         let (cursor, editor_lines) = {
             let editor_layout = self
                 .editor
@@ -288,7 +286,11 @@ impl TuiRenderer {
             .row
             .saturating_sub(editor_visible_lines.saturating_sub(1));
         let editor = Paragraph::new(editor_lines)
-            .block(Block::default().borders(Borders::ALL).title(" input "))
+            .block(
+                Block::default()
+                    .borders(Borders::TOP | Borders::BOTTOM)
+                    .border_style(Style::default().fg(COMPOSER_RULE_COLOR)),
+            )
             .scroll((editor_scroll.min(u16::MAX as usize) as u16, 0));
         frame.render_widget(editor, chunks[1]);
         if let Some(picker) = thinking_picker {
@@ -306,18 +308,15 @@ impl TuiRenderer {
         );
         frame.render_widget(Paragraph::new(footer), chunks[2]);
 
-        if thinking_picker.is_none() && chunks[1].height > 2 {
-            let x = chunks[1]
-                .x
-                .saturating_add(1)
-                .saturating_add(cursor.column as u16);
+        if thinking_picker.is_none() && chunks[1].height > 2 && chunks[1].width > 0 {
+            let x = chunks[1].x.saturating_add(cursor.column as u16);
             let y = chunks[1]
                 .y
                 .saturating_add(1)
                 .saturating_add(cursor.row.saturating_sub(editor_scroll) as u16);
             let max_x = chunks[1]
                 .x
-                .saturating_add(chunks[1].width.saturating_sub(2));
+                .saturating_add(chunks[1].width.saturating_sub(1));
             let max_y = chunks[1]
                 .y
                 .saturating_add(chunks[1].height.saturating_sub(2));
@@ -345,7 +344,7 @@ fn thinking_picker_layout(
     picker: &ThinkingPickerState,
 ) -> Option<(Rect, usize)> {
     let available_height = editor_area.y.saturating_sub(frame_area.y) as usize;
-    let available_width = editor_area.width.saturating_sub(2) as usize;
+    let available_width = editor_area.width as usize;
     if picker.len() == 0 || available_height < 3 || available_width < 4 {
         return None;
     }
@@ -359,7 +358,7 @@ fn thinking_picker_layout(
     let height = visible_rows.saturating_add(2) as u16;
     Some((
         Rect::new(
-            editor_area.x.saturating_add(1),
+            editor_area.x,
             editor_area.y.saturating_sub(height),
             width,
             height,
@@ -379,7 +378,7 @@ fn render_command_suggestions(
     }
     let total = matching_commands(state.input()).count();
     let available_height = editor_area.y.saturating_sub(frame.area().y) as usize;
-    let width = editor_area.width.saturating_sub(2).min(64);
+    let width = editor_area.width.min(64);
     if total == 0 || available_height < 3 || width < 4 {
         return;
     }
@@ -409,7 +408,7 @@ fn render_command_suggestions(
         .collect::<Vec<_>>();
     let height = visible.saturating_add(2) as u16;
     let area = Rect::new(
-        editor_area.x.saturating_add(1),
+        editor_area.x,
         editor_area.y.saturating_sub(height),
         width,
         height,
@@ -1410,16 +1409,7 @@ fn footer_text(
         .active_model()
         .map(ModelRef::display_name)
         .unwrap_or_else(|| "no model".to_owned());
-    let session = state
-        .session_info()
-        .map(|info| format!("session: {}", info.display_name()))
-        .unwrap_or_else(|| "session: ephemeral".to_owned());
-    let usage = state.context_usage();
-    let current = format_token_count(usage.current_tokens());
-    let context = match usage.context_window {
-        Some(window) => format!("ctx ~{current}/{}", format_token_count(window)),
-        None => format!("ctx ~{current}"),
-    };
+    let context = context_footer(state.context_usage());
     let (status, critical_status) = if scroll_from_bottom > 0 {
         (format!("↑ {scroll_from_bottom} lines"), true)
     } else if state.last_error().is_some() {
@@ -1427,87 +1417,207 @@ fn footer_text(
     } else if state.is_compaction_active() {
         ("compacting".to_owned(), true)
     } else if state.is_busy() {
-        ("busy".to_owned(), true)
+        ("busy".to_owned(), false)
     } else {
         ("ready".to_owned(), false)
     };
 
-    let mut core = vec![model];
+    // Selection order is priority; display order is independently left/right grouped.
+    let mut items = vec![
+        FooterItem::new(
+            status,
+            Color::Gray,
+            if critical_status {
+                FooterPriority::CriticalStatus
+            } else {
+                FooterPriority::Status
+            },
+            3,
+            false,
+            critical_status,
+        ),
+        FooterItem::new(model, Color::Cyan, FooterPriority::Model, 0, true, true),
+    ];
     if let Some(level) = state.thinking_level() {
-        core.push(format!("think {level}"));
-    }
-    core.push(context);
-    let mut branch = state.git_branch().map(str::to_owned);
-    let mut session = Some(session);
-    let mut hint = has_expandable_tool_output.then(|| {
-        if tool_output_expanded {
-            "Ctrl+O collapse tools".to_owned()
-        } else {
-            "Ctrl+O expand tools".to_owned()
-        }
-    });
-    let mut status = Some(status);
-    let limit = width.saturating_sub(1) as usize;
-
-    loop {
-        let text = footer_components(&core, &branch, &session, &hint, &status);
-        if UnicodeWidthStr::width(text.as_str()) <= limit {
-            return Line::from(Span::styled(text, Style::default().fg(Color::Gray)));
-        }
-        if hint.take().is_some() {
-            continue;
-        }
-        if branch.take().is_some() {
-            continue;
-        }
-        if session.take().is_some() {
-            continue;
-        }
-        if !critical_status && status.take().is_some() {
-            continue;
-        }
-        if critical_status {
-            let status = status.as_deref().unwrap_or_default();
-            return Line::from(Span::styled(
-                truncate_display_width(status, limit),
-                Style::default().fg(Color::Gray),
-            ));
-        }
-        return Line::from(Span::styled(
-            truncate_display_width(&text, limit),
-            Style::default().fg(Color::Gray),
+        items.push(FooterItem::new(
+            level.to_string(),
+            Color::Cyan,
+            FooterPriority::Thinking,
+            1,
+            true,
+            false,
         ));
+    }
+    items.push(FooterItem::new(
+        context.0,
+        context.1,
+        FooterPriority::Context,
+        2,
+        false,
+        false,
+    ));
+    if let Some(branch) = state.git_branch() {
+        items.push(FooterItem::new(
+            branch.to_owned(),
+            Color::Cyan,
+            FooterPriority::Branch,
+            0,
+            false,
+            true,
+        ));
+    }
+    if let Some(session) = state.session_info() {
+        items.push(FooterItem::new(
+            session.display_name(),
+            Color::DarkGray,
+            FooterPriority::Session,
+            1,
+            false,
+            false,
+        ));
+    }
+    if has_expandable_tool_output {
+        let hint = if tool_output_expanded {
+            "Ctrl+O collapse tools"
+        } else {
+            "Ctrl+O expand tools"
+        };
+        items.push(FooterItem::new(
+            hint.to_owned(),
+            Color::DarkGray,
+            FooterPriority::Hint,
+            4,
+            false,
+            false,
+        ));
+    }
+    items.sort_by_key(|item| item.priority);
+    let mut remaining = width as usize;
+    let mut selected = Vec::new();
+    for mut item in items {
+        let separator = if selected.is_empty() { 0 } else { 2 };
+        let available = remaining.saturating_sub(separator);
+        if UnicodeWidthStr::width(item.text.as_str()) > available {
+            if !item.truncate || available == 0 {
+                continue;
+            }
+            item.text = truncate_display_width(&item.text, available);
+        }
+        if item.text.is_empty() {
+            continue;
+        }
+        remaining -= separator + UnicodeWidthStr::width(item.text.as_str());
+        selected.push(item);
+    }
+    selected.sort_by_key(|item| (item.right, item.order));
+    let has_left = selected.iter().any(|item| !item.right);
+    let mut spans = Vec::new();
+    let mut right_started = false;
+    for item in selected {
+        if item.right && !right_started {
+            spans.push(Span::raw(
+                " ".repeat(remaining + if has_left { 2 } else { 0 }),
+            ));
+            right_started = true;
+        } else if !spans.is_empty() {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(item.text, Style::default().fg(item.color)));
+    }
+    Line::from(spans)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum FooterPriority {
+    CriticalStatus,
+    Model,
+    Thinking,
+    Context,
+    Branch,
+    Status,
+    Session,
+    Hint,
+}
+
+struct FooterItem {
+    text: String,
+    color: Color,
+    priority: FooterPriority,
+    order: u8,
+    right: bool,
+    truncate: bool,
+}
+
+impl FooterItem {
+    fn new(
+        text: String,
+        color: Color,
+        priority: FooterPriority,
+        order: u8,
+        right: bool,
+        truncate: bool,
+    ) -> Self {
+        Self {
+            text,
+            color,
+            priority,
+            order,
+            right,
+            truncate,
+        }
     }
 }
 
-fn footer_components(
-    core: &[String],
-    branch: &Option<String>,
-    session: &Option<String>,
-    hint: &Option<String>,
-    status: &Option<String>,
-) -> String {
-    core.iter()
-        .chain(branch.iter())
-        .chain(session.iter())
-        .chain(hint.iter())
-        .chain(status.iter())
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join(" · ")
+fn context_footer(usage: ri_core::ContextUsage) -> (String, Color) {
+    let approximation = if usage.source == ri_core::UsageSource::Estimated {
+        "~"
+    } else {
+        ""
+    };
+    let Some(window) = usage.context_window.filter(|&window| window > 0) else {
+        return (
+            format!(
+                "{approximation}{}",
+                format_token_count(usage.current_tokens())
+            ),
+            Color::Gray,
+        );
+    };
+    let percentage = u128::from(usage.current_tokens()) * 100 / u128::from(window);
+    let color = if percentage >= CONTEXT_CRITICAL_PERCENT {
+        Color::Red
+    } else if percentage >= CONTEXT_WARNING_PERCENT {
+        Color::Yellow
+    } else {
+        Color::Gray
+    };
+    (
+        format!(
+            "{approximation}{percentage}%/{}",
+            format_token_count(window)
+        ),
+        color,
+    )
 }
 
 fn truncate_display_width(text: &str, limit: usize) -> String {
+    if UnicodeWidthStr::width(text) <= limit {
+        return text.to_owned();
+    }
+    if limit == 0 {
+        return String::new();
+    }
     let mut rendered = String::new();
-    let mut width: usize = 0;
-    for character in text.chars() {
-        let character_width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
-        if width.saturating_add(character_width) > limit {
+    let mut width = 0;
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if width + grapheme_width > limit - 1 {
             break;
         }
-        rendered.push(character);
-        width = width.saturating_add(character_width);
+        rendered.push_str(grapheme);
+        width += grapheme_width;
     }
+    rendered.push('…');
     rendered
 }
 
@@ -1515,9 +1625,15 @@ fn format_token_count(value: u64) -> String {
     if value < 1_000 {
         value.to_string()
     } else if value < 1_000_000 {
-        trim_decimal(format!("{:.1}k", value as f64 / 1_000.0))
+        format!(
+            "{}k",
+            trim_decimal(format!("{:.1}", value as f64 / 1_000.0))
+        )
     } else {
-        trim_decimal(format!("{:.1}m", value as f64 / 1_000_000.0))
+        format!(
+            "{}m",
+            trim_decimal(format!("{:.1}", value as f64 / 1_000_000.0))
+        )
     }
 }
 
@@ -1543,8 +1659,8 @@ mod tests {
     fn assert_footer_context(state: &AppState, tokens: u64, context_window: u64) {
         let text = footer_text(state, 200, 0, false, false).to_string();
         let expected = format!(
-            "ctx ~{}/{}",
-            format_token_count(tokens),
+            "~{}%/{}",
+            u128::from(tokens) * 100 / u128::from(context_window),
             format_token_count(context_window)
         );
         assert!(
@@ -1599,7 +1715,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .content_rows;
-            let expected = markdown::layout_markdown(source, 78);
+            let expected = markdown::layout_markdown(source, 80);
             assert_eq!(format!("{cached:?}"), format!("{expected:?}"));
             renderer.draw(&mut terminal, &state, 0).unwrap();
             assert_eq!(renderer.stats().bytes_reflowed, 0);
@@ -1627,7 +1743,7 @@ mod tests {
         } else {
             panic!("expected message");
         }
-        let settled = layout_entry(entry, 78, false);
+        let settled = layout_entry(entry, 80, false);
         assert_eq!(
             format!("{:?}", &settled[3..settled.len() - 1]),
             format!("{active:?}")
@@ -1814,7 +1930,7 @@ mod tests {
         state.reduce(AgentEvent::AssistantMessageStarted);
         let mut renderer = TuiRenderer::new();
         let mut terminal = terminal();
-        let width = 18;
+        let width = 20;
         let chunks = ["abcdef", "😀", "e\u{301}", "\n", "世界", " trailing text"];
 
         for chunk in chunks {
@@ -2762,8 +2878,7 @@ mod tests {
             let mut state = AppState::new();
             state.reduce(AgentEvent::AssistantMessageStarted);
             let mut renderer = TuiRenderer::new();
-            let mut terminal =
-                Terminal::new(TestBackend::new(width + 2, 10)).expect("test terminal");
+            let mut terminal = Terminal::new(TestBackend::new(width, 10)).expect("test terminal");
             for character in text.chars() {
                 append_streaming_delta(&mut state, &character.to_string());
                 renderer
@@ -2888,7 +3003,7 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert!(narrow.contains("cockpit/gpt"));
-        assert!(narrow.contains("ctx ~0"));
+        assert!(narrow.contains("~0"));
         assert!(!narrow.contains("feature/footer"));
     }
 
@@ -2988,7 +3103,333 @@ mod tests {
 
         assert!(text.contains("error — see transcript"));
         assert!(!text.contains(provider_message));
-        assert!(text.len() < 120);
+        assert_eq!(UnicodeWidthStr::width(text.as_str()), 200);
+    }
+
+    #[test]
+    fn borderless_geometry_reclaims_columns_rows_and_page_size() {
+        let mut state = AppState::new();
+        state.add_system_message("123456789012345678");
+        state.insert_text("1234567890123456789");
+        let mut renderer = TuiRenderer::new();
+        let mut terminal = terminal();
+        renderer.draw(&mut terminal, &state, 0).unwrap();
+        assert_eq!(renderer.transcript.width, 18 + 2);
+        assert_eq!(renderer.editor.width, 18 + 2);
+        assert_eq!(renderer.editor.layout.as_ref().unwrap().row_count(), 1);
+        assert_eq!(renderer.transcript_page_rows(), 4 + 2);
+        assert_eq!(renderer.transcript_total_rows(), 3);
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].symbol(), "▶");
+        assert_eq!(buffer[(19, 1)].symbol(), "8");
+        for x in 0..20 {
+            for y in [6, 8] {
+                assert_eq!(buffer[(x, y)].symbol(), "─");
+                assert_eq!(buffer[(x, y)].fg, COMPOSER_RULE_COLOR);
+            }
+        }
+        assert_eq!(buffer[(0, 7)].symbol(), "1");
+        assert_eq!(buffer[(19, 7)].symbol(), " ");
+        terminal.backend_mut().assert_cursor_position((19, 7));
+    }
+
+    #[test]
+    fn composer_cursor_tracks_full_width_unicode_multiline_and_scrolling() {
+        for (width, height, input, cursor, content) in [
+            (20, 10, "", (0, 7), ""),
+            (20, 10, "abc", (3, 7), "abc"),
+            (4, 10, "abcd", (0, 7), ""),
+            (4, 10, "abc界", (2, 7), "界"),
+            (4, 10, "e\u{301}界", (3, 7), "e\u{301}界"),
+            (20, 10, "first\nsecond\nthird", (5, 7), "third"),
+            (4, 6, "a\nb\nc\nd\ne", (1, 3), "e"),
+            (1, 5, "a", (0, 2), ""),
+        ] {
+            let mut state = AppState::new();
+            state.insert_text(input);
+            let mut renderer = TuiRenderer::new();
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            renderer.draw(&mut terminal, &state, 0).unwrap();
+            terminal.backend_mut().assert_cursor_position(cursor);
+            if !content.is_empty() {
+                assert_eq!(
+                    find_text_cell(terminal.backend().buffer(), content)
+                        .unwrap()
+                        .0,
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn borderless_scroll_pages_and_resize_use_all_transcript_rows() {
+        let state = synthetic_transcript(100, 20);
+        let mut renderer = TuiRenderer::new();
+        let mut terminal = terminal();
+        let mut scroll = TranscriptScroll::default();
+        let suggestions = CommandSuggestions::default();
+        renderer
+            .draw_interactive(&mut terminal, &state, &mut scroll, &suggestions, None)
+            .unwrap();
+        assert_eq!(scroll.maximum_scroll, renderer.transcript_total_rows() - 6);
+        scroll.scroll_up(renderer.transcript_page_rows());
+        assert_eq!(scroll.from_bottom(), 6);
+        let top = scroll.top_row;
+        terminal.backend_mut().resize(20, 12);
+        renderer
+            .draw_interactive(&mut terminal, &state, &mut scroll, &suggestions, None)
+            .unwrap();
+        assert_eq!(renderer.transcript_page_rows(), 8);
+        assert_eq!(scroll.top_row, top);
+        assert_eq!(scroll.from_bottom(), 4);
+        assert_eq!(renderer.stats().entries_reflowed, 0);
+        scroll.scroll_down(renderer.transcript_page_rows());
+        assert_eq!(scroll.from_bottom(), 0);
+    }
+
+    #[test]
+    fn popups_align_with_composer_and_keep_their_own_borders() {
+        let mut state = AppState::new();
+        state.insert_text("/");
+        let picker = thinking_picker();
+        for width in [4, 8, 12, 40, 60, 80] {
+            for active_picker in [None, Some(&picker)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+                let mut renderer = TuiRenderer::new();
+                renderer
+                    .draw_interactive(
+                        &mut terminal,
+                        &state,
+                        &mut TranscriptScroll::default(),
+                        &CommandSuggestions::default(),
+                        active_picker,
+                    )
+                    .unwrap();
+                let popup_width = if active_picker.is_some() {
+                    width.min(12)
+                } else {
+                    width.min(64)
+                };
+                let buffer = terminal.backend().buffer();
+                assert_eq!(buffer[(0, 15)].symbol(), "└");
+                assert_eq!(buffer[(popup_width - 1, 15)].symbol(), "┘");
+                assert_eq!(buffer[(0, 14)].symbol(), "│");
+                assert_eq!(buffer[(0, 16)].symbol(), "─");
+                assert_eq!(terminal.backend().cursor_visible(), active_picker.is_none());
+            }
+        }
+        for width in 0..5 {
+            for height in 0..6 {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                TuiRenderer::new()
+                    .draw_interactive(
+                        &mut terminal,
+                        &state,
+                        &mut TranscriptScroll::default(),
+                        &CommandSuggestions::default(),
+                        Some(&picker),
+                    )
+                    .unwrap();
+            }
+        }
+        let editor = Rect::new(3, 15, 8, 3);
+        let (popup, _) = thinking_picker_layout(Rect::new(3, 2, 8, 20), editor, &picker).unwrap();
+        assert_eq!(popup.x, editor.x);
+        assert_eq!(popup.width, editor.width);
+    }
+
+    fn configured_footer_state() -> AppState {
+        let mut state = AppState::new();
+        state.reduce(AgentEvent::ModelChanged(ModelRef {
+            provider: "cockpit".into(),
+            model: "gpt".into(),
+        }));
+        state.set_thinking_level(Some(ThinkingLevel::Max));
+        state.set_git_branch(Some("main".into()));
+        state.reduce(AgentEvent::ContextUsageUpdated(ContextUsage::estimated(
+            40_000,
+            ModelLimits {
+                context_window: Some(128_000),
+                max_output_tokens: None,
+            },
+        )));
+        state
+    }
+
+    #[test]
+    fn footer_has_exact_left_right_groups_and_no_old_labels() {
+        let state = configured_footer_state();
+        let line = footer_text(&state, 80, 0, false, false);
+        let left = "main  ~31%/128k  ready";
+        let right = "cockpit/gpt  max";
+        assert_eq!(
+            line.to_string(),
+            format!("{left}{}{right}", " ".repeat(80 - left.len() - right.len()))
+        );
+        for old in ["think ", "ctx ", " · ", "session:", "ephemeral"] {
+            assert!(!line.to_string().contains(old));
+        }
+        let narrow = footer_text(&state, 28, 0, true, false).to_string();
+        assert_eq!(narrow, "~31%/128k   cockpit/gpt  max");
+        let critical = footer_text(&state, 39, 42, true, false).to_string();
+        assert!(critical.starts_with("~31%/128k  ↑ 42 lines"));
+        assert!(critical.ends_with(right));
+        assert!(!critical.contains("Ctrl+O"));
+    }
+
+    #[test]
+    fn context_percentage_source_fallback_pressure_and_overflow() {
+        for (tokens, color) in [
+            (69_999, Color::Gray),
+            (70_000, Color::Yellow),
+            (89_999, Color::Yellow),
+            (90_000, Color::Red),
+        ] {
+            let usage = ContextUsage::estimated(
+                tokens,
+                ModelLimits {
+                    context_window: Some(100_000),
+                    max_output_tokens: None,
+                },
+            );
+            assert_eq!(
+                context_footer(usage),
+                (format!("~{}%/100k", tokens / 1000), color)
+            );
+            let provider = ContextUsage {
+                input_tokens: Some(tokens),
+                estimated_input_tokens: 1,
+                source: ri_core::UsageSource::Provider,
+                ..usage
+            };
+            assert_eq!(
+                context_footer(provider),
+                (format!("{}%/100k", tokens / 1000), color)
+            );
+            let mut state = AppState::new();
+            state.reduce(AgentEvent::ContextUsageUpdated(provider));
+            let footer = footer_text(&state, 80, 0, false, false);
+            assert_eq!(
+                footer
+                    .spans
+                    .iter()
+                    .find(|span| span.content.contains('%'))
+                    .unwrap()
+                    .style
+                    .fg,
+                Some(color)
+            );
+            assert!(footer
+                .spans
+                .iter()
+                .filter(|span| !span.content.contains('%'))
+                .all(|span| span.style.fg != Some(Color::Red)
+                    && span.style.fg != Some(Color::Yellow)));
+        }
+        for window in [None, Some(0)] {
+            let usage = ContextUsage {
+                estimated_input_tokens: 12_000,
+                context_window: window,
+                ..ContextUsage::default()
+            };
+            assert_eq!(context_footer(usage), ("~12k".into(), Color::Gray));
+            assert_eq!(
+                context_footer(ContextUsage {
+                    source: ri_core::UsageSource::Provider,
+                    input_tokens: Some(12_000),
+                    ..usage
+                })
+                .0,
+                "12k"
+            );
+        }
+        assert_eq!(
+            context_footer(ContextUsage {
+                estimated_input_tokens: u64::MAX,
+                context_window: Some(1),
+                ..ContextUsage::default()
+            })
+            .0,
+            format!("~{}%/1", u128::from(u64::MAX) * 100)
+        );
+    }
+
+    #[test]
+    fn session_and_hint_are_optional_and_footer_changes_do_not_reflow_history() {
+        let mut state = configured_footer_state();
+        state.add_system_message("unchanged history");
+        state.set_session_info(Some(ri_core::SessionInfo {
+            id: "session-id".into(),
+            path: Default::default(),
+            name: Some("refactor-agent".into()),
+            thinking_level: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            workspace_root: Default::default(),
+            project_root: Default::default(),
+            message_count: 1,
+            first_user_preview: None,
+            materialized: false,
+        }));
+        let wide = footer_text(&state, 100, 0, true, false).to_string();
+        assert!(wide.starts_with("main  refactor-agent  ~31%/128k  ready  Ctrl+O expand tools"));
+        let medium = footer_text(&state, 60, 0, true, false).to_string();
+        assert!(medium.contains("refactor-agent"));
+        assert!(!medium.contains("Ctrl+O"));
+        let narrow = footer_text(&state, 40, 0, true, false).to_string();
+        assert!(narrow.starts_with("main  ~31%/128k  ready"));
+        assert!(!narrow.contains("refactor-agent"));
+        assert!(narrow.ends_with("cockpit/gpt  max"));
+
+        let mut renderer = TuiRenderer::new();
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        renderer.draw(&mut terminal, &state, 0).unwrap();
+        state.acknowledge_transcript_changes();
+        state.set_git_branch(Some("feature/another-branch".into()));
+        state.set_thinking_level(Some(ThinkingLevel::Low));
+        state.set_session_info(None);
+        state.reduce(AgentEvent::ContextUsageUpdated(ContextUsage::estimated(
+            96_000,
+            ModelLimits {
+                context_window: Some(128_000),
+                max_output_tokens: None,
+            },
+        )));
+        renderer.draw(&mut terminal, &state, 0).unwrap();
+        assert_eq!(renderer.stats().entries_reflowed, 0);
+        assert_eq!(renderer.stats().bytes_reflowed, 0);
+        assert_eq!(renderer.stats().cache_misses, 0);
+    }
+
+    #[test]
+    fn footer_extreme_widths_preserve_graphemes_and_model_priority() {
+        let mut state = configured_footer_state();
+        state.reduce(AgentEvent::ModelChanged(ModelRef {
+            provider: "界".into(),
+            model: "👨‍👩‍👧‍👦e\u{301}abcdef".into(),
+        }));
+        for scrolled in [0, 42] {
+            for width in 0..80 {
+                let text = footer_text(&state, width, scrolled, true, true).to_string();
+                assert!(
+                    UnicodeWidthStr::width(text.as_str()) <= width as usize,
+                    "{width}: {text}"
+                );
+            }
+        }
+        assert_eq!(truncate_display_width("👨‍👩‍👧‍👦abc", 3), "👨‍👩‍👧‍👦…");
+        assert_eq!(truncate_display_width("e\u{301}abc", 2), "e\u{301}…");
+        assert_eq!(truncate_display_width("界abc", 1), "…");
+        assert_eq!(truncate_display_width("界abc", 0), "");
+        state.set_thinking_level(None);
+        assert!(!footer_text(&state, 80, 0, false, false)
+            .to_string()
+            .contains("max"));
+        state.set_thinking_level(Some(ThinkingLevel::Off));
+        assert!(footer_text(&state, 80, 0, false, false)
+            .to_string()
+            .ends_with("  off"));
     }
 
     fn buffer_text(buffer: &Buffer) -> String {
