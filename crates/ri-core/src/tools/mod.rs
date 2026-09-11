@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 mod bash;
+mod builtin;
 mod edit;
 mod path;
 mod read;
@@ -15,7 +16,8 @@ mod registry;
 mod write;
 
 pub use bash::DEFAULT_BASH_TIMEOUT_MS;
-pub use registry::ToolRegistry;
+pub use builtin::builtin_tool_registry;
+pub use registry::{ToolRegistry, ToolRegistryError};
 
 pub const MAX_TOOL_OUTPUT_BYTES: usize = 1024 * 1024;
 pub const MAX_TOOL_PREVIEW_LINES: usize = 20;
@@ -371,8 +373,44 @@ pub(crate) fn suffix_at_byte_boundary(text: &str, limit: usize) -> &str {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) struct EchoTool(pub &'static str);
+
+    #[async_trait]
+    impl Tool for EchoTool {
+        fn definition(&self) -> crate::model::ToolDefinition {
+            crate::model::ToolDefinition {
+                name: self.0.to_owned(),
+                description: Some("Echo arguments".to_owned()),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"],
+                    "additionalProperties": false
+                }),
+            }
+        }
+
+        fn presentation(&self, arguments: &Value) -> ToolCallPresentation {
+            let mut presentation = ToolCallPresentation::fallback(self.0, arguments);
+            presentation.summary = format!("Echo: {}", arguments["text"].as_str().unwrap());
+            presentation
+        }
+
+        async fn execute(
+            &self,
+            arguments: Value,
+            _context: &ToolContext,
+            _events: ToolEventSender,
+            _cancel: CancellationToken,
+        ) -> Result<ToolExecutionResult, ToolError> {
+            Ok(ToolExecutionResult::success(
+                arguments["text"].as_str().unwrap(),
+            ))
+        }
+    }
 
     #[test]
     fn bounded_text_retains_head_and_tail() {

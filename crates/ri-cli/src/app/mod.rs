@@ -465,6 +465,7 @@ impl AppSetup {
 
     fn runtime_config(&self) -> AgentRuntimeConfig {
         AgentRuntimeConfig {
+            plugins: ri_core::builtin_plugins(),
             tool_context: self.tool_context.clone(),
             base_messages: vec![ModelMessage::System {
                 content: self.system_prompt.clone(),

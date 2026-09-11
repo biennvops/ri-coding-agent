@@ -9,7 +9,7 @@ use crate::model::{ModelAssistantItem, ModelLimits, ModelMessage, StopReason, Us
 use crate::session::SessionInfo;
 use crate::tools::{
     ToolCallPresentation, ToolExecutionMetadata, ToolOutputKind, ToolOutputStream, ToolPreviewKind,
-    ToolPreviewLine, ToolRegistry, ToolSummaryKind, MAX_TOOL_PREVIEW_BYTES,
+    ToolPreviewLine, ToolSummaryKind, MAX_TOOL_PREVIEW_BYTES,
 };
 
 const MAX_TOOL_TRANSCRIPT_OUTPUT_BYTES: usize = 256 * 1024;
@@ -1276,7 +1276,7 @@ fn append_tool_output(tool: &mut ToolTranscriptEntry, chunk: &str) {
 
 fn tool_call_presentation(name: &str, arguments: &str) -> ToolCallPresentation {
     match serde_json::from_str(arguments) {
-        Ok(arguments) => ToolRegistry::new().presentation(name, &arguments),
+        Ok(arguments) => crate::tools::builtin_tool_registry().presentation(name, &arguments),
         Err(_) => ToolCallPresentation {
             summary: name.to_owned(),
             summary_kind: ToolSummaryKind::Normal,

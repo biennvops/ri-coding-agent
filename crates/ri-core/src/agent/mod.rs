@@ -20,6 +20,7 @@ use crate::model::{
     ModelAssistantItem, ModelEvent, ModelLimits, ModelMessage, ModelProvider, ModelRequest,
     ModelResponse, ModelToolCall, ProviderError, StopReason, ToolChoice, Usage,
 };
+use crate::plugin::{builtin_plugins, PluginRegistry};
 use crate::session::{SessionInfo, SessionMode, SessionWriteOutcome};
 use crate::tools::{
     ToolContext, ToolError, ToolEvent, ToolExecutionMetadata, ToolExecutionResult,
@@ -180,6 +181,7 @@ pub enum AgentEvent {
 #[derive(Clone, Debug)]
 pub struct AgentRuntimeConfig {
     pub tool_context: ToolContext,
+    pub plugins: PluginRegistry,
     pub base_messages: Vec<ModelMessage>,
     pub initial_history: Vec<ModelMessage>,
     pub session: SessionMode,
@@ -190,6 +192,7 @@ impl AgentRuntimeConfig {
     pub fn new(tool_context: ToolContext) -> Self {
         Self {
             tool_context,
+            plugins: builtin_plugins(),
             base_messages: Vec::new(),
             initial_history: Vec::new(),
             session: SessionMode::Disabled,
@@ -379,7 +382,7 @@ where
     ) -> Self {
         Self {
             provider: Arc::new(provider),
-            registry: Arc::new(ToolRegistry::new()),
+            registry: Arc::clone(config.plugins.tools()),
             context: config.tool_context,
             base_messages: config.base_messages,
             conversation: ConversationHistory::from_provider_messages(config.initial_history),
@@ -492,6 +495,7 @@ where
                         let provider = Arc::clone(&self.provider);
                         let registry = Arc::clone(&self.registry);
                         let turn_config = AgentRuntimeConfig {
+                            plugins: PluginRegistry::new(Arc::clone(&self.registry)),
                             tool_context: self.context.clone(),
                             base_messages: self.base_messages.clone(),
                             initial_history: Vec::new(),
@@ -539,6 +543,7 @@ where
                         let provider = Arc::clone(&self.provider);
                         let registry = Arc::clone(&self.registry);
                         let config = AgentRuntimeConfig {
+                            plugins: PluginRegistry::new(Arc::clone(&self.registry)),
                             tool_context: self.context.clone(),
                             base_messages: self.base_messages.clone(),
                             initial_history: Vec::new(),
@@ -2119,6 +2124,61 @@ mod tests {
     use crate::model::MockProvider;
 
     #[tokio::test]
+    async fn runtime_uses_injected_capabilities_including_an_empty_registry() {
+        for custom in [false, true] {
+            let mut tools = ToolRegistry::new();
+            if custom {
+                tools
+                    .register(Arc::new(crate::tools::tests::EchoTool("echo")))
+                    .unwrap();
+            }
+            let definitions = tools.definitions();
+            let mut config =
+                AgentRuntimeConfig::new(ToolContext::new(std::env::temp_dir()).unwrap());
+            config.plugins = PluginRegistry::new(Arc::new(tools));
+            let provider = ScriptedProvider::new(vec![
+                ScriptedStep {
+                    events: Vec::new(),
+                    response: ModelResponse {
+                        items: vec![ModelAssistantItem::ToolCall(tool_call(
+                            "echo-call",
+                            "echo",
+                            r#"{"text":"hello"}"#,
+                        ))],
+                        stop_reason: StopReason::ToolCalls,
+                        usage: None,
+                    },
+                },
+                final_step("done"),
+            ]);
+            let requests = Arc::clone(&provider.requests);
+            let (command_tx, command_rx) = mpsc::channel(8);
+            let (event_tx, mut event_rx) = mpsc::channel(64);
+            let runtime = AgentRuntime::with_config(provider, config);
+            let task = tokio::spawn(runtime.run(command_rx, event_tx));
+            command_tx
+                .send(AgentCommand::Submit {
+                    text: "echo hello".to_owned(),
+                })
+                .await
+                .unwrap();
+            let events = collect_turn(&mut event_rx).await;
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Error(_))));
+            command_tx.send(AgentCommand::Shutdown).await.unwrap();
+            task.await.unwrap();
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(requests.iter().all(|request| request.tools == definitions));
+            assert!(requests[1].messages.iter().any(|message| matches!(message,
+                ModelMessage::ToolResult { tool_name, content, .. }
+                if tool_name == "echo" && if custom { content == "hello" } else { content.contains("available tools: (none)") }
+            )));
+        }
+    }
+
+    #[tokio::test]
     async fn runtime_forwards_stream_and_finishes_turn() {
         let (command_tx, command_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(32);
@@ -2252,6 +2312,7 @@ mod tests {
         let runtime = AgentRuntime::with_config(
             provider,
             AgentRuntimeConfig {
+                plugins: builtin_plugins(),
                 tool_context: ToolContext::new(&root).unwrap(),
                 base_messages: Vec::new(),
                 initial_history: Vec::new(),
@@ -2435,6 +2496,7 @@ mod tests {
         let runtime = AgentRuntime::with_config(
             provider,
             AgentRuntimeConfig {
+                plugins: builtin_plugins(),
                 tool_context: ToolContext::new(&root).unwrap(),
                 base_messages: Vec::new(),
                 initial_history,
@@ -2620,7 +2682,22 @@ mod tests {
             requests[0].messages,
             vec![ModelMessage::user("inspect note.txt")]
         );
-        assert_eq!(requests[0].tools.len(), 4);
+        assert_eq!(
+            requests[0]
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["read", "write", "edit", "bash"]
+        );
+        assert_eq!(
+            requests[0].tools,
+            crate::tools::builtin_tool_registry().definitions()
+        );
+        assert!(requests[0]
+            .tools
+            .iter()
+            .all(|tool| tool.parameters["additionalProperties"] == false));
         assert_eq!(requests[1].tools.len(), 4);
         assert_eq!(requests[0].tool_choice, None);
         assert_eq!(requests[1].tool_choice, None);
@@ -3030,6 +3107,7 @@ mod tests {
         let runtime = AgentRuntime::with_config(
             provider,
             AgentRuntimeConfig {
+                plugins: builtin_plugins(),
                 tool_context: ToolContext::new(&root).unwrap(),
                 base_messages: vec![ModelMessage::System {
                     content: "SECRET BASE CONTEXT".to_owned(),
@@ -3085,6 +3163,7 @@ mod tests {
         let runtime = AgentRuntime::with_config(
             MockProvider::with_response("should not run").with_delay(Duration::ZERO),
             AgentRuntimeConfig {
+                plugins: builtin_plugins(),
                 tool_context: ToolContext::new(&root).unwrap(),
                 base_messages: Vec::new(),
                 initial_history: Vec::new(),
@@ -3132,8 +3211,9 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(128);
         let outcome = run_turn(
             provider,
-            Arc::new(ToolRegistry::new()),
+            Arc::new(crate::tools::builtin_tool_registry()),
             AgentRuntimeConfig {
+                plugins: builtin_plugins(),
                 tool_context: ToolContext::new(&root).unwrap(),
                 base_messages: Vec::new(),
                 initial_history: Vec::new(),
@@ -3204,8 +3284,9 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(128);
         let turn = tokio::spawn(run_turn(
             provider,
-            Arc::new(ToolRegistry::new()),
+            Arc::new(crate::tools::builtin_tool_registry()),
             AgentRuntimeConfig {
+                plugins: builtin_plugins(),
                 tool_context: ToolContext::new(&root).unwrap(),
                 base_messages: Vec::new(),
                 initial_history: Vec::new(),
@@ -3284,6 +3365,7 @@ mod tests {
                 .with_chunk_size(1)
                 .with_delay(Duration::from_millis(10)),
             AgentRuntimeConfig {
+                plugins: builtin_plugins(),
                 tool_context: ToolContext::new(&root).unwrap(),
                 base_messages: Vec::new(),
                 initial_history: Vec::new(),
@@ -3345,8 +3427,9 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(128);
         let turn = tokio::spawn(run_turn(
             provider,
-            Arc::new(ToolRegistry::new()),
+            Arc::new(crate::tools::builtin_tool_registry()),
             AgentRuntimeConfig {
+                plugins: builtin_plugins(),
                 tool_context: ToolContext::new(&root).unwrap(),
                 base_messages: Vec::new(),
                 initial_history: Vec::new(),
@@ -3421,8 +3504,9 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(128);
         let turn = tokio::spawn(run_turn(
             provider,
-            Arc::new(ToolRegistry::new()),
+            Arc::new(crate::tools::builtin_tool_registry()),
             AgentRuntimeConfig {
+                plugins: builtin_plugins(),
                 tool_context: ToolContext::new(&root).unwrap(),
                 base_messages: Vec::new(),
                 initial_history: Vec::new(),
@@ -3558,7 +3642,7 @@ mod tests {
                 content: "initial answer".to_owned(),
             }],
         });
-        let registry = ToolRegistry::new();
+        let registry = crate::tools::builtin_tool_registry();
         let request_without_steering = normal_request(
             &[],
             &ConversationHistory::new(None, history_before_continuation),
@@ -3606,6 +3690,7 @@ mod tests {
             provider,
             Arc::new(registry),
             AgentRuntimeConfig {
+                plugins: builtin_plugins(),
                 tool_context: ToolContext::from_current_dir().unwrap(),
                 base_messages: Vec::new(),
                 initial_history: Vec::new(),
@@ -3906,6 +3991,7 @@ mod tests {
         let runtime = AgentRuntime::with_config(
             provider,
             AgentRuntimeConfig {
+                plugins: builtin_plugins(),
                 tool_context: ToolContext::new(&root).unwrap(),
                 base_messages: vec![base.clone()],
                 initial_history: Vec::new(),
@@ -4086,6 +4172,7 @@ mod tests {
         let runtime = AgentRuntime::with_config(
             provider,
             AgentRuntimeConfig {
+                plugins: builtin_plugins(),
                 tool_context: ToolContext::from_current_dir().unwrap(),
                 base_messages: Vec::new(),
                 initial_history,
@@ -4216,6 +4303,7 @@ mod tests {
         let runtime = AgentRuntime::with_config(
             provider,
             AgentRuntimeConfig {
+                plugins: builtin_plugins(),
                 tool_context: ToolContext::new(&root).unwrap(),
                 base_messages: Vec::new(),
                 initial_history: initial_history.clone(),
@@ -4357,6 +4445,7 @@ mod tests {
         let runtime = AgentRuntime::with_config(
             provider,
             AgentRuntimeConfig {
+                plugins: builtin_plugins(),
                 tool_context: ToolContext::new(&root).unwrap(),
                 base_messages: Vec::new(),
                 initial_history: initial_history.clone(),
@@ -4436,6 +4525,7 @@ mod tests {
         let runtime = AgentRuntime::with_config(
             provider,
             AgentRuntimeConfig {
+                plugins: builtin_plugins(),
                 tool_context: ToolContext::new(&root).unwrap(),
                 base_messages: Vec::new(),
                 initial_history,
@@ -4490,6 +4580,7 @@ mod tests {
         let runtime = AgentRuntime::with_config(
             provider,
             AgentRuntimeConfig {
+                plugins: builtin_plugins(),
                 tool_context: ToolContext::from_current_dir().unwrap(),
                 base_messages: Vec::new(),
                 initial_history,
@@ -4562,6 +4653,7 @@ mod tests {
         let runtime = AgentRuntime::with_config(
             provider,
             AgentRuntimeConfig {
+                plugins: builtin_plugins(),
                 tool_context: ToolContext::from_current_dir().unwrap(),
                 base_messages: Vec::new(),
                 initial_history: initial_history.clone(),
@@ -4649,6 +4741,7 @@ mod tests {
         let runtime = AgentRuntime::with_config(
             provider,
             AgentRuntimeConfig {
+                plugins: builtin_plugins(),
                 tool_context: ToolContext::new(&root).unwrap(),
                 base_messages: Vec::new(),
                 initial_history: opened.history,
@@ -4712,6 +4805,7 @@ mod tests {
         let runtime = AgentRuntime::with_config(
             provider,
             AgentRuntimeConfig {
+                plugins: builtin_plugins(),
                 tool_context: ToolContext::from_current_dir().unwrap(),
                 base_messages: Vec::new(),
                 initial_history,
@@ -4797,6 +4891,7 @@ mod tests {
         let runtime = AgentRuntime::with_config(
             provider,
             AgentRuntimeConfig {
+                plugins: builtin_plugins(),
                 tool_context: ToolContext::from_current_dir().unwrap(),
                 base_messages: Vec::new(),
                 initial_history,
@@ -4876,6 +4971,7 @@ mod tests {
         let runtime = AgentRuntime::with_config(
             provider,
             AgentRuntimeConfig {
+                plugins: builtin_plugins(),
                 tool_context: ToolContext::from_current_dir().unwrap(),
                 base_messages: Vec::new(),
                 initial_history,
