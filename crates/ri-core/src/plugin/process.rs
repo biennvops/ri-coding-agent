@@ -1,25 +1,241 @@
 use std::collections::HashMap;
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde_json::Value;
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::codec::{FramedRead, LinesCodec};
 
+use super::manifest::{LoadedPluginManifest, PluginManifest, PluginManifestError};
 use super::protocol::*;
+use tokio::process::{Child, Command};
+use tokio::time::timeout;
 
 const PLUGIN_NOTIFICATION_CHANNEL_CAPACITY: usize = 64;
 const MAX_PENDING_REQUESTS: usize = 64;
 
 #[derive(Debug, Error)]
 pub enum PluginProcessError {
+    #[error("invalid plugin manifest: {0}")]
+    Manifest(#[from] PluginManifestError),
+    #[error("could not spawn plugin: {0}")]
+    Spawn(std::io::Error),
+    #[error("plugin initialization timed out")]
+    StartupTimeout,
+    #[error("plugin protocol mismatch: {0}")]
+    ProtocolMismatch(String),
+    #[error("plugin identity mismatch for {field}: expected {expected:?}, received {actual:?}")]
+    IdentityMismatch {
+        field: &'static str,
+        expected: String,
+        actual: String,
+    },
+    #[error("{source}; stderr: {stderr:?}")]
+    Diagnostics {
+        source: Box<PluginProcessError>,
+        stderr: PluginDiagnostics,
+    },
+    #[error("could not reap plugin: {0}")]
+    Reap(std::io::Error),
     #[error("plugin transport: {0}")]
     Transport(String),
     #[error("plugin remote error: {0:?}")]
     RemoteError(RpcErrorObject),
+}
+
+pub const PLUGIN_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+pub const MAX_PLUGIN_STDERR_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Debug, Default)]
+pub struct PluginDiagnostics {
+    pub text: String,
+    pub truncated: bool,
+}
+
+#[derive(Default)]
+struct StderrCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl StderrCapture {
+    fn append(&mut self, bytes: &[u8]) {
+        let retained = bytes.len().min(MAX_PLUGIN_STDERR_BYTES - self.bytes.len());
+        self.bytes.extend_from_slice(&bytes[..retained]);
+        self.truncated |= retained < bytes.len();
+    }
+
+    fn snapshot(&self) -> PluginDiagnostics {
+        let mut text = String::from_utf8_lossy(&self.bytes).into_owned();
+        let mut end = text.len().min(MAX_PLUGIN_STDERR_BYTES);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        PluginDiagnostics {
+            text,
+            truncated: self.truncated || end < String::from_utf8_lossy(&self.bytes).len(),
+        }
+    }
+}
+
+pub struct PluginProcess {
+    manifest: PluginManifest,
+    capabilities: PluginCapabilities,
+    child: Child,
+    transport: Transport,
+    stderr: Arc<Mutex<StderrCapture>>,
+    stderr_task: JoinHandle<()>,
+}
+
+impl PluginProcess {
+    /// Explicitly executes the manifest command; this is not a sandbox or discovery API.
+    pub async fn start(loaded: LoadedPluginManifest) -> Result<Self, PluginProcessError> {
+        loaded.manifest.validate(&loaded.path)?;
+        let entrypoint = &loaded.manifest.entrypoint;
+        let command_path = std::path::Path::new(&entrypoint.command);
+        // Resolve relative executable paths before changing the child's working directory.
+        let command = if command_path.is_relative() && command_path.components().count() > 1 {
+            loaded.directory.join(command_path)
+        } else {
+            command_path.to_owned()
+        };
+        let mut child = Command::new(command)
+            .args(&entrypoint.args)
+            .current_dir(&loaded.directory)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(PluginProcessError::Spawn)?;
+        let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+        let stderr = Arc::new(Mutex::new(StderrCapture::default()));
+        let capture = stderr.clone();
+        let stderr_task = tokio::spawn(async move {
+            let mut buffer = [0; 8192];
+            loop {
+                match stderr_pipe.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => capture.lock().unwrap().append(&buffer[..count]),
+                }
+            }
+        });
+        let transport = Transport::new(
+            child.stdout.take().expect("piped stdout"),
+            child.stdin.take().expect("piped stdin"),
+        );
+        let mut process = Self {
+            manifest: loaded.manifest,
+            capabilities: PluginCapabilities::default(),
+            child,
+            transport,
+            stderr,
+            stderr_task,
+        };
+        let initialized = timeout(PLUGIN_STARTUP_TIMEOUT, process.initialize()).await;
+        let error = match initialized {
+            Ok(Ok(())) => return Ok(process),
+            Ok(Err(error)) => error,
+            Err(_) => PluginProcessError::StartupTimeout,
+        };
+        Err(process.cleanup_error(error).await)
+    }
+
+    async fn initialize(&mut self) -> Result<(), PluginProcessError> {
+        let params = InitializeParams {
+            protocol_version: PLUGIN_PROTOCOL_VERSION.into(),
+            host: HostIdentity {
+                name: "ri".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+            },
+        };
+        let result = self
+            .transport
+            .request(
+                "initialize",
+                serde_json::to_value(params).expect("serializable initialize params"),
+            )
+            .await?;
+        let result: InitializeResult = serde_json::from_value(result)
+            .map_err(|error| PluginProcessError::Transport(error.to_string()))?;
+        if result.protocol_version != PLUGIN_PROTOCOL_VERSION {
+            return Err(PluginProcessError::ProtocolMismatch(
+                result.protocol_version,
+            ));
+        }
+        for (field, expected, actual) in [
+            ("id", &self.manifest.id, result.plugin.id),
+            ("name", &self.manifest.name, result.plugin.name),
+            ("version", &self.manifest.version, result.plugin.version),
+        ] {
+            if *expected != actual {
+                return Err(PluginProcessError::IdentityMismatch {
+                    field,
+                    expected: expected.clone(),
+                    actual,
+                });
+            }
+        }
+        self.capabilities = result.capabilities;
+        Ok(())
+    }
+
+    pub fn manifest(&self) -> &PluginManifest {
+        &self.manifest
+    }
+    pub fn capabilities(&self) -> &PluginCapabilities {
+        &self.capabilities
+    }
+    pub fn diagnostics(&self) -> PluginDiagnostics {
+        self.stderr.lock().unwrap().snapshot()
+    }
+
+    /// Sends a generic request. Callers choose their own post-startup request deadline.
+    pub async fn request(&self, method: &str, params: Value) -> Result<Value, PluginProcessError> {
+        self.transport.request(method, params).await
+    }
+
+    pub async fn recv_notification(&mut self) -> Option<RpcNotification> {
+        self.transport.notifications.recv().await
+    }
+
+    async fn finish_stderr(&mut self) {
+        // A descendant may inherit stderr; never wait indefinitely for pipe EOF.
+        if timeout(Duration::from_millis(100), &mut self.stderr_task)
+            .await
+            .is_err()
+        {
+            self.stderr_task.abort();
+            let _ = (&mut self.stderr_task).await;
+        }
+    }
+
+    async fn cleanup_error(&mut self, error: PluginProcessError) -> PluginProcessError {
+        self.transport.reader.abort();
+        self.transport.writer.abort();
+        let _ = self.child.start_kill();
+        let error = match self.child.wait().await {
+            Ok(_) => error,
+            Err(error) => PluginProcessError::Reap(error),
+        };
+        self.finish_stderr().await;
+        PluginProcessError::Diagnostics {
+            source: Box::new(error),
+            stderr: self.diagnostics(),
+        }
+    }
+}
+
+impl Drop for PluginProcess {
+    fn drop(&mut self) {
+        self.stderr_task.abort();
+    }
 }
 
 type Reply = oneshot::Sender<Result<Value, PluginProcessError>>;
@@ -180,6 +396,84 @@ impl Drop for Transport {
 mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, BufReader};
+
+    struct Fixture {
+        directory: std::path::PathBuf,
+    }
+
+    impl Fixture {
+        fn new(result: Value, diagnostic: &str, stall: bool) -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "ri-plugin-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let response = serde_json::json!({"jsonrpc":"2.0","id":1,"result":result}).to_string();
+            #[cfg(unix)]
+            let (command, args, name, script) = ("/bin/sh", vec!["fixture.sh"], "fixture.sh", format!("IFS= read -r initialize\nprintf '%s\\n' '{diagnostic}' >&2\n{}\nprintf '%s\\n' '{response}'\nIFS= read -r shutdown\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}}'\n", if stall { "while :; do :; done" } else { "" }));
+            #[cfg(windows)]
+            let (command, args, name, script) = ("cmd.exe", vec!["/C", "fixture.cmd"], "fixture.cmd", format!("@echo off\r\nset /p INITIALIZE=\r\necho {diagnostic} 1>&2\r\n{}\r\necho {response}\r\nset /p SHUTDOWN=\r\necho {{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}}\r\nexit /b 0\r\n", if stall { ":stall\r\ngoto stall" } else { "" }));
+            std::fs::write(directory.join(name), script).unwrap();
+            std::fs::write(directory.join("plugin.json"), serde_json::json!({"manifestVersion":1,"id":"test.echo","name":"Echo","version":"0.1.0","protocolVersion":"ri.plugin.v1","entrypoint":{"command":command,"args":args}}).to_string()).unwrap();
+            Self { directory }
+        }
+
+        fn load(&self) -> LoadedPluginManifest {
+            super::super::manifest::load_plugin_manifest(self.directory.join("plugin.json"))
+                .unwrap()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.directory).unwrap();
+        }
+    }
+
+    fn initialize_result() -> Value {
+        serde_json::json!({"protocolVersion":"ri.plugin.v1","plugin":{"id":"test.echo","name":"Echo","version":"0.1.0"},"capabilities":{"tools":false,"future":true}})
+    }
+
+    #[tokio::test]
+    async fn initialization_verifies_identity_and_protocol() {
+        for field in ["id", "name", "version", "protocolVersion"] {
+            let mut result = initialize_result();
+            if field == "protocolVersion" {
+                result[field] = Value::String("wrong".into());
+            } else {
+                result["plugin"][field] = Value::String("wrong".into());
+            }
+            let fixture = Fixture::new(result, "startup diagnostic", false);
+            let error = PluginProcess::start(fixture.load())
+                .await
+                .err()
+                .expect("must reject mismatch");
+            assert!(error.to_string().contains("startup diagnostic"), "{error}");
+            match error {
+                PluginProcessError::Diagnostics { source, .. } if field == "protocolVersion" => {
+                    assert!(matches!(*source, PluginProcessError::ProtocolMismatch(_)))
+                }
+                PluginProcessError::Diagnostics { source, .. } => assert!(matches!(
+                    *source,
+                    PluginProcessError::IdentityMismatch { .. }
+                )),
+                _ => panic!("unexpected error: {error}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn initialization_timeout_cleans_up() {
+        let fixture = Fixture::new(initialize_result(), "timeout diagnostic", true);
+        let error = PluginProcess::start(fixture.load()).await.err().unwrap();
+        assert!(
+            matches!(error, PluginProcessError::Diagnostics { source, .. } if matches!(*source, PluginProcessError::StartupTimeout))
+        );
+    }
 
     #[tokio::test]
     async fn routes_out_of_order_responses_and_notifications() {

@@ -28,3 +28,8 @@ pub mod manifest;
 pub mod protocol;
 
 mod process;
+
+pub use process::{
+    PluginDiagnostics, PluginProcess, PluginProcessError, MAX_PLUGIN_STDERR_BYTES,
+    PLUGIN_STARTUP_TIMEOUT,
+};
