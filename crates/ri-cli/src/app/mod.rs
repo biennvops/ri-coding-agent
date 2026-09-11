@@ -905,7 +905,6 @@ async fn run_tui_loop(
         .size()
         .context("could not determine terminal size")?
         .width
-        .saturating_sub(2)
         .max(1) as usize;
     let mut preferred_column = None;
     let mut suggestions = CommandSuggestions::default();
@@ -1097,7 +1096,7 @@ async fn run_tui_loop(
                         }
                     }
                     Event::Resize(width, _) => {
-                        editor_width = width.saturating_sub(2).max(1) as usize;
+                        editor_width = width.max(1) as usize;
                         preferred_column = None;
                         redraw.request(RedrawUrgency::Immediate, Instant::now());
                     }
