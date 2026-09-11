@@ -7,7 +7,7 @@ use futures_util::StreamExt;
 use serde_json::Value;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tokio_util::sync::CancellationToken;
@@ -207,8 +207,8 @@ impl PluginProcess {
         self.transport.request(method, params).await
     }
 
-    pub async fn recv_notification(&mut self) -> Option<RpcNotification> {
-        self.transport.notifications.recv().await
+    pub async fn recv_notification(&self) -> Option<RpcNotification> {
+        self.transport.notifications.lock().await.recv().await
     }
 
     pub async fn shutdown(mut self) -> Result<(), PluginProcessError> {
@@ -305,7 +305,7 @@ impl Drop for PendingRequest {
 
 struct Transport {
     outgoing: Option<mpsc::Sender<String>>,
-    notifications: mpsc::Receiver<RpcNotification>,
+    notifications: AsyncMutex<mpsc::Receiver<RpcNotification>>,
     dispatch: Arc<Mutex<Dispatch>>,
     permits: Semaphore,
     reader: JoinHandle<()>,
@@ -382,7 +382,7 @@ impl Transport {
         });
         Self {
             outgoing: Some(outgoing),
-            notifications,
+            notifications: AsyncMutex::new(notifications),
             dispatch,
             permits: Semaphore::new(MAX_PENDING_REQUESTS),
             reader,
@@ -612,6 +612,82 @@ mod tests {
         peer_task.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn notifications_can_be_drained_while_request_is_pending() {
+        let notification_count = PLUGIN_NOTIFICATION_CHANNEL_CAPACITY + 1;
+        let fixture = Fixture::new(initialize_result(), "diagnostic", false);
+        fixture.change_script(|_| {
+            let initialize = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": initialize_result(),
+            })
+            .to_string();
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": 42,
+            })
+            .to_string();
+            let shutdown = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": null,
+            })
+            .to_string();
+            let notification_lines = (0..notification_count)
+                .map(|index| {
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "event/progress",
+                        "params": {"index": index},
+                    })
+                    .to_string()
+                })
+                .collect::<Vec<_>>();
+            #[cfg(unix)]
+            {
+                let notifications = notification_lines
+                    .iter()
+                    .map(|line| format!("printf '%s\\n' '{line}'"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!(
+                    "IFS= read -r initialize\nprintf '%s\\n' '{initialize}'\nIFS= read -r request\n{notifications}\nprintf '%s\\n' '{response}'\nIFS= read -r shutdown\nprintf '%s\\n' '{shutdown}'\n"
+                )
+            }
+            #[cfg(windows)]
+            {
+                let notifications = notification_lines
+                    .iter()
+                    .map(|line| format!("echo {line}\r\n"))
+                    .collect::<String>();
+                format!(
+                    "@echo off\r\nset /p INITIALIZE=\r\necho {initialize}\r\nset /p REQUEST=\r\n{notifications}echo {response}\r\nset /p SHUTDOWN=\r\necho {shutdown}\r\nexit /b 0\r\n"
+                )
+            }
+        });
+        let process = PluginProcess::start(fixture.load()).await.unwrap();
+        let drain = async {
+            let mut received = 0;
+            while received < notification_count {
+                let notification = process.recv_notification().await.unwrap();
+                assert_eq!(notification.method, "event/progress");
+                assert_eq!(notification.params["index"], received);
+                received += 1;
+            }
+            received
+        };
+        let (result, received) = timeout(Duration::from_secs(1), async {
+            tokio::join!(process.request("pending", Value::Null), drain)
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(received, notification_count);
+        process.shutdown().await.unwrap();
+    }
+
     #[cfg(unix)]
     async fn assert_reaped(pid: u32) {
         for _ in 0..100 {
@@ -770,7 +846,7 @@ mod tests {
     async fn routes_out_of_order_responses_and_notifications() {
         let (host, peer) = tokio::io::duplex(4096);
         let (read, write) = tokio::io::split(host);
-        let mut transport = Transport::new(read, write);
+        let transport = Transport::new(read, write);
         let peer_task = tokio::spawn(async move {
             let (read, mut write) = tokio::io::split(peer);
             let mut lines = BufReader::new(read).lines();
@@ -787,7 +863,14 @@ mod tests {
         assert!(matches!(a, Err(PluginProcessError::RemoteError(_))));
         assert_eq!(b.unwrap(), 22);
         assert_eq!(
-            transport.notifications.recv().await.unwrap().method,
+            transport
+                .notifications
+                .lock()
+                .await
+                .recv()
+                .await
+                .unwrap()
+                .method,
             "event/test"
         );
         peer_task.await.unwrap();
