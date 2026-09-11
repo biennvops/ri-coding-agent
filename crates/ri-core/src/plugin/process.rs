@@ -25,6 +25,10 @@ pub enum PluginProcessError {
     Manifest(#[from] PluginManifestError),
     #[error("could not spawn plugin: {0}")]
     Spawn(std::io::Error),
+    #[error("plugin shutdown timed out")]
+    ShutdownTimeout,
+    #[error("plugin exited: {0}")]
+    Exited(std::process::ExitStatus),
     #[error("plugin initialization timed out")]
     StartupTimeout,
     #[error("plugin protocol mismatch: {0}")]
@@ -48,6 +52,7 @@ pub enum PluginProcessError {
     RemoteError(RpcErrorObject),
 }
 
+pub const PLUGIN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 pub const PLUGIN_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_PLUGIN_STDERR_BYTES: usize = 64 * 1024;
 
@@ -203,6 +208,34 @@ impl PluginProcess {
 
     pub async fn recv_notification(&mut self) -> Option<RpcNotification> {
         self.transport.notifications.recv().await
+    }
+
+    pub async fn shutdown(mut self) -> Result<(), PluginProcessError> {
+        let graceful = timeout(PLUGIN_SHUTDOWN_TIMEOUT, async {
+            if let Some(status) = self.child.try_wait().map_err(PluginProcessError::Reap)? {
+                return Err(PluginProcessError::Exited(status));
+            }
+            self.transport
+                .request("shutdown", serde_json::json!({}))
+                .await?;
+            self.transport.outgoing.take();
+            let status = self.child.wait().await.map_err(PluginProcessError::Reap)?;
+            if !status.success() {
+                return Err(PluginProcessError::Exited(status));
+            }
+            Ok(())
+        })
+        .await;
+        match graceful {
+            Ok(Ok(())) => {
+                self.finish_stderr().await;
+                Ok(())
+            }
+            Ok(Err(error)) => Err(self.cleanup_error(error).await),
+            Err(_) => Err(self
+                .cleanup_error(PluginProcessError::ShutdownTimeout)
+                .await),
+        }
     }
 
     async fn finish_stderr(&mut self) {
@@ -436,6 +469,76 @@ mod tests {
 
     fn initialize_result() -> Value {
         serde_json::json!({"protocolVersion":"ri.plugin.v1","plugin":{"id":"test.echo","name":"Echo","version":"0.1.0"},"capabilities":{"tools":false,"future":true}})
+    }
+
+    impl Fixture {
+        fn change_script(&self, change: impl FnOnce(String) -> String) {
+            #[cfg(unix)]
+            let name = "fixture.sh";
+            #[cfg(windows)]
+            let name = "fixture.cmd";
+            let path = self.directory.join(name);
+            std::fs::write(&path, change(std::fs::read_to_string(&path).unwrap())).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn real_process_lifecycle() {
+        let fixture = Fixture::new(initialize_result(), "diagnostic", false);
+        let process = PluginProcess::start(fixture.load()).await.unwrap();
+        assert_eq!(process.manifest().id, "test.echo");
+        assert!(!process.capabilities().tools);
+        assert_eq!(process.capabilities().extra["future"], true);
+        process.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_timeout_and_remote_error_clean_up() {
+        for remote_error in [false, true] {
+            let fixture = Fixture::new(initialize_result(), "shutdown diagnostic", false);
+            fixture.change_script(|script| {
+                if remote_error {
+                    script.replace(
+                        "\"id\":2,\"result\":null",
+                        "\"id\":2,\"error\":{\"code\":-1,\"message\":\"shutdown failed\"}",
+                    )
+                } else {
+                    #[cfg(unix)]
+                    let script = format!("{script}while :; do :; done\n");
+                    #[cfg(windows)]
+                    let script = script.replace("exit /b 0", ":stall\r\ngoto stall");
+                    script
+                }
+            });
+            let process = PluginProcess::start(fixture.load()).await.unwrap();
+            let error = process.shutdown().await.unwrap_err();
+            match error {
+                PluginProcessError::Diagnostics { source, stderr } => {
+                    assert!(stderr.text.contains("shutdown diagnostic"));
+                    if remote_error {
+                        assert!(matches!(*source, PluginProcessError::RemoteError(_)));
+                    } else {
+                        assert!(matches!(*source, PluginProcessError::ShutdownTimeout));
+                    }
+                }
+                _ => panic!("unexpected {error}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_after_exit_is_reported() {
+        let fixture = Fixture::new(initialize_result(), "exit diagnostic", false);
+        fixture.change_script(|script| {
+            #[cfg(unix)]
+            let script = script.replace("IFS= read -r shutdown", "exit 0");
+            #[cfg(windows)]
+            let script = script.replace("set /p SHUTDOWN=", "exit /b 0");
+            script
+        });
+        let mut process = PluginProcess::start(fixture.load()).await.unwrap();
+        process.child.wait().await.unwrap();
+        assert!(process.shutdown().await.is_err());
     }
 
     #[tokio::test]
