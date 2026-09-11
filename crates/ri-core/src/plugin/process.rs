@@ -483,6 +483,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_remote_error_malformed_output_and_early_exit() {
+        for mode in ["remote", "malformed", "exit"] {
+            let fixture = Fixture::new(initialize_result(), "failure diagnostic", false);
+            fixture.change_script(|script| {
+                let response = serde_json::json!({"jsonrpc":"2.0","id":1,"result":initialize_result()}).to_string();
+                match mode {
+                    "remote" => script.replace(&response, r#"{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"initialize failed"}}"#),
+                    "malformed" => script.replace(&response, "not JSON"),
+                    _ => {
+                        #[cfg(unix)]
+                        let script = script.replace(&format!("printf '%s\\n' '{response}'"), "exit 0");
+                        #[cfg(windows)]
+                        let script = script.replace(&format!("echo {response}"), "exit /b 0");
+                        script
+                    }
+                }
+            });
+            let error = PluginProcess::start(fixture.load()).await.err().unwrap();
+            assert!(error.to_string().contains("failure diagnostic"), "{error}");
+            if mode == "remote" {
+                assert!(
+                    matches!(error, PluginProcessError::Diagnostics { source, .. } if matches!(*source, PluginProcessError::RemoteError(_)))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stderr_is_bounded_but_continues_draining() {
+        let fixture = Fixture::new(initialize_result(), "diagnostic", false);
+        fixture.change_script(|script| {
+            let text = "x".repeat(1024);
+            #[cfg(unix)]
+            let noise = format!("printf '%s\\n' '{text}' >&2\n").repeat(128);
+            #[cfg(windows)]
+            let noise = format!(
+                "@echo off\r\n{}",
+                format!("echo {text} 1>&2\r\n").repeat(128)
+            );
+            format!("{noise}{script}")
+        });
+        let process = PluginProcess::start(fixture.load()).await.unwrap();
+        let diagnostics = process.diagnostics();
+        assert_eq!(diagnostics.text.len(), MAX_PLUGIN_STDERR_BYTES);
+        assert!(diagnostics.truncated);
+        process.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn non_utf8_diagnostics_remain_bounded() {
+        let mut capture = StderrCapture::default();
+        capture.append(&vec![0xff; MAX_PLUGIN_STDERR_BYTES + 1]);
+        assert_eq!(capture.bytes.len(), MAX_PLUGIN_STDERR_BYTES);
+        let snapshot = capture.snapshot();
+        assert!(snapshot.text.len() <= MAX_PLUGIN_STDERR_BYTES);
+        assert!(snapshot.truncated);
+    }
+
+    #[tokio::test]
+    async fn notification_overflow_fails_without_blocking_responses() {
+        let (host, peer) = tokio::io::duplex(4096);
+        let (read, write) = tokio::io::split(host);
+        let transport = Transport::new(read, write);
+        let peer_task = tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(peer);
+            let mut lines = BufReader::new(read).lines();
+            lines.next_line().await.unwrap();
+            for _ in 0..=PLUGIN_NOTIFICATION_CHANNEL_CAPACITY {
+                let _ = write
+                    .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"event\",\"params\":{}}\n")
+                    .await;
+            }
+        });
+        let result = timeout(
+            Duration::from_secs(1),
+            transport.request("test", Value::Null),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, Err(PluginProcessError::Transport(reason)) if reason.contains("queue full"))
+        );
+        peer_task.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn assert_reaped(pid: u32) {
+        for _ in 0..100 {
+            let status = Command::new("/bin/kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(Stdio::null())
+                .status()
+                .await
+                .unwrap();
+            if !status.success() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("child {pid} still exists");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_process_kills_child_and_failure_reaps_child() {
+        let fixture = Fixture::new(initialize_result(), "diagnostic", false);
+        let process = PluginProcess::start(fixture.load()).await.unwrap();
+        let pid = process.child.id().unwrap();
+        drop(process);
+        assert_reaped(pid).await;
+
+        let fixture = Fixture::new(Value::Null, "invalid initialize", false);
+        fixture.change_script(|script| format!("echo $$ > plugin.pid\n{script}"));
+        assert!(PluginProcess::start(fixture.load()).await.is_err());
+        let pid = std::fs::read_to_string(fixture.directory.join("plugin.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_reaped(pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relative_executable_and_literal_arguments() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new(initialize_result(), "diagnostic", false);
+        fixture.change_script(|script| {
+            format!("#!/bin/sh\n[ \"$1\" = 'literal;not a shell command' ] || exit 3\n{script}")
+        });
+        let script = fixture.directory.join("fixture.sh");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut loaded = fixture.load();
+        loaded.manifest.entrypoint.command = "./fixture.sh".into();
+        loaded.manifest.entrypoint.args = vec!["literal;not a shell command".into()];
+        PluginProcess::start(loaded)
+            .await
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn real_process_lifecycle() {
         let fixture = Fixture::new(initialize_result(), "diagnostic", false);
         let process = PluginProcess::start(fixture.load()).await.unwrap();
