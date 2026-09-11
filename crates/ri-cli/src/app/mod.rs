@@ -532,9 +532,11 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
     }
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (event_tx, mut event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+    let runtime_config = setup.runtime_config();
+    let tool_registry = runtime_config.plugins.tools().clone();
     let runtime = AgentRuntime::with_config_and_compaction(
         setup.provider.clone(),
-        setup.runtime_config(),
+        runtime_config,
         setup.compaction_enabled,
     );
     let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
@@ -547,7 +549,7 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
         bail!("could not start the agent: {error}");
     }
 
-    let mut state = AppState::new();
+    let mut state = AppState::with_tool_registry(tool_registry);
     state.replace_history(&setup.initial_transcript);
     state.set_session_info(session_info);
     state.reduce(AgentEvent::ModelChanged(setup.model_ref()));
@@ -845,14 +847,16 @@ async fn run_tui(mut setup: AppSetup) -> Result<()> {
     let mut terminal = TerminalGuard::new().context("could not initialize terminal")?;
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (event_tx, mut event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+    let runtime_config = setup.runtime_config();
+    let tool_registry = runtime_config.plugins.tools().clone();
     let runtime = AgentRuntime::with_config_and_compaction(
         setup.provider.clone(),
-        setup.runtime_config(),
+        runtime_config,
         setup.compaction_enabled,
     );
     let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
 
-    let mut state = AppState::new();
+    let mut state = AppState::with_tool_registry(tool_registry);
     state.replace_history(&setup.initial_transcript);
     add_startup_diagnostics(&mut state, &setup.context, setup.initial_session_resumed);
     state.set_session_info(session_info);

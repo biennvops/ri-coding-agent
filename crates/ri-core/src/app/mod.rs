@@ -1,4 +1,5 @@
 use std::ops::Index;
+use std::sync::Arc;
 
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -9,7 +10,7 @@ use crate::model::{ModelAssistantItem, ModelLimits, ModelMessage, StopReason, Us
 use crate::session::SessionInfo;
 use crate::tools::{
     ToolCallPresentation, ToolExecutionMetadata, ToolOutputKind, ToolOutputStream, ToolPreviewKind,
-    ToolPreviewLine, ToolSummaryKind, MAX_TOOL_PREVIEW_BYTES,
+    ToolPreviewLine, ToolRegistry, ToolSummaryKind, MAX_TOOL_PREVIEW_BYTES,
 };
 
 const MAX_TOOL_TRANSCRIPT_OUTPUT_BYTES: usize = 256 * 1024;
@@ -201,8 +202,9 @@ pub enum TranscriptEntry {
     Tool(ToolTranscriptEntry),
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct AppState {
+    tool_registry: Arc<ToolRegistry>,
     message_entry_indices: Vec<usize>,
     entries: Vec<TranscriptEntryState>,
     transcript_entry_indices: Vec<usize>,
@@ -229,9 +231,76 @@ pub struct AppState {
     latest_usage: Option<Usage>,
 }
 
+impl Default for AppState {
+    fn default() -> Self {
+        Self::with_tool_registry(Arc::new(crate::tools::builtin_tool_registry()))
+    }
+}
+
+impl PartialEq for AppState {
+    fn eq(&self, other: &Self) -> bool {
+        self.message_entry_indices == other.message_entry_indices
+            && self.entries == other.entries
+            && self.transcript_entry_indices == other.transcript_entry_indices
+            && self.transcript_entry_order == other.transcript_entry_order
+            && self.transcript_entry_positions == other.transcript_entry_positions
+            && self.queued_transcript_start == other.queued_transcript_start
+            && self.streaming_assistant == other.streaming_assistant
+            && self.next_transcript_entry_id == other.next_transcript_entry_id
+            && self.transcript_epoch == other.transcript_epoch
+            && self.transcript_revision == other.transcript_revision
+            && self.pending_transcript_changes == other.pending_transcript_changes
+            && self.input == other.input
+            && self.cursor == other.cursor
+            && self.input_revision == other.input_revision
+            && self.turn_active == other.turn_active
+            && self.compaction_active == other.compaction_active
+            && self.last_error == other.last_error
+            && self.last_stop_reason == other.last_stop_reason
+            && self.active_model == other.active_model
+            && self.thinking_level == other.thinking_level
+            && self.git_branch == other.git_branch
+            && self.session_info == other.session_info
+            && self.context_usage == other.context_usage
+            && self.latest_usage == other.latest_usage
+    }
+}
+
+impl Eq for AppState {}
+
 impl AppState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_tool_registry(tool_registry: Arc<ToolRegistry>) -> Self {
+        Self {
+            tool_registry,
+            message_entry_indices: Vec::new(),
+            entries: Vec::new(),
+            transcript_entry_indices: Vec::new(),
+            transcript_entry_order: Vec::new(),
+            transcript_entry_positions: Vec::new(),
+            queued_transcript_start: None,
+            streaming_assistant: None,
+            next_transcript_entry_id: 0,
+            transcript_epoch: 0,
+            transcript_revision: 0,
+            pending_transcript_changes: Vec::new(),
+            input: String::new(),
+            cursor: 0,
+            input_revision: 0,
+            turn_active: false,
+            compaction_active: false,
+            last_error: None,
+            last_stop_reason: None,
+            active_model: None,
+            thinking_level: None,
+            git_branch: None,
+            session_info: None,
+            context_usage: ContextUsage::default(),
+            latest_usage: None,
+        }
     }
 
     pub fn messages(&self) -> TranscriptMessages<'_> {
@@ -631,7 +700,7 @@ impl AppState {
                 name,
                 arguments,
             } => {
-                let presentation = tool_call_presentation(&name, &arguments);
+                let presentation = tool_call_presentation(&self.tool_registry, &name, &arguments);
                 self.push_entry(TranscriptEntry::Tool(ToolTranscriptEntry {
                     call_id,
                     name,
@@ -1009,7 +1078,8 @@ impl AppState {
                     else {
                         continue;
                     };
-                    let presentation = tool_call_presentation(&name, &call.arguments);
+                    let presentation =
+                        tool_call_presentation(&self.tool_registry, &name, &call.arguments);
                     self.push_entry(TranscriptEntry::Tool(ToolTranscriptEntry {
                         call_id,
                         name,
@@ -1274,9 +1344,13 @@ fn append_tool_output(tool: &mut ToolTranscriptEntry, chunk: &str) {
     tool.output = format!("{head}{TOOL_OUTPUT_MARKER}{tail}");
 }
 
-fn tool_call_presentation(name: &str, arguments: &str) -> ToolCallPresentation {
+fn tool_call_presentation(
+    registry: &ToolRegistry,
+    name: &str,
+    arguments: &str,
+) -> ToolCallPresentation {
     match serde_json::from_str(arguments) {
-        Ok(arguments) => crate::tools::builtin_tool_registry().presentation(name, &arguments),
+        Ok(arguments) => registry.presentation(name, &arguments),
         Err(_) => ToolCallPresentation {
             summary: name.to_owned(),
             summary_kind: ToolSummaryKind::Normal,
@@ -1668,6 +1742,52 @@ mod tests {
                 metadata: ToolExecutionMetadata::success(),
             }
         }
+    }
+
+    #[test]
+    fn injected_tool_registry_drives_live_and_historical_presentations() {
+        use std::sync::Arc;
+
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(crate::tools::tests::EchoTool("echo")))
+            .unwrap();
+        let registry = Arc::new(registry);
+        let arguments = r#"{"text":"hello"}"#;
+
+        let mut live = AppState::with_tool_registry(Arc::clone(&registry));
+        live.reduce(AgentEvent::ToolExecutionStarted {
+            call_id: "live-call".to_owned(),
+            name: "echo".to_owned(),
+            arguments: arguments.to_owned(),
+        });
+        let TranscriptEntry::Tool(tool) = &live.transcript_entries()[0].entry else {
+            panic!("expected live tool entry");
+        };
+        assert_eq!(tool.summary, "Echo: hello");
+
+        let history = vec![
+            ModelMessage::Assistant {
+                items: vec![ModelAssistantItem::ToolCall(crate::model::ModelToolCall {
+                    index: 0,
+                    call_id: Some("history-call".to_owned()),
+                    item_id: None,
+                    name: Some("echo".to_owned()),
+                    arguments: arguments.to_owned(),
+                })],
+            },
+            ModelMessage::ToolResult {
+                tool_call_id: "history-call".to_owned(),
+                tool_name: "echo".to_owned(),
+                content: "hello".to_owned(),
+            },
+        ];
+        let mut historical = AppState::with_tool_registry(registry);
+        historical.replace_history(&history);
+        let TranscriptEntry::Tool(tool) = &historical.transcript_entries()[0].entry else {
+            panic!("expected historical tool entry");
+        };
+        assert_eq!(tool.summary, "Echo: hello");
     }
 
     #[test]
