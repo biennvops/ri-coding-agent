@@ -2124,6 +2124,85 @@ mod tests {
     use crate::model::MockProvider;
 
     #[tokio::test]
+    async fn runtime_executes_external_plugin_tool_through_registry() {
+        use crate::{ExternalToolSet, PluginProcess};
+        use serde_json::json;
+
+        let fixture = crate::plugin::Fixture::scripted(
+            true,
+            vec![
+                (
+                    "tools/list",
+                    json!({}),
+                    json!({"result":{"tools":[{"name":"echo","description":"Echo fixture","inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}}]}}),
+                ),
+                (
+                    "tools/call",
+                    json!({"name":"echo","arguments":{"text":"hello"}}),
+                    json!({"result":{"content":"plugin says hello","isError":false}}),
+                ),
+            ],
+        );
+        let process = PluginProcess::start(fixture.load()).await.unwrap();
+        let tools = ExternalToolSet::load(&process).await.unwrap();
+        let mut registry = crate::builtin_tool_registry();
+        tools.register_into(&mut registry).unwrap();
+        assert_eq!(registry.names(), ["read", "write", "edit", "bash", "echo"]);
+        let definitions = registry.definitions();
+        let mut config = AgentRuntimeConfig::new(ToolContext::new(std::env::temp_dir()).unwrap());
+        config.plugins = PluginRegistry::new(Arc::new(registry));
+        let provider = ScriptedProvider::new(vec![
+            ScriptedStep {
+                events: Vec::new(),
+                response: ModelResponse {
+                    items: vec![ModelAssistantItem::ToolCall(tool_call(
+                        "echo-call",
+                        "echo",
+                        r#"{"text":"hello"}"#,
+                    ))],
+                    stop_reason: StopReason::ToolCalls,
+                    usage: None,
+                },
+            },
+            final_step("done"),
+        ]);
+        let requests = Arc::clone(&provider.requests);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let task =
+            tokio::spawn(AgentRuntime::with_config(provider, config).run(command_rx, event_tx));
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "echo hello".into(),
+            })
+            .await
+            .unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(2), collect_turn(&mut event_rx))
+            .await
+            .unwrap();
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Error(_))));
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::ToolExecutionStarted { call_id, name, .. } if call_id == "echo-call" && name == "echo")));
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::ToolExecutionFinished { call_id, name, result } if call_id == "echo-call" && name == "echo" && result.model_content == "plugin says hello" && result.metadata.success)));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TurnFinished {
+                reason: StopReason::Stop
+            }
+        )));
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        task.await.unwrap();
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(requests.iter().all(|request| request.tools == definitions));
+            assert!(requests[1].messages.iter().any(|message| matches!(message, ModelMessage::ToolResult { tool_name, content, .. } if tool_name == "echo" && content == "plugin says hello")));
+        }
+        process.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn runtime_uses_injected_capabilities_including_an_empty_registry() {
         for custom in [false, true] {
             let mut tools = ToolRegistry::new();
