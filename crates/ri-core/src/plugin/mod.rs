@@ -60,3 +60,8 @@ pub use tools::{
     ExternalToolError, ExternalToolSet, MAX_EXTERNAL_TOOLS_PER_PLUGIN,
     MAX_EXTERNAL_TOOL_DESCRIPTION_BYTES, MAX_EXTERNAL_TOOL_NAME_BYTES,
 };
+
+mod installed;
+pub use installed::{
+    default_plugins_dir, resolve_installed_plugins, InstalledPluginError, PLUGIN_MANIFEST_FILENAME,
+};
