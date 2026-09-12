@@ -204,7 +204,7 @@ A live provider smoke is deliberately manual. It is not part of CI and must be r
 
 ## Internal capability architecture
 
-`ri-core` separates internal capability composition from an explicitly invoked external-plugin protocol/lifecycle API. The two paths do not connect yet.
+`ri-core` separates internal capability composition from an explicitly invoked external-plugin protocol/lifecycle API. Explicitly loaded external tools adapt to the same `Tool` and `ToolRegistry` interfaces as built-ins.
 
 ```text
 Application bootstrap → PluginRegistry → AgentRuntimeConfig → AgentRuntime
@@ -229,7 +229,7 @@ plugin.json → validated manifest → PluginProcess
                                external executable
 ```
 
-External plugins are **not discovered or loaded during normal `ri` startup**. Project-local files never automatically execute plugin code. No external plugin capability is registered with the model yet; default tools remain exactly `read`, `write`, `edit`, and `bash`. This API is a protocol/lifecycle foundation for the next milestone, not a Rust dynamic-library ABI.
+External plugins are **not discovered or loaded during normal `ri` startup**. Project-local files never automatically execute plugin code. Default tools remain exactly `read`, `write`, `edit`, and `bash`. Explicit host callers may load and register external tools through the API below; this is not a Rust dynamic-library ABI.
 
 An explicit host caller uses `load_plugin_manifest(path)`, then `PluginProcess::start(loaded).await`. Loading a manifest only parses and validates it; `start` executes its command directly with a separate argument vector, without host-added shell wrapping. The child runs in the canonical manifest directory and inherits the host environment. Relative executable paths such as `./ri-plugin-echo` resolve against that directory; bare commands use executable lookup. This is not a sandbox: only explicitly start trusted executables.
 
@@ -278,8 +278,89 @@ Shutdown exchange, assuming no intervening requests:
 {"jsonrpc":"2.0","id":2,"result":null}
 ```
 
-Plugin discovery/install, external tool registration, MCP, and web search remain unimplemented.
+### External tool capability
+
+Tool support is an additive extension of `ri.plugin.v1`. Advertising `capabilities.tools = true` alone does not execute `tools/list` or register tools. An explicit host composes the capability:
+
+```rust,no_run
+use ri_core::{builtin_tool_registry, load_plugin_manifest, ExternalToolSet, PluginProcess};
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let process = PluginProcess::start(load_plugin_manifest("plugin.json")?).await?;
+let tools = ExternalToolSet::load(&process).await?;
+let mut registry = builtin_tool_registry();
+tools.register_into(&mut registry)?;
+// Inject the registry through PluginRegistry and AgentRuntimeConfig.
+// Keep the process alive while its tools are in use, then shut it down explicitly.
+process.shutdown().await?;
+# Ok(())
+# }
+```
+
+- With `capabilities.tools = false`, `ExternalToolSet::load` returns an empty set without a `tools/list` request.
+- With `true`, each explicit load sends exactly one `tools/list` request with `{}` params, validates the complete list, and retains an immutable snapshot in advertised order. There is no polling or dynamic refresh.
+- A plugin may expose at most 128 tools. Names are 1–64 bytes, contain only ASCII letters, digits, `_` or `-`, and start with a letter or digit. Names retain their case and are not prefixed or rewritten.
+- Descriptions may be omitted, but supplied descriptions must be nonblank and at most 16 KiB of UTF-8. `inputSchema` must be a JSON object; its contents are preserved, without requiring `additionalProperties: false`. The existing 1 MiB frame bound still applies.
+- External tool names share the global namespace with built-ins and other registered tools. Duplicate descriptors are invalid. Registration checks the entire set before mutation: a plugin cannot override `read`, `write`, `edit`, `bash`, or any other existing entry. Collisions are errors, not silent renames or replacements.
+
+`tools/list` exchange (shown pretty-printed; each frame is one line on the wire):
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "tools": [
+      {
+        "name": "echo",
+        "description": "Echo input text",
+        "inputSchema": {
+          "type": "object",
+          "properties": {"text": {"type": "string"}},
+          "required": ["text"],
+          "additionalProperties": false
+        }
+      }
+    ]
+  }
+}
+```
+
+`tools/call` forwards arguments unchanged:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "tools/call",
+  "params": {"name": "echo", "arguments": {"text": "hello"}}
+}
+```
+
+Successful tool result:
+
+```json
+{"jsonrpc":"2.0","id":3,"result":{"content":"hello","isError":false}}
+```
+
+Expected tool-level failure:
+
+```json
+{"jsonrpc":"2.0","id":3,"result":{"content":"file does not exist","isError":true}}
+```
+
+`content` is a required string; `isError` defaults to `false`. Capability messages tolerate future additive fields. `isError: false` becomes normal tool success; `isError: true` becomes a normal tool-level failure visible to the model. JSON-RPC errors (unsupported method, malformed request, internal plugin RPC failure), malformed results, and transport failures instead become host `ToolError`s identifying the plugin and tool. Execution duration is recorded; other metadata retains standard defaults.
+
+External tools use normal tool transcript events, tool-result history, and fallback presentation (name and bounded JSON argument preview). No plugin-specific agent execution path or synchronous presentation RPC exists.
+
+Cancelling an ri turn stops waiting for an external tool call and drops its pending response; late responses are ignored. `ri.plugin.v1` does not yet send cooperative cancellation to the plugin: remote computation may continue until it returns or the process is shut down. Generic request callers still choose their own deadlines.
+
+There is no streamed tool output, plugin-specific presentation, workspace context in `tools/call`, dynamic `tools/list` refresh, or automatic external plugin loading. Plugin discovery/install, activation/settings, MCP, and web search remain unimplemented.
 
 ## Current non-goals
 
-Plugin discovery/install, external tool registration, WASM, provider plugins, command plugins, context plugins, web search, Codex integration, MCP, skills, user-selectable themes, semantic/LSP highlighting, session branching, new provider protocols, OAuth, remote execution, sandboxing, permission prompts, and public release automation are outside this baseline.
+Plugin discovery/install, plugin activation/settings, WASM, provider plugins, command plugins, context plugins, web search, Codex integration, MCP, skills, user-selectable themes, semantic/LSP highlighting, session branching, new provider protocols, OAuth, remote execution, sandboxing, permission prompts, and public release automation are outside this baseline.
