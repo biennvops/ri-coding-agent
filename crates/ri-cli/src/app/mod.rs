@@ -218,15 +218,34 @@ pub async fn run(options: Options) -> Result<(), RunError> {
             .ok_or_else(|| RunError::Setup(anyhow!("session picker cancelled")))?;
         setup.apply_opened(opened).map_err(RunError::Setup)?;
     }
-    if let Some(prompt) = options.print_prompt {
-        if options.json {
-            run_json(prompt, setup).await.map_err(RunError::Runtime)
+    let host = setup.activate_plugins().await.map_err(RunError::Setup)?;
+    run_with_plugins(host, async move {
+        if let Some(prompt) = options.print_prompt {
+            if options.json {
+                run_json(prompt, setup).await
+            } else {
+                run_print(prompt, setup).await
+            }
         } else {
-            run_print(prompt, setup).await.map_err(RunError::Runtime)
+            run_tui(setup).await
         }
-    } else {
-        run_tui(setup).await.map_err(RunError::Runtime)
+    })
+    .await
+    .map_err(RunError::Runtime)
+}
+
+async fn run_with_plugins(
+    host: ri_core::PluginHost,
+    run: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    let result = run.await;
+    for failure in host.shutdown().await {
+        eprintln!(
+            "ri: warning: could not shut down plugin {} cleanly: {}",
+            failure.plugin_id, failure.message
+        );
     }
+    result
 }
 
 fn missing_models_message() -> String {
@@ -592,6 +611,8 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
     } else {
         eprintln!("session: ephemeral");
     }
+    let mut shutdown =
+        ShutdownSignals::new().context("could not install shutdown signal handlers")?;
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (event_tx, mut event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let runtime_config = setup.runtime_config();
@@ -602,8 +623,6 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
         setup.compaction_enabled,
     );
     let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
-    let mut shutdown =
-        ShutdownSignals::new().context("could not install shutdown signal handlers")?;
 
     if let Err(error) = command_tx.send(AgentCommand::Submit { text: prompt }).await {
         let _ = command_tx.send(AgentCommand::Shutdown).await;
@@ -754,6 +773,8 @@ async fn run_json(prompt: String, setup: AppSetup) -> Result<()> {
             session.as_ref(),
         ),
     )?;
+    let mut shutdown =
+        ShutdownSignals::new().context("could not install shutdown signal handlers")?;
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (event_tx, mut event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let runtime = AgentRuntime::with_config_and_compaction(
@@ -762,8 +783,6 @@ async fn run_json(prompt: String, setup: AppSetup) -> Result<()> {
         setup.compaction_enabled,
     );
     let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
-    let mut shutdown =
-        ShutdownSignals::new().context("could not install shutdown signal handlers")?;
 
     if let Err(error) = command_tx.send(AgentCommand::Submit { text: prompt }).await {
         let message = format!("could not start the agent: {error}");
@@ -2085,6 +2104,35 @@ mod tests {
                 .activate_plugins_from(Some(&fixture.root))
                 .await
                 .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_shutdown_follows_success_and_error_without_masking_result() {
+        for fail_run in [false, true] {
+            for fail_shutdown in [false, true] {
+                let fixture = InstalledFixture::new(false, fail_shutdown);
+                let mut setup = fixture.setup(vec!["test.echo".into()]);
+                let host = setup
+                    .activate_plugins_from(Some(&fixture.root))
+                    .await
+                    .unwrap();
+                let result = run_with_plugins(host, async {
+                    assert!(!fixture.root.join("test.echo/stopped").exists());
+                    if fail_run {
+                        bail!("run failed");
+                    }
+                    Ok(())
+                })
+                .await;
+                assert_eq!(result.is_err(), fail_run);
+                if let Err(error) = result {
+                    assert_eq!(error.to_string(), "run failed");
+                }
+                let requests =
+                    std::fs::read_to_string(fixture.root.join("test.echo/requests")).unwrap();
+                assert!(requests.lines().last().unwrap().contains("shutdown"));
+            }
         }
     }
 
