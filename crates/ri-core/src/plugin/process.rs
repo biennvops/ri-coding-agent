@@ -444,6 +444,9 @@ impl PluginClient {
         method: &str,
         params: Value,
     ) -> Result<Value, PluginProcessError> {
+        if let Some(reason) = &self.state.dispatch.lock().unwrap().failure {
+            return Err(PluginProcessError::Transport(reason.clone()));
+        }
         let _permit = self
             .state
             .permits
@@ -581,6 +584,40 @@ pub(crate) mod tests {
             let path = self.directory.join(name);
             std::fs::write(&path, change(std::fs::read_to_string(&path).unwrap())).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn closing_full_client_rejects_new_requests_without_waiting_for_permits() {
+        let (host, _peer) = tokio::io::duplex(65536);
+        let (read, write) = tokio::io::split(host);
+        let transport = Transport::new(read, write);
+        let client = transport.client.clone();
+        let mut pending = Vec::new();
+        for _ in 0..MAX_PENDING_REQUESTS {
+            let mut request = Box::pin(client.request("pending", Value::Null));
+            assert!(futures_util::poll!(&mut request).is_pending());
+            pending.push(request);
+        }
+        assert_eq!(
+            client.state.dispatch.lock().unwrap().pending.len(),
+            MAX_PENDING_REQUESTS
+        );
+        let mut extra = Box::pin(client.request("extra", Value::Null));
+        assert!(futures_util::poll!(&mut extra).is_pending());
+        assert_eq!(client.state.dispatch.lock().unwrap().next_id, 65);
+        transport.close().await;
+        assert!(matches!(
+            timeout(
+                Duration::from_secs(1),
+                client.request("closed", Value::Null)
+            )
+            .await
+            .unwrap(),
+            Err(PluginProcessError::Transport(_))
+        ));
+        drop(pending);
+        assert!(matches!(extra.await, Err(PluginProcessError::Transport(_))));
+        assert!(client.state.dispatch.lock().unwrap().pending.is_empty());
     }
 
     #[tokio::test]
