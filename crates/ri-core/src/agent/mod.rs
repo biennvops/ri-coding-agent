@@ -2125,7 +2125,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_executes_external_plugin_tool_through_registry() {
-        use crate::{ExternalToolSet, PluginProcess};
+        use crate::{resolve_installed_plugins, PluginHost};
         use serde_json::json;
 
         let fixture = crate::plugin::Fixture::scripted(
@@ -2143,14 +2143,25 @@ mod tests {
                 ),
             ],
         );
-        let process = PluginProcess::start(fixture.load()).await.unwrap();
-        let tools = ExternalToolSet::load(&process).await.unwrap();
-        let mut registry = crate::builtin_tool_registry();
-        tools.register_into(&mut registry).unwrap();
-        assert_eq!(registry.names(), ["read", "write", "edit", "bash", "echo"]);
-        let definitions = registry.definitions();
+        let loaded = fixture.load();
+        let root = &loaded.directory;
+        let installed = root.join("test.echo");
+        std::fs::create_dir(&installed).unwrap();
+        std::fs::copy(&loaded.path, installed.join("plugin.json")).unwrap();
+        #[cfg(unix)]
+        let script = "fixture.sh";
+        #[cfg(windows)]
+        let script = "fixture.cmd";
+        std::fs::copy(root.join(script), installed.join(script)).unwrap();
+        let manifests = resolve_installed_plugins(root, &["test.echo".into()]).unwrap();
+        let host = PluginHost::activate(manifests).await.unwrap();
+        assert_eq!(
+            host.registry().tools().names(),
+            ["read", "write", "edit", "bash", "echo"]
+        );
+        let definitions = host.registry().tools().definitions();
         let mut config = AgentRuntimeConfig::new(ToolContext::new(std::env::temp_dir()).unwrap());
-        config.plugins = PluginRegistry::new(Arc::new(registry));
+        config.plugins = host.registry().clone();
         let provider = ScriptedProvider::new(vec![
             ScriptedStep {
                 events: Vec::new(),
@@ -2199,7 +2210,7 @@ mod tests {
             assert!(requests.iter().all(|request| request.tools == definitions));
             assert!(requests[1].messages.iter().any(|message| matches!(message, ModelMessage::ToolResult { tool_name, content, .. } if tool_name == "echo" && content == "plugin says hello")));
         }
-        process.shutdown().await.unwrap();
+        assert!(host.shutdown().await.is_empty());
     }
 
     #[tokio::test]

@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -8,16 +7,30 @@ use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::fs::home_directory;
+
 use super::ConfigWarning;
 use super::ThinkingLevel;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResolvedSettings {
+    pub plugins: PluginSettings,
     pub default_provider: Option<String>,
     pub default_model: Option<String>,
     pub default_thinking_level: Option<ThinkingLevel>,
     pub context: ContextSettings,
     pub compaction: CompactionSettings,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PluginSettings {
+    pub enabled: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+enum SettingsScope {
+    Global,
+    Project,
 }
 
 pub type Settings = ResolvedSettings;
@@ -91,12 +104,12 @@ pub fn load_settings_from_paths(
     };
     if let Some(path) = global_path {
         if let Some(raw) = read_settings(path)? {
-            apply_raw_settings(&mut load, raw, path)?;
+            apply_raw_settings(&mut load, raw, path, SettingsScope::Global)?;
         }
     }
     if let Some(path) = project_path {
         if let Some(raw) = read_settings(path)? {
-            apply_raw_settings(&mut load, raw, path)?;
+            apply_raw_settings(&mut load, raw, path, SettingsScope::Project)?;
         }
     }
     Ok(load)
@@ -124,6 +137,7 @@ fn apply_raw_settings(
     load: &mut SettingsLoad,
     raw: RawSettings,
     source_path: &Path,
+    scope: SettingsScope,
 ) -> Result<(), SettingsError> {
     for key in raw.extra.keys() {
         load.warnings.push(ConfigWarning {
@@ -142,6 +156,37 @@ fn apply_raw_settings(
             path: format!("settings.compaction.{key}"),
             message: "unknown field".to_owned(),
         });
+    }
+
+    for key in raw.plugins.extra.keys() {
+        load.warnings.push(ConfigWarning {
+            path: format!("settings.plugins.{key}"),
+            message: "unknown field".to_owned(),
+        });
+    }
+    match (scope, raw.plugins.enabled) {
+        (_, RawField::Missing) => {},
+        (SettingsScope::Project, _) => load.warnings.push(ConfigWarning {
+            path: "settings.plugins.enabled".to_owned(),
+            message: "external plugin activation is ignored in project settings; configure ~/.ri/agent/settings.json or use --plugin".to_owned(),
+        }),
+        (SettingsScope::Global, value) => {
+            let invalid = |message: String| SettingsError::Invalid {
+                path: format_path(source_path, "plugins.enabled"), message,
+            };
+            let RawField::Value(ids) = value else {
+                return Err(invalid("plugins.enabled must be an array of plugin IDs".to_owned()));
+            };
+            let mut seen = std::collections::HashSet::new();
+            for id in &ids {
+                crate::plugin::manifest::validate_plugin_id_value(id)
+                    .map_err(|message| invalid(format!("invalid plugin id {id:?}: {message}")))?;
+                if !seen.insert(id) {
+                    return Err(invalid(format!("duplicate plugin id {id:?}")));
+                }
+            }
+            load.settings.plugins.enabled = ids;
+        }
     }
 
     let default_provider = optional_string(
@@ -253,14 +298,10 @@ fn format_path(source_path: &Path, field: &str) -> String {
     format!("{}.{field}", source_path.display())
 }
 
-fn home_directory() -> Option<PathBuf> {
-    env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-}
-
 #[derive(Debug, Deserialize, Default)]
 struct RawSettings {
+    #[serde(default)]
+    plugins: RawPluginSettings,
     #[serde(rename = "defaultProvider", default)]
     default_provider: RawField<String>,
     #[serde(rename = "defaultModel", default)]
@@ -271,6 +312,14 @@ struct RawSettings {
     context: RawContextSettings,
     #[serde(default)]
     compaction: RawCompactionSettings,
+    #[serde(flatten)]
+    extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawPluginSettings {
+    #[serde(default)]
+    enabled: RawField<Vec<String>>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
 }
@@ -317,6 +366,44 @@ struct RawCompactionSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_settings_are_global_only_and_validated() {
+        let root = unique_test_dir("plugins");
+        fs::create_dir_all(&root).unwrap();
+        let global = root.join("global.json");
+        let project = root.join("project.json");
+        fs::write(
+            &global,
+            r#"{"plugins":{"enabled":["dev.global","dev.second"]}}"#,
+        )
+        .unwrap();
+        for enabled in [r#"["dev.project"]"#, "[]", "null"] {
+            fs::write(
+                &project,
+                format!(r#"{{"plugins":{{"enabled":{enabled}}}}}"#),
+            )
+            .unwrap();
+            let load = load_settings_from_paths(Some(&global), Some(&project)).unwrap();
+            assert_eq!(load.settings.plugins.enabled, ["dev.global", "dev.second"]);
+            assert_eq!(load.warnings.len(), 1);
+            assert!(load.warnings[0].message.contains("--plugin"));
+        }
+        for enabled in [
+            r#"[""]"#,
+            r#"["Dev.Search"]"#,
+            r#"["a/b"]"#,
+            r#"["dev.search","dev.search"]"#,
+            "null",
+        ] {
+            fs::write(&global, format!(r#"{{"plugins":{{"enabled":{enabled}}}}}"#)).unwrap();
+            assert!(load_settings_from_paths(Some(&global), None).is_err());
+        }
+        fs::write(&global, r#"{"plugins":{"future":true}}"#).unwrap();
+        let load = load_settings_from_paths(Some(&global), None).unwrap();
+        assert_eq!(load.warnings[0].path, "settings.plugins.future");
+        remove_test_dir(root);
+    }
 
     #[test]
     fn missing_settings_keep_builtin_defaults() {

@@ -14,7 +14,9 @@ use serde_json::Value;
 static CLI_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn cli_test_lock() -> MutexGuard<'static, ()> {
-    CLI_TEST_LOCK.lock().unwrap()
+    CLI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(unix)]
@@ -97,6 +99,137 @@ fn run_tui_signal_torture(signal: &str) {
         !tty_state.contains("-icanon"),
         "SIG{signal} left the PTY in raw mode: {tty_state}"
     );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn help_version_and_safe_mode_do_not_load_configured_broken_plugins() {
+    let _lock = cli_test_lock();
+    let fixture = Fixture::new(success_body());
+    let agent = fixture.home.join(".ri/agent");
+    fs::create_dir_all(agent.join("plugins/test.broken")).unwrap();
+    fs::write(
+        agent.join("plugins/test.broken/plugin.json"),
+        "invalid manifest",
+    )
+    .unwrap();
+    fs::write(
+        agent.join("settings.json"),
+        r#"{"plugins":{"enabled":["test.broken"]}}"#,
+    )
+    .unwrap();
+    for flag in ["--help", "--version"] {
+        let output = fixture.run(&[flag]);
+        assert!(output.status.success(), "{}", text(&output.stderr));
+    }
+    let output = fixture.run(&["--json", "-p", "hello", "--no-session", "--no-context"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(text(&output.stderr).contains("test.broken"));
+    assert!(output.stdout.is_empty());
+    let output = fixture.run(&[
+        "--no-plugins",
+        "--json",
+        "-p",
+        "hello",
+        "--no-session",
+        "--no-context",
+    ]);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert_eq!(
+        parse_records(&output.stdout).last().unwrap()["data"]["success"],
+        true
+    );
+    assert!(!text(&output.stderr).contains("plugins:"));
+    fixture.finish();
+}
+
+#[test]
+fn invalid_home_never_trusts_repository_plugin_settings_or_executables() {
+    let _lock = cli_test_lock();
+    for (home, profile) in [
+        ("", None),
+        (".", None),
+        ("relative-home", None),
+        ("", Some("")),
+        (".", Some("relative-profile")),
+    ] {
+        let fixture = Fixture::new(success_body());
+        let agent = fixture.home.join(home).join(".ri/agent");
+        let plugin = agent.join("plugins/test.repository");
+        fs::create_dir_all(&plugin).unwrap();
+        fs::write(
+            agent.join("settings.json"),
+            r#"{"plugins":{"enabled":["test.repository"]}}"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        let (command, args) = ("/bin/sh", vec!["-c", "echo started > started; exit 7"]);
+        #[cfg(windows)]
+        let (command, args) = ("cmd.exe", vec!["/C", "echo started>started & exit /b 7"]);
+        fs::write(plugin.join("plugin.json"), serde_json::json!({"manifestVersion":1,"id":"test.repository","name":"Repository","version":"1","protocolVersion":"ri.plugin.v1","entrypoint":{"command":command,"args":args}}).to_string()).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ri"));
+        command
+            .current_dir(&fixture.home)
+            .env("HOME", home)
+            .env_remove("USERPROFILE")
+            .env("RI_MODELS_FILE", &fixture.models)
+            .env_remove("RI_LOG")
+            .args(["-p", "hello", "--no-session", "--no-context"]);
+        if let Some(profile) = profile {
+            command.env("USERPROFILE", profile);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            !plugin.join("started").exists(),
+            "repository executable started with HOME={home:?}"
+        );
+        assert!(
+            output.status.success(),
+            "HOME={home:?}: {}",
+            text(&output.stderr)
+        );
+        assert_eq!(text(&output.stdout), "hello\n");
+        let output = command
+            .args(["--plugin", "test.repository"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(text(&output.stderr).contains("home directory"));
+        assert!(!plugin.join("started").exists());
+        fixture.finish();
+    }
+}
+
+#[test]
+fn invalid_home_falls_back_to_absolute_userprofile_for_settings_and_plugins() {
+    let _lock = cli_test_lock();
+    let root = unique_dir("plugin-home-fallback");
+    let agent = root.join(".ri/agent");
+    fs::create_dir_all(&agent).unwrap();
+    fs::write(
+        agent.join("settings.json"),
+        r#"{"plugins":{"enabled":["test.missing"]}}"#,
+    )
+    .unwrap();
+    let models = root.join("models.json");
+    fs::write(&models, valid_models()).unwrap();
+    for home in ["", ".", "relative-home"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_ri"))
+            .current_dir(&root)
+            .env("HOME", home)
+            .env("USERPROFILE", &root)
+            .env("RI_MODELS_FILE", &models)
+            .env_remove("RI_LOG")
+            .args(["-p", "hello", "--no-session", "--no-context"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        let stderr = text(&output.stderr);
+        assert!(
+            stderr.contains("plugin \"test.missing\" is not installed"),
+            "{stderr}"
+        );
+    }
     fs::remove_dir_all(root).unwrap();
 }
 

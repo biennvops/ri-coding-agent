@@ -36,6 +36,8 @@ const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Options {
+    pub plugins: Vec<String>,
+    pub no_plugins: bool,
     pub print_prompt: Option<String>,
     pub json: bool,
     pub provider: Option<String>,
@@ -74,6 +76,11 @@ impl Options {
                         options.print_prompt = Some(prompt);
                     }
                 }
+                "--plugin" => options.plugins.push(
+                    args.next()
+                        .ok_or_else(|| anyhow!("--plugin requires a plugin id"))?,
+                ),
+                "--no-plugins" => options.no_plugins = true,
                 "--json" => options.json = true,
                 "-V" | "--version" => options.show_version = true,
                 "--provider" => {
@@ -113,6 +120,10 @@ impl Options {
             }
         }
 
+        if options.no_plugins && !options.plugins.is_empty() {
+            bail!("--no-plugins cannot be combined with --plugin");
+        }
+
         if options.json
             && options.print_prompt.is_none()
             && !options.show_help
@@ -147,12 +158,34 @@ impl Options {
              Usage:\n  ri                              start the interactive TUI\n  ri -p, --print <prompt>         run one prompt without the TUI\n  ri --json -p <prompt>           emit versioned NDJSON events\n\n\
              Model:\n  --provider <id>                 select a configured provider\n  --model <id>                   select a configured model\n  --thinking <level>              set reasoning level (off, minimal, low, medium, high, xhigh, max)\n\n\
              Sessions:\n  -c, --continue                 continue the newest saved session\n  -r, --resume                   choose a saved session interactively\n  --session <id-or-path>         resume one saved session\n  --no-session                   disable session persistence\n\n\
+             Plugins:\n  --plugin <id>                  enable an installed plugin for this run; repeatable\n  --no-plugins                   disable configured external plugins for this run\n\n\
              Context and help:\n  --no-context                   disable AGENTS context loading\n  -h, --help                    show this help\n  -V, --version                 show the version\n\n\
              Interactive commands:\n{}\n\n\
              Environment:\n  RI_LOG=error|warn|info|debug|trace  write private diagnostic logs",
             command_help()
         );
     }
+}
+
+fn plugin_diagnostic(ids: &[String]) -> Option<String> {
+    (!ids.is_empty()).then(|| format!("plugins: {}", ids.join(", ")))
+}
+
+fn resolve_plugin_selection(
+    configured: &[String],
+    cli: &[String],
+    no_plugins: bool,
+) -> Vec<String> {
+    if no_plugins {
+        return Vec::new();
+    }
+    let mut selected = Vec::new();
+    for id in configured.iter().chain(cli) {
+        if !selected.contains(id) {
+            selected.push(id.clone());
+        }
+    }
+    selected
 }
 
 #[derive(Debug)]
@@ -189,15 +222,34 @@ pub async fn run(options: Options) -> Result<(), RunError> {
             .ok_or_else(|| RunError::Setup(anyhow!("session picker cancelled")))?;
         setup.apply_opened(opened).map_err(RunError::Setup)?;
     }
-    if let Some(prompt) = options.print_prompt {
-        if options.json {
-            run_json(prompt, setup).await.map_err(RunError::Runtime)
+    let host = setup.activate_plugins().await.map_err(RunError::Setup)?;
+    run_with_plugins(host, async move {
+        if let Some(prompt) = options.print_prompt {
+            if options.json {
+                run_json(prompt, setup).await
+            } else {
+                run_print(prompt, setup).await
+            }
         } else {
-            run_print(prompt, setup).await.map_err(RunError::Runtime)
+            run_tui(setup).await
         }
-    } else {
-        run_tui(setup).await.map_err(RunError::Runtime)
+    })
+    .await
+    .map_err(RunError::Runtime)
+}
+
+async fn run_with_plugins(
+    host: ri_core::PluginHost,
+    run: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    let result = run.await;
+    for failure in host.shutdown().await {
+        eprintln!(
+            "ri: warning: could not shut down plugin {} cleanly: {}",
+            failure.plugin_id, failure.message
+        );
     }
+    result
 }
 
 fn missing_models_message() -> String {
@@ -213,6 +265,9 @@ fn missing_models_message() -> String {
 }
 
 struct AppSetup {
+    plugins: ri_core::PluginRegistry,
+    active_plugin_ids: Vec<String>,
+    selected_plugin_ids: Vec<String>,
     provider: ConfiguredProvider,
     catalog: Option<ModelCatalog>,
     selected: Option<ResolvedModel>,
@@ -418,6 +473,13 @@ impl AppSetup {
         }
 
         Ok(Self {
+            plugins: ri_core::builtin_plugins(),
+            active_plugin_ids: Vec::new(),
+            selected_plugin_ids: resolve_plugin_selection(
+                &settings.settings.plugins.enabled,
+                &options.plugins,
+                options.no_plugins,
+            ),
             provider,
             catalog,
             selected,
@@ -439,6 +501,32 @@ impl AppSetup {
             state_path,
             workspace_id,
         })
+    }
+
+    async fn activate_plugins(&mut self) -> Result<ri_core::PluginHost> {
+        self.activate_plugins_from(ri_core::default_plugins_dir().as_deref())
+            .await
+    }
+
+    async fn activate_plugins_from(
+        &mut self,
+        root: Option<&std::path::Path>,
+    ) -> Result<ri_core::PluginHost> {
+        let host = if self.selected_plugin_ids.is_empty() {
+            ri_core::PluginHost::builtin_only()
+        } else {
+            let root = root.ok_or_else(|| {
+                anyhow!("external plugins were enabled but no absolute home directory is available; set HOME or USERPROFILE to an absolute path")
+            })?;
+            let manifests = ri_core::resolve_installed_plugins(root, &self.selected_plugin_ids)?;
+            ri_core::PluginHost::activate(manifests).await?
+        };
+        self.plugins = host.registry().clone();
+        self.active_plugin_ids = host.active_ids().to_vec();
+        for id in &self.active_plugin_ids {
+            tracing::info!(target: "ri", plugin = %id, "activated external plugin");
+        }
+        Ok(host)
     }
 
     fn model_ref(&self) -> ModelRef {
@@ -465,7 +553,7 @@ impl AppSetup {
 
     fn runtime_config(&self) -> AgentRuntimeConfig {
         AgentRuntimeConfig {
-            plugins: ri_core::builtin_plugins(),
+            plugins: self.plugins.clone(),
             tool_context: self.tool_context.clone(),
             base_messages: vec![ModelMessage::System {
                 content: self.system_prompt.clone(),
@@ -524,12 +612,17 @@ impl AppSetup {
 async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
     tracing::info!(target: "ri", mode = "print", prompt_bytes = prompt.len(), "run started");
     eprintln!("{}", setup.context.diagnostic());
+    if let Some(diagnostic) = plugin_diagnostic(&setup.active_plugin_ids) {
+        eprintln!("{diagnostic}");
+    }
     let session_info = setup.session_info()?;
     if let Some(info) = session_info.as_ref() {
         eprintln!("session: {} ({})", info.display_name(), info.id);
     } else {
         eprintln!("session: ephemeral");
     }
+    let mut shutdown =
+        ShutdownSignals::new().context("could not install shutdown signal handlers")?;
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (event_tx, mut event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let runtime_config = setup.runtime_config();
@@ -540,8 +633,6 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
         setup.compaction_enabled,
     );
     let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
-    let mut shutdown =
-        ShutdownSignals::new().context("could not install shutdown signal handlers")?;
 
     if let Err(error) = command_tx.send(AgentCommand::Submit { text: prompt }).await {
         let _ = command_tx.send(AgentCommand::Shutdown).await;
@@ -676,6 +767,9 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
 async fn run_json(prompt: String, setup: AppSetup) -> Result<()> {
     tracing::info!(target: "ri", mode = "json", prompt_bytes = prompt.len(), "run started");
     eprintln!("{}", setup.context.diagnostic());
+    if let Some(diagnostic) = plugin_diagnostic(&setup.active_plugin_ids) {
+        eprintln!("{diagnostic}");
+    }
     let session = setup.session_info()?;
     if let Some(info) = session.as_ref() {
         eprintln!("session: {} ({})", info.display_name(), info.id);
@@ -692,6 +786,8 @@ async fn run_json(prompt: String, setup: AppSetup) -> Result<()> {
             session.as_ref(),
         ),
     )?;
+    let mut shutdown =
+        ShutdownSignals::new().context("could not install shutdown signal handlers")?;
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (event_tx, mut event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let runtime = AgentRuntime::with_config_and_compaction(
@@ -700,8 +796,6 @@ async fn run_json(prompt: String, setup: AppSetup) -> Result<()> {
         setup.compaction_enabled,
     );
     let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
-    let mut shutdown =
-        ShutdownSignals::new().context("could not install shutdown signal handlers")?;
 
     if let Err(error) = command_tx.send(AgentCommand::Submit { text: prompt }).await {
         let message = format!("could not start the agent: {error}");
@@ -829,11 +923,19 @@ async fn run_json(prompt: String, setup: AppSetup) -> Result<()> {
     }
 }
 
-fn add_startup_diagnostics(state: &mut AppState, context: &ContextBundle, session_resumed: bool) {
+fn add_startup_diagnostics(
+    state: &mut AppState,
+    context: &ContextBundle,
+    session_resumed: bool,
+    plugin_ids: &[String],
+) {
     if session_resumed {
         return;
     }
     state.add_system_message(context.diagnostic());
+    if let Some(diagnostic) = plugin_diagnostic(plugin_ids) {
+        state.add_system_message(diagnostic);
+    }
     if let Some(path) = crate::logging::path() {
         state.add_system_message(format!("logging: {}", path.display()));
     }
@@ -858,7 +960,12 @@ async fn run_tui(mut setup: AppSetup) -> Result<()> {
 
     let mut state = AppState::with_tool_registry(tool_registry);
     state.replace_history(&setup.initial_transcript);
-    add_startup_diagnostics(&mut state, &setup.context, setup.initial_session_resumed);
+    add_startup_diagnostics(
+        &mut state,
+        &setup.context,
+        setup.initial_session_resumed,
+        &setup.active_plugin_ids,
+    );
     state.set_session_info(session_info);
     state.set_git_branch(resolve_git_head(&setup.context.project_root));
     state.reduce(AgentEvent::ModelChanged(setup.model_ref()));
@@ -1888,6 +1995,267 @@ mod tests {
     use super::*;
     use ri_core::ResolvedSettings;
 
+    struct InstalledFixture {
+        root: PathBuf,
+    }
+
+    impl InstalledFixture {
+        fn new(fail_shutdown: bool) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "ri-installed-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let directory = root.join("test.echo");
+            std::fs::create_dir_all(&directory).unwrap();
+            #[cfg(unix)]
+            let (command, args, name) = ("/bin/sh", vec!["fixture.sh"], "fixture.sh");
+            #[cfg(windows)]
+            let (command, args, name) = ("cmd.exe", vec!["/C", "fixture.cmd"], "fixture.cmd");
+            std::fs::write(directory.join("plugin.json"), serde_json::json!({"manifestVersion":1,"id":"test.echo","name":"Echo","version":"0.1.0","protocolVersion":"ri.plugin.v1","entrypoint":{"command":command,"args":args}}).to_string()).unwrap();
+            let mut exchanges = vec![
+                (
+                    "initialize",
+                    serde_json::json!({"result":{"protocolVersion":"ri.plugin.v1","plugin":{"id":"test.echo","name":"Echo","version":"0.1.0"},"capabilities":{"tools":true}}}),
+                ),
+                (
+                    "tools/list",
+                    serde_json::json!({"result":{"tools":[{"name":"echo","inputSchema":{}}]}}),
+                ),
+            ];
+            exchanges.push((
+                "shutdown",
+                if fail_shutdown {
+                    serde_json::json!({"error":{"code":-32000,"message":"shutdown failed"}})
+                } else {
+                    serde_json::json!({"result":null})
+                },
+            ));
+            #[cfg(unix)]
+            let mut script = String::from("echo started > started\n");
+            #[cfg(windows)]
+            let mut script = String::from("@echo off\r\necho started>started\r\n");
+            for (index, (method, mut response)) in exchanges.into_iter().enumerate() {
+                response["jsonrpc"] = "2.0".into();
+                response["id"] = (index + 1).into();
+                #[cfg(unix)]
+                script.push_str(&format!("IFS= read -r request\nprintf '%s\\n' \"$request\" >> requests\ncase \"$request\" in *'\"method\":\"{method}\"'*) ;; *) exit 7 ;; esac\nprintf '%s\\n' '{response}'\n"));
+                #[cfg(windows)]
+                script.push_str(&format!("set /p REQUEST=\r\necho %REQUEST%>>requests\r\necho %REQUEST% | findstr /C:\"{method}\" >nul || exit /b 7\r\necho {response}\r\n"));
+            }
+            #[cfg(unix)]
+            script.push_str("echo shutdown > stopped\n");
+            #[cfg(windows)]
+            script.push_str("echo shutdown>stopped\r\nexit /b 0\r\n");
+            std::fs::write(directory.join(name), script).unwrap();
+            Self { root }
+        }
+
+        fn setup(&self, selected: Vec<String>) -> AppSetup {
+            AppSetup {
+                plugins: ri_core::builtin_plugins(),
+                active_plugin_ids: Vec::new(),
+                selected_plugin_ids: selected,
+                provider: ConfiguredProvider::mock(),
+                catalog: None,
+                selected: None,
+                tool_context: ToolContext::new(&self.root).unwrap(),
+                context: ContextBundle::disabled(self.root.clone(), self.root.clone()),
+                system_prompt: String::new(),
+                repository: None,
+                session: None,
+                initial_history: Vec::new(),
+                initial_transcript: Vec::new(),
+                compaction_enabled: false,
+                thinking_level: None,
+                reasoning_effort: None,
+                cli_thinking_level: None,
+                default_thinking_level: None,
+                recent_thinking_level: None,
+                resume_requested: false,
+                initial_session_resumed: false,
+                state_path: None,
+                workspace_id: "workspace".into(),
+            }
+        }
+    }
+
+    impl Drop for InstalledFixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_activates_installed_plugins_and_rejects_missing_selection() {
+        let fixture = InstalledFixture::new(false);
+        let mut setup = fixture.setup(Vec::new());
+        let host = setup.activate_plugins_from(None).await.unwrap();
+        assert_eq!(
+            setup.runtime_config().plugins.tools().names(),
+            ["read", "write", "edit", "bash"]
+        );
+        assert!(host.shutdown().await.is_empty());
+        setup.selected_plugin_ids = vec!["test.echo".into()];
+        assert!(setup
+            .activate_plugins_from(None)
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("no absolute home directory"));
+        let host = setup
+            .activate_plugins_from(Some(&fixture.root))
+            .await
+            .unwrap();
+        assert_eq!(setup.active_plugin_ids, ["test.echo"]);
+        assert_eq!(
+            setup.runtime_config().plugins.tools().names(),
+            ["read", "write", "edit", "bash", "echo"]
+        );
+        assert!(host.shutdown().await.is_empty());
+        assert!(fixture.root.join("test.echo/stopped").exists());
+        for id in ["test.missing", "/path/plugin.json"] {
+            setup.selected_plugin_ids = vec![id.into()];
+            assert!(setup
+                .activate_plugins_from(Some(&fixture.root))
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_shutdown_follows_success_and_error_without_masking_result() {
+        for fail_run in [false, true] {
+            for fail_shutdown in [false, true] {
+                let fixture = InstalledFixture::new(fail_shutdown);
+                let mut setup = fixture.setup(vec!["test.echo".into()]);
+                let host = setup
+                    .activate_plugins_from(Some(&fixture.root))
+                    .await
+                    .unwrap();
+                let result = run_with_plugins(host, async {
+                    assert!(!fixture.root.join("test.echo/stopped").exists());
+                    if fail_run {
+                        bail!("run failed");
+                    }
+                    Ok(())
+                })
+                .await;
+                assert_eq!(result.is_err(), fail_run);
+                if let Err(error) = result {
+                    assert_eq!(error.to_string(), "run failed");
+                }
+                let requests =
+                    std::fs::read_to_string(fixture.root.join("test.echo/requests")).unwrap();
+                assert!(requests.lines().last().unwrap().contains("shutdown"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn safe_mode_never_starts_configured_plugin() {
+        let fixture = InstalledFixture::new(false);
+        let options = Options::parse(["--no-plugins".into()]).unwrap();
+        let selected =
+            resolve_plugin_selection(&["test.echo".into()], &options.plugins, options.no_plugins);
+        let mut setup = fixture.setup(selected);
+        let host = setup.activate_plugins_from(None).await.unwrap();
+        assert!(setup.selected_plugin_ids.is_empty());
+        assert!(setup.active_plugin_ids.is_empty());
+        assert_eq!(
+            setup.runtime_config().plugins.tools().names(),
+            ["read", "write", "edit", "bash"]
+        );
+        assert!(host.shutdown().await.is_empty());
+        assert!(!fixture.root.join("test.echo/started").exists());
+    }
+
+    #[tokio::test]
+    async fn installed_plugins_stay_alive_until_runtime_stops() {
+        let fixture = InstalledFixture::new(false);
+        let mut setup = fixture.setup(resolve_plugin_selection(&["test.echo".into()], &[], false));
+        let host = setup
+            .activate_plugins_from(Some(&fixture.root))
+            .await
+            .unwrap();
+        run_with_plugins(host, async {
+            let (command_tx, command_rx) = mpsc::channel(8);
+            let (event_tx, mut event_rx) = mpsc::channel(64);
+            let runtime = AgentRuntime::with_config(setup.provider.clone(), setup.runtime_config());
+            let task = tokio::spawn(runtime.run(command_rx, event_tx));
+            command_tx
+                .send(AgentCommand::Submit {
+                    text: "hello".into(),
+                })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while let Some(event) = event_rx.recv().await {
+                    assert!(!matches!(event, AgentEvent::Error(_)));
+                    if matches!(
+                        event,
+                        AgentEvent::TurnFinished {
+                            reason: StopReason::Stop
+                        }
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!fixture.root.join("test.echo/stopped").exists());
+            command_tx.send(AgentCommand::Shutdown).await.unwrap();
+            task.await.unwrap();
+            assert!(!fixture.root.join("test.echo/stopped").exists());
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(fixture.root.join("test.echo/stopped").exists());
+    }
+
+    #[test]
+    fn active_plugin_diagnostic_is_optional_and_ordered() {
+        assert_eq!(plugin_diagnostic(&[]), None);
+        assert_eq!(
+            plugin_diagnostic(&["a".into(), "b".into()]).as_deref(),
+            Some("plugins: a, b")
+        );
+    }
+
+    #[test]
+    fn plugin_flags_and_selection() {
+        let parse = |args: &[&str]| Options::parse(args.iter().map(|s| s.to_string()));
+        assert_eq!(
+            parse(&["--plugin", "dev.search"]).unwrap().plugins,
+            ["dev.search"]
+        );
+        assert_eq!(
+            parse(&["--plugin", "dev.search", "--plugin", "dev.git"])
+                .unwrap()
+                .plugins,
+            ["dev.search", "dev.git"]
+        );
+        assert!(parse(&["--no-plugins"]).unwrap().no_plugins);
+        assert!(parse(&["--no-plugins", "--plugin", "dev.search"]).is_err());
+        assert!(parse(&["--plugin"]).is_err());
+        let configured = vec!["a".into(), "b".into()];
+        assert_eq!(
+            resolve_plugin_selection(&configured, &["b".into(), "c".into()], false),
+            ["a", "b", "c"]
+        );
+        assert_eq!(
+            resolve_plugin_selection(&configured, &[], false),
+            configured
+        );
+        assert!(resolve_plugin_selection(&configured, &[], true).is_empty());
+    }
+
     #[test]
     fn parses_print_prompt_and_model_flags() {
         assert_eq!(
@@ -1903,6 +2271,8 @@ mod tests {
             ])
             .unwrap(),
             Options {
+                plugins: Vec::new(),
+                no_plugins: false,
                 print_prompt: Some("hello".to_owned()),
                 json: false,
                 provider: Some("custom".to_owned()),
@@ -2100,6 +2470,9 @@ mod tests {
         .unwrap();
         let selected = catalog.resolve(None, Some("model")).unwrap();
         let mut setup = AppSetup {
+            plugins: ri_core::builtin_plugins(),
+            active_plugin_ids: Vec::new(),
+            selected_plugin_ids: Vec::new(),
             provider: ConfiguredProvider::mock(),
             catalog: Some(catalog),
             selected: Some(selected),
@@ -2413,14 +2786,18 @@ mod tests {
     fn startup_diagnostics_are_kept_for_fresh_sessions_only() {
         let context = ContextBundle::disabled(PathBuf::new(), PathBuf::new());
         let mut fresh = AppState::new();
-        add_startup_diagnostics(&mut fresh, &context, false);
+        add_startup_diagnostics(&mut fresh, &context, false, &["a".into(), "b".into()]);
+        assert!(fresh
+            .messages()
+            .iter()
+            .any(|message| message.content == "plugins: a, b"));
         assert!(fresh
             .messages()
             .iter()
             .any(|message| message.content == "context: disabled"));
 
         let mut resumed = AppState::new();
-        add_startup_diagnostics(&mut resumed, &context, true);
+        add_startup_diagnostics(&mut resumed, &context, true, &["a".into()]);
         assert!(resumed.messages().is_empty());
     }
 

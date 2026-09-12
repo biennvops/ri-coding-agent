@@ -55,6 +55,23 @@ pub enum PluginManifestError {
     },
 }
 
+pub(crate) fn validate_plugin_id_value(id: &str) -> Result<(), &'static str> {
+    let valid = !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b".-_".contains(&b))
+        && id
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+    if valid {
+        Ok(())
+    } else {
+        Err("expected 1..=128 lowercase ASCII letters, digits, '.', '-', or '_', starting with a letter or digit")
+    }
+}
+
 impl PluginManifest {
     pub(crate) fn validate(&self, path: &Path) -> Result<(), PluginManifestError> {
         if self.manifest_version != PLUGIN_MANIFEST_VERSION {
@@ -69,17 +86,7 @@ impl PluginManifest {
                 value: self.protocol_version.clone(),
             });
         }
-        let valid_id = !self.id.is_empty()
-            && self.id.len() <= 128
-            && self
-                .id
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b".-_".contains(&b))
-            && self
-                .id
-                .bytes()
-                .next()
-                .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+        let valid_id = validate_plugin_id_value(&self.id).is_ok();
         for (field, value, valid) in [
             ("id", &self.id, valid_id),
             ("name", &self.name, !self.name.trim().is_empty()),
@@ -137,6 +144,16 @@ pub fn load_plugin_manifest(
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    #[test]
+    fn canonical_plugin_ids() {
+        for id in ["dev.example.search", "abc_1-test"] {
+            assert!(validate_plugin_id_value(id).is_ok());
+        }
+        for id in ["", ".search", "Search", "a/search", &"a".repeat(129)] {
+            assert!(validate_plugin_id_value(id).is_err());
+        }
+    }
 
     fn example() -> Value {
         json!({"manifestVersion":1,"id":"dev.example.echo","name":"Echo","version":"0.1.0","protocolVersion":"ri.plugin.v1","entrypoint":{"command":"./echo"}})

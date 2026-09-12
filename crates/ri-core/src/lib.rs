@@ -18,9 +18,9 @@ pub use app::{
 pub use config::{
     default_state_path, load_state, persist_recent_model, persist_recent_thinking, ApiKind,
     CompactionSettings, Compatibility, ConfigError, ConfigWarning, ContextSettings, CostMetadata,
-    ModelCatalog, ModelRef, RecentModel, RecentModelState, ResolvedModel, ResolvedSettings,
-    Settings, SettingsError, SettingsLoad, StateError, ThinkingLevel, ThinkingLevelError,
-    WorkspaceRecentModel,
+    ModelCatalog, ModelRef, PluginSettings, RecentModel, RecentModelState, ResolvedModel,
+    ResolvedSettings, Settings, SettingsError, SettingsLoad, StateError, ThinkingLevel,
+    ThinkingLevelError, WorkspaceRecentModel,
 };
 pub use context::{
     automatic_trigger, compaction_target, input_budget, ConservativeTokenEstimator, ContextUsage,
@@ -34,14 +34,15 @@ pub use model::{
     StopReason, ToolChoice, ToolDefinition, Usage,
 };
 pub use plugin::{
-    builtin_plugins, load_plugin_manifest, ExternalToolError, ExternalToolSet,
-    LoadedPluginManifest, PluginCapabilities, PluginDiagnostics, PluginEntrypoint, PluginIdentity,
-    PluginManifest, PluginManifestError, PluginProcess, PluginProcessError, PluginRegistry,
-    PluginToolDefinition, ToolCallParams, ToolCallResult, ToolsListResult,
-    MAX_EXTERNAL_TOOLS_PER_PLUGIN, MAX_EXTERNAL_TOOL_DESCRIPTION_BYTES,
+    builtin_plugins, default_plugins_dir, load_plugin_manifest, resolve_installed_plugins,
+    ExternalToolError, ExternalToolSet, InstalledPluginError, LoadedPluginManifest,
+    PluginActivationError, PluginCapabilities, PluginDiagnostics, PluginEntrypoint, PluginHost,
+    PluginIdentity, PluginManifest, PluginManifestError, PluginProcess, PluginProcessError,
+    PluginRegistry, PluginShutdownFailure, PluginToolDefinition, ToolCallParams, ToolCallResult,
+    ToolsListResult, MAX_EXTERNAL_TOOLS_PER_PLUGIN, MAX_EXTERNAL_TOOL_DESCRIPTION_BYTES,
     MAX_EXTERNAL_TOOL_NAME_BYTES, MAX_PLUGIN_FRAME_BYTES, MAX_PLUGIN_STDERR_BYTES,
-    PLUGIN_MANIFEST_VERSION, PLUGIN_PROTOCOL_VERSION, PLUGIN_SHUTDOWN_TIMEOUT,
-    PLUGIN_STARTUP_TIMEOUT,
+    PLUGIN_MANIFEST_FILENAME, PLUGIN_MANIFEST_VERSION, PLUGIN_PROTOCOL_VERSION,
+    PLUGIN_SHUTDOWN_TIMEOUT, PLUGIN_STARTUP_TIMEOUT,
 };
 pub use session::{
     read_session, validate_name, workspace_id, MessageId, OpenedSession, SessionAssistantItem,

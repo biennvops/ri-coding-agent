@@ -141,10 +141,13 @@ Logs are written under `~/.ri/agent/logs/`. They are not generated retroactively
 
 - `RI_MODELS_FILE`, or `~/.ri/agent/models.json`
 - `~/.ri/agent/settings.json`
+- `~/.ri/agent/plugins/<plugin-id>/plugin.json`
 - `<project>/.ri/settings.json`
 - `~/.ri/agent/state.json` and its advisory `.lock` target
 - `~/.ri/agent/sessions/<workspace-id>/`
 - `~/.ri/agent/logs/`
+
+Global settings and installed plugins use the first absolute path from `HOME`, then `USERPROFILE`; empty or relative values are ignored so repository files cannot become global executable configuration.
 
 If neither `HOME` nor `USERPROFILE` is available, setup-free commands such as `ri --help` and `ri --version` still work. Persistent operations that need a global path fail with an actionable error.
 
@@ -218,6 +221,47 @@ Application bootstrap → PluginRegistry → AgentRuntimeConfig → AgentRuntime
 
 Capability composition lives outside `AgentRuntime` so the agent loop only consumes the prepared tool registry, rather than deciding which tools exist or how they are supplied. `PluginRegistry` currently contains only tools; no speculative provider, command, context, or hook interfaces are defined.
 
+### Installed plugin activation
+
+Manually place trusted plugins under `~/.ri/agent/plugins/<plugin-id>/plugin.json`:
+
+```text
+~/.ri/agent/plugins/
+└── dev.example.echo/
+    ├── plugin.json
+    └── ri-plugin-echo
+```
+
+The directory name must match the manifest's `"id": "dev.example.echo"`. There is no installer or package manager yet. Only explicitly selected IDs are inspected; unrelated broken installations do not affect startup. IDs are 1–128 bytes of lowercase ASCII letters, digits, `.`, `-`, or `_`, starting with a letter or digit. Settings and CLI accept IDs, not manifest or executable paths; repository `.ri/plugins` directories are never searched.
+
+Enable plugins in global `~/.ri/agent/settings.json`:
+
+```json
+{
+  "plugins": {
+    "enabled": ["dev.example.echo"]
+  }
+}
+```
+
+`plugins.enabled` is honored only from global user settings. Project `.ri/settings.json` cannot enable executable plugins, replace the global list, or clear it. Project activation attempts produce a warning directing you to global settings or `--plugin`: cloning/opening a repository must not itself cause plugin executables to start. Invalid IDs, duplicate IDs, and null enabled lists in global settings are configuration errors.
+
+For one-run activation or safe mode:
+
+```bash
+ri --plugin dev.example.echo
+ri --plugin dev.example.echo --plugin dev.example.git
+ri --no-plugins
+```
+
+The global list comes first, followed by CLI additions in command-line order. Duplicates across these selections activate once, at their first position. `--no-plugins` disables all external plugins for that run, without disabling `read`, `write`, `edit`, or `bash`; it cannot be combined with `--plugin`. Help and version commands never start plugins. An empty selection does not require a home directory for plugin setup.
+
+Explicit selection is a startup requirement: missing installations, invalid manifests, protocol/identity handshake failures, invalid tool definitions, and tool-name collisions fail setup rather than silently omitting requested capabilities. Plugins cannot override built-ins or each other. `PluginHost` allows at most 5 seconds per plugin for initial `tools/list` loading, activates in selection order, composes built-ins first followed by each plugin's advertised tool order, and cleans up started processes if any activation fails. `AgentRuntime` receives only the composed `PluginRegistry`, not process handles.
+
+Processes remain alive until the TUI, print, or JSON agent runtime stops, then shut down in reverse activation order. Shutdown failures produce warnings without replacing the agent result. Active IDs appear as `plugins: dev.example.echo` on print/JSON stderr and in fresh TUI startup diagnostics; JSON stdout remains versioned NDJSON only.
+
+**External plugins are trusted local executables.** They currently run with the same OS permissions and inherited environment as `ri`. There is no plugin sandbox or permission model yet; a separate process provides crash isolation, not a security boundary.
+
 ### External plugin protocol foundation
 
 ```text
@@ -229,7 +273,7 @@ plugin.json → validated manifest → PluginProcess
                                external executable
 ```
 
-External plugins are **not discovered or loaded during normal `ri` startup**. Project-local files never automatically execute plugin code. Default tools remain exactly `read`, `write`, `edit`, and `bash`. Explicit host callers may load and register external tools through the API below; this is not a Rust dynamic-library ABI.
+External plugins are activated only when selected by global user settings or explicit CLI flags. Project-local files never automatically execute plugin code. With no external plugins selected, tools remain exactly `read`, `write`, `edit`, and `bash`. External tools use the API below; this is not a Rust dynamic-library ABI.
 
 An explicit host caller uses `load_plugin_manifest(path)`, then `PluginProcess::start(loaded).await`. Loading a manifest only parses and validates it; `start` executes its command directly with a separate argument vector, without host-added shell wrapping. The child runs in the canonical manifest directory and inherits the host environment. Relative executable paths such as `./ri-plugin-echo` resolve against that directory; bare commands use executable lookup. This is not a sandbox: only explicitly start trusted executables.
 
@@ -359,8 +403,8 @@ External tools use normal tool transcript events, tool-result history, and fallb
 
 Cancelling an ri turn stops waiting for an external tool call and drops its pending response; late responses are ignored. `ri.plugin.v1` does not yet send cooperative cancellation to the plugin: remote computation may continue until it returns or the process is shut down. Generic request callers still choose their own deadlines.
 
-There is no streamed tool output, plugin-specific presentation, workspace context in `tools/call`, dynamic `tools/list` refresh, or automatic external plugin loading. Plugin discovery/install, activation/settings, MCP, and web search remain unimplemented.
+There is no streamed tool output, plugin-specific presentation, workspace context in `tools/call`, dynamic `tools/list` refresh, or unselected external plugin loading. Plugin installation/package management, MCP, and web search remain unimplemented.
 
 ## Current non-goals
 
-Plugin discovery/install, plugin activation/settings, WASM, provider plugins, command plugins, context plugins, web search, Codex integration, MCP, skills, user-selectable themes, semantic/LSP highlighting, session branching, new provider protocols, OAuth, remote execution, sandboxing, permission prompts, and public release automation are outside this baseline.
+Plugin installation/package manager, plugin registry/repository, plugin signing, dependency resolution, hot reload, WASM, provider plugins, command plugins, context plugins, web search, Codex integration, MCP, skills, user-selectable themes, semantic/LSP highlighting, session branching, new provider protocols, OAuth, remote execution, sandboxing, permission prompts, and public release automation are outside this baseline.
