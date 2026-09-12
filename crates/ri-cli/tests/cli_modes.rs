@@ -14,7 +14,9 @@ use serde_json::Value;
 static CLI_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn cli_test_lock() -> MutexGuard<'static, ()> {
-    CLI_TEST_LOCK.lock().unwrap()
+    CLI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(unix)]
@@ -222,15 +224,10 @@ fn invalid_home_falls_back_to_absolute_userprofile_for_settings_and_plugins() {
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(2));
+        let stderr = text(&output.stderr);
         assert!(
-            text(&output.stderr).contains(
-                &agent
-                    .join("plugins/test.missing/plugin.json")
-                    .display()
-                    .to_string()
-            ),
-            "{}",
-            text(&output.stderr)
+            stderr.contains("plugin \"test.missing\" is not installed"),
+            "{stderr}"
         );
     }
     fs::remove_dir_all(root).unwrap();
