@@ -2029,7 +2029,7 @@ mod tests {
             if call {
                 exchanges.push((
                     "tools/call",
-                    serde_json::json!({"result":{"output":"plugin echoed","isError":false}}),
+                    serde_json::json!({"result":{"content":"plugin echoed","isError":false}}),
                 ));
             }
             exchanges.push((
@@ -2160,6 +2160,69 @@ mod tests {
                 assert!(requests.lines().last().unwrap().contains("shutdown"));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn safe_mode_never_starts_configured_plugin() {
+        let fixture = InstalledFixture::new(false, false);
+        let options = Options::parse(["--no-plugins".into()]).unwrap();
+        let selected =
+            resolve_plugin_selection(&["test.echo".into()], &options.plugins, options.no_plugins);
+        let mut setup = fixture.setup(selected);
+        let host = setup.activate_plugins_from(None).await.unwrap();
+        assert!(setup.selected_plugin_ids.is_empty());
+        assert!(setup.active_plugin_ids.is_empty());
+        assert_eq!(
+            setup.runtime_config().plugins.tools().names(),
+            ["read", "write", "edit", "bash"]
+        );
+        assert!(host.shutdown().await.is_empty());
+        assert!(!fixture.root.join("test.echo/started").exists());
+    }
+
+    #[tokio::test]
+    async fn installed_plugins_stay_alive_until_runtime_stops() {
+        let fixture = InstalledFixture::new(false, false);
+        let mut setup = fixture.setup(resolve_plugin_selection(&["test.echo".into()], &[], false));
+        let host = setup
+            .activate_plugins_from(Some(&fixture.root))
+            .await
+            .unwrap();
+        run_with_plugins(host, async {
+            let (command_tx, command_rx) = mpsc::channel(8);
+            let (event_tx, mut event_rx) = mpsc::channel(64);
+            let runtime = AgentRuntime::with_config(setup.provider.clone(), setup.runtime_config());
+            let task = tokio::spawn(runtime.run(command_rx, event_tx));
+            command_tx
+                .send(AgentCommand::Submit {
+                    text: "hello".into(),
+                })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while let Some(event) = event_rx.recv().await {
+                    assert!(!matches!(event, AgentEvent::Error(_)));
+                    if matches!(
+                        event,
+                        AgentEvent::TurnFinished {
+                            reason: StopReason::Stop
+                        }
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!fixture.root.join("test.echo/stopped").exists());
+            command_tx.send(AgentCommand::Shutdown).await.unwrap();
+            task.await.unwrap();
+            assert!(!fixture.root.join("test.echo/stopped").exists());
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(fixture.root.join("test.echo/stopped").exists());
     }
 
     #[test]
