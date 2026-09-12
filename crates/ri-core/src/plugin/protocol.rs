@@ -95,6 +95,34 @@ pub struct PluginCapabilities {
     pub extra: BTreeMap<String, Value>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginToolDefinition {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub input_schema: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolsListResult {
+    pub tools: Vec<PluginToolDefinition>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolCallParams {
+    pub name: String,
+    pub arguments: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCallResult {
+    pub content: String,
+    #[serde(default)]
+    pub is_error: bool,
+}
+
 pub fn encode_request(id: u64, method: &str, params: Value) -> Result<String, ProtocolError> {
     let line = serde_json::to_string(&RpcRequest {
         jsonrpc: "2.0".into(),
@@ -149,6 +177,36 @@ pub fn decode_plugin_message(line: &str) -> Result<PluginMessage, ProtocolError>
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn tool_wire_contract_round_trips_and_tolerates_additions() {
+        let list = serde_json::json!({"tools":[{"name":"echo","inputSchema":{"type":"object"},"description":"Echo"}]});
+        let decoded: ToolsListResult = serde_json::from_value(list.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), list);
+        let params = ToolCallParams {
+            name: "echo".into(),
+            arguments: serde_json::json!({"text":"hello"}),
+        };
+        assert_eq!(
+            serde_json::to_value(params).unwrap(),
+            serde_json::json!({"name":"echo","arguments":{"text":"hello"}})
+        );
+        let result: ToolCallResult =
+            serde_json::from_value(serde_json::json!({"content":"hello","future":42})).unwrap();
+        assert!(!result.is_error);
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            serde_json::json!({"content":"hello","isError":false})
+        );
+        let result: ToolCallResult =
+            serde_json::from_value(serde_json::json!({"content":"failed","isError":true})).unwrap();
+        assert!(result.is_error);
+        let list: ToolsListResult = serde_json::from_value(serde_json::json!({"tools":[{"name":"echo","inputSchema":{},"future":true}],"future":true})).unwrap();
+        assert!(list.tools[0].description.is_none());
+        let _: ToolCallParams =
+            serde_json::from_value(serde_json::json!({"name":"echo","arguments":{},"future":true}))
+                .unwrap();
+    }
 
     #[test]
     fn wire_round_trips() {
