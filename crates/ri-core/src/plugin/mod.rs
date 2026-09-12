@@ -50,3 +50,5 @@ mod tests {
         assert!(super::PluginRegistry::default().tools().names().is_empty());
     }
 }
+
+mod tools;
