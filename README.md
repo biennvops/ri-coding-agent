@@ -204,7 +204,7 @@ A live provider smoke is deliberately manual. It is not part of CI and must be r
 
 ## Internal capability architecture
 
-`ri-core` has an internal plugin/capability foundation; it does **not** load external plugins.
+`ri-core` separates internal capability composition from an explicitly invoked external-plugin protocol/lifecycle API. The two paths do not connect yet.
 
 ```text
 Application bootstrap → PluginRegistry → AgentRuntimeConfig → AgentRuntime
@@ -218,8 +218,68 @@ Application bootstrap → PluginRegistry → AgentRuntimeConfig → AgentRuntime
 
 Capability composition lives outside `AgentRuntime` so the agent loop only consumes the prepared tool registry, rather than deciding which tools exist or how they are supplied. `PluginRegistry` currently contains only tools; no speculative provider, command, context, or hook interfaces are defined.
 
-Third-party/external plugins, discovery and installation, a subprocess protocol, MCP, and web search are not implemented. A future external-plugin milestone is intended to use a versioned, language-neutral subprocess protocol, not a Rust dynamic-library ABI.
+### External plugin protocol foundation
+
+```text
+plugin.json → validated manifest → PluginProcess
+                                       │
+                              JSON-RPC 2.0 / NDJSON
+                                       │
+                                       ▼
+                               external executable
+```
+
+External plugins are **not discovered or loaded during normal `ri` startup**. Project-local files never automatically execute plugin code. No external plugin capability is registered with the model yet; default tools remain exactly `read`, `write`, `edit`, and `bash`. This API is a protocol/lifecycle foundation for the next milestone, not a Rust dynamic-library ABI.
+
+An explicit host caller uses `load_plugin_manifest(path)`, then `PluginProcess::start(loaded).await`. Loading a manifest only parses and validates it; `start` executes its command directly with a separate argument vector, without host-added shell wrapping. The child runs in the canonical manifest directory and inherits the host environment. Relative executable paths such as `./ri-plugin-echo` resolve against that directory; bare commands use executable lookup. This is not a sandbox: only explicitly start trusted executables.
+
+Manifest version 1 uses strict camelCase fields (unknown fields are errors):
+
+```json
+{
+  "manifestVersion": 1,
+  "id": "dev.example.echo",
+  "name": "Echo",
+  "version": "0.1.0",
+  "protocolVersion": "ri.plugin.v1",
+  "entrypoint": {
+    "command": "./ri-plugin-echo",
+    "args": []
+  }
+}
+```
+
+`args` defaults to `[]`. IDs contain at most 128 bytes of lowercase ASCII letters, digits, `.`, `-`, or `_`, starting with a letter or digit. Name, version, and command must be non-empty after trimming. The release version is opaque, not necessarily SemVer. Manifests contain no configuration or secrets.
+
+Transport and lifecycle:
+
+- stdin/stdout carry UTF-8 JSON-RPC 2.0, one JSON object per line (NDJSON), at most 1 MiB per frame excluding its newline. Stdout is protocol-only; malformed or oversized output fails the connection.
+- stderr is diagnostics-only. The host continuously drains it, retaining the first 64 KiB and a truncation flag. Bounded diagnostics accompany startup/shutdown failures.
+- Startup sends `initialize` and allows at most 5 seconds for initialization. The negotiated protocol must be `ri.plugin.v1`; returned plugin ID, name, and version must exactly match the manifest. Failed initialization terminates and reaps the child.
+- Request IDs start at 1 and increase monotonically. Responses are matched by ID, including out-of-order responses. Each response has exactly one `result` (including `null`) or JSON-RPC `error`. Generic `request` callers choose their own post-startup deadlines; cancellation removes pending request state.
+- `recv_notification` exposes uninterpreted notifications. The notification queue and pending-request count are bounded to 64 each. Notification overflow fails the connection rather than blocking response routing. Plugin-to-host requests are not supported.
+- `capabilities()` exposes advertised capabilities; unknown capability keys are preserved. Advertising `tools` does not register or enable tools.
+- `shutdown().await` sends `shutdown` with `{}` params. After the response, stdin closes and the host waits for exit. The entire graceful shutdown has a 2-second deadline; failure or timeout triggers termination and reaping. Kill-on-drop is an emergency fallback, not the normal shutdown path.
+
+Initialization exchange (each object is transmitted on a single line; the host version is the compiled package version):
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"ri.plugin.v1","host":{"name":"ri","version":"0.1.0"}}}
+```
+
+```json
+{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"ri.plugin.v1","plugin":{"id":"dev.example.echo","name":"Echo","version":"0.1.0"},"capabilities":{"tools":false}}}
+```
+
+Shutdown exchange, assuming no intervening requests:
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"shutdown","params":{}}
+{"jsonrpc":"2.0","id":2,"result":null}
+```
+
+Plugin discovery/install, external tool registration, MCP, and web search remain unimplemented.
 
 ## Current non-goals
 
-External plugins (including discovery/install and subprocess execution), web search, Codex integration, MCP, skills, user-selectable themes, semantic/LSP highlighting, session branching, new provider protocols, OAuth, remote execution, sandboxing, permission prompts, and public release automation are outside this baseline.
+Plugin discovery/install, external tool registration, WASM, provider plugins, command plugins, context plugins, web search, Codex integration, MCP, skills, user-selectable themes, semantic/LSP highlighting, session branching, new provider protocols, OAuth, remote execution, sandboxing, permission prompts, and public release automation are outside this baseline.

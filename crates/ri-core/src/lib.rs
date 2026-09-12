@@ -33,7 +33,13 @@ pub use model::{
     ModelProvider, ModelRequest, ModelResponse, ModelThinking, ModelToolCall, ProviderError,
     StopReason, ToolChoice, ToolDefinition, Usage,
 };
-pub use plugin::{builtin_plugins, PluginRegistry};
+pub use plugin::{
+    builtin_plugins, load_plugin_manifest, LoadedPluginManifest, PluginCapabilities,
+    PluginDiagnostics, PluginEntrypoint, PluginIdentity, PluginManifest, PluginManifestError,
+    PluginProcess, PluginProcessError, PluginRegistry, MAX_PLUGIN_FRAME_BYTES,
+    MAX_PLUGIN_STDERR_BYTES, PLUGIN_MANIFEST_VERSION, PLUGIN_PROTOCOL_VERSION,
+    PLUGIN_SHUTDOWN_TIMEOUT, PLUGIN_STARTUP_TIMEOUT,
+};
 pub use session::{
     read_session, validate_name, workspace_id, MessageId, OpenedSession, SessionAssistantItem,
     SessionError, SessionHandle, SessionHeader, SessionId, SessionInfo, SessionMessage,
