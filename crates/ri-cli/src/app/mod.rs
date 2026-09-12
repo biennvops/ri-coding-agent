@@ -36,6 +36,8 @@ const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Options {
+    pub plugins: Vec<String>,
+    pub no_plugins: bool,
     pub print_prompt: Option<String>,
     pub json: bool,
     pub provider: Option<String>,
@@ -74,6 +76,11 @@ impl Options {
                         options.print_prompt = Some(prompt);
                     }
                 }
+                "--plugin" => options.plugins.push(
+                    args.next()
+                        .ok_or_else(|| anyhow!("--plugin requires a plugin id"))?,
+                ),
+                "--no-plugins" => options.no_plugins = true,
                 "--json" => options.json = true,
                 "-V" | "--version" => options.show_version = true,
                 "--provider" => {
@@ -113,6 +120,10 @@ impl Options {
             }
         }
 
+        if options.no_plugins && !options.plugins.is_empty() {
+            bail!("--no-plugins cannot be combined with --plugin");
+        }
+
         if options.json
             && options.print_prompt.is_none()
             && !options.show_help
@@ -147,12 +158,30 @@ impl Options {
              Usage:\n  ri                              start the interactive TUI\n  ri -p, --print <prompt>         run one prompt without the TUI\n  ri --json -p <prompt>           emit versioned NDJSON events\n\n\
              Model:\n  --provider <id>                 select a configured provider\n  --model <id>                   select a configured model\n  --thinking <level>              set reasoning level (off, minimal, low, medium, high, xhigh, max)\n\n\
              Sessions:\n  -c, --continue                 continue the newest saved session\n  -r, --resume                   choose a saved session interactively\n  --session <id-or-path>         resume one saved session\n  --no-session                   disable session persistence\n\n\
+             Plugins:\n  --plugin <id>                  enable an installed plugin for this run; repeatable\n  --no-plugins                   disable configured external plugins for this run\n\n\
              Context and help:\n  --no-context                   disable AGENTS context loading\n  -h, --help                    show this help\n  -V, --version                 show the version\n\n\
              Interactive commands:\n{}\n\n\
              Environment:\n  RI_LOG=error|warn|info|debug|trace  write private diagnostic logs",
             command_help()
         );
     }
+}
+
+fn resolve_plugin_selection(
+    configured: &[String],
+    cli: &[String],
+    no_plugins: bool,
+) -> Vec<String> {
+    if no_plugins {
+        return Vec::new();
+    }
+    let mut selected = Vec::new();
+    for id in configured.iter().chain(cli) {
+        if !selected.contains(id) {
+            selected.push(id.clone());
+        }
+    }
+    selected
 }
 
 #[derive(Debug)]
@@ -1889,6 +1918,34 @@ mod tests {
     use ri_core::ResolvedSettings;
 
     #[test]
+    fn plugin_flags_and_selection() {
+        let parse = |args: &[&str]| Options::parse(args.iter().map(|s| s.to_string()));
+        assert_eq!(
+            parse(&["--plugin", "dev.search"]).unwrap().plugins,
+            ["dev.search"]
+        );
+        assert_eq!(
+            parse(&["--plugin", "dev.search", "--plugin", "dev.git"])
+                .unwrap()
+                .plugins,
+            ["dev.search", "dev.git"]
+        );
+        assert!(parse(&["--no-plugins"]).unwrap().no_plugins);
+        assert!(parse(&["--no-plugins", "--plugin", "dev.search"]).is_err());
+        assert!(parse(&["--plugin"]).is_err());
+        let configured = vec!["a".into(), "b".into()];
+        assert_eq!(
+            resolve_plugin_selection(&configured, &["b".into(), "c".into()], false),
+            ["a", "b", "c"]
+        );
+        assert_eq!(
+            resolve_plugin_selection(&configured, &[], false),
+            configured
+        );
+        assert!(resolve_plugin_selection(&configured, &[], true).is_empty());
+    }
+
+    #[test]
     fn parses_print_prompt_and_model_flags() {
         assert_eq!(
             Options::parse([
@@ -1903,6 +1960,8 @@ mod tests {
             ])
             .unwrap(),
             Options {
+                plugins: Vec::new(),
+                no_plugins: false,
                 print_prompt: Some("hello".to_owned()),
                 json: false,
                 provider: Some("custom".to_owned()),
