@@ -167,6 +167,10 @@ impl Options {
     }
 }
 
+fn plugin_diagnostic(ids: &[String]) -> Option<String> {
+    (!ids.is_empty()).then(|| format!("plugins: {}", ids.join(", ")))
+}
+
 fn resolve_plugin_selection(
     configured: &[String],
     cli: &[String],
@@ -519,6 +523,9 @@ impl AppSetup {
         };
         self.plugins = host.registry().clone();
         self.active_plugin_ids = host.active_ids().to_vec();
+        for id in &self.active_plugin_ids {
+            tracing::info!(target: "ri", plugin = %id, "activated external plugin");
+        }
         Ok(host)
     }
 
@@ -605,6 +612,9 @@ impl AppSetup {
 async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
     tracing::info!(target: "ri", mode = "print", prompt_bytes = prompt.len(), "run started");
     eprintln!("{}", setup.context.diagnostic());
+    if let Some(diagnostic) = plugin_diagnostic(&setup.active_plugin_ids) {
+        eprintln!("{diagnostic}");
+    }
     let session_info = setup.session_info()?;
     if let Some(info) = session_info.as_ref() {
         eprintln!("session: {} ({})", info.display_name(), info.id);
@@ -757,6 +767,9 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
 async fn run_json(prompt: String, setup: AppSetup) -> Result<()> {
     tracing::info!(target: "ri", mode = "json", prompt_bytes = prompt.len(), "run started");
     eprintln!("{}", setup.context.diagnostic());
+    if let Some(diagnostic) = plugin_diagnostic(&setup.active_plugin_ids) {
+        eprintln!("{diagnostic}");
+    }
     let session = setup.session_info()?;
     if let Some(info) = session.as_ref() {
         eprintln!("session: {} ({})", info.display_name(), info.id);
@@ -910,11 +923,19 @@ async fn run_json(prompt: String, setup: AppSetup) -> Result<()> {
     }
 }
 
-fn add_startup_diagnostics(state: &mut AppState, context: &ContextBundle, session_resumed: bool) {
+fn add_startup_diagnostics(
+    state: &mut AppState,
+    context: &ContextBundle,
+    session_resumed: bool,
+    plugin_ids: &[String],
+) {
     if session_resumed {
         return;
     }
     state.add_system_message(context.diagnostic());
+    if let Some(diagnostic) = plugin_diagnostic(plugin_ids) {
+        state.add_system_message(diagnostic);
+    }
     if let Some(path) = crate::logging::path() {
         state.add_system_message(format!("logging: {}", path.display()));
     }
@@ -939,7 +960,12 @@ async fn run_tui(mut setup: AppSetup) -> Result<()> {
 
     let mut state = AppState::with_tool_registry(tool_registry);
     state.replace_history(&setup.initial_transcript);
-    add_startup_diagnostics(&mut state, &setup.context, setup.initial_session_resumed);
+    add_startup_diagnostics(
+        &mut state,
+        &setup.context,
+        setup.initial_session_resumed,
+        &setup.active_plugin_ids,
+    );
     state.set_session_info(session_info);
     state.set_git_branch(resolve_git_head(&setup.context.project_root));
     state.reduce(AgentEvent::ModelChanged(setup.model_ref()));
@@ -2137,6 +2163,15 @@ mod tests {
     }
 
     #[test]
+    fn active_plugin_diagnostic_is_optional_and_ordered() {
+        assert_eq!(plugin_diagnostic(&[]), None);
+        assert_eq!(
+            plugin_diagnostic(&["a".into(), "b".into()]).as_deref(),
+            Some("plugins: a, b")
+        );
+    }
+
+    #[test]
     fn plugin_flags_and_selection() {
         let parse = |args: &[&str]| Options::parse(args.iter().map(|s| s.to_string()));
         assert_eq!(
@@ -2694,14 +2729,18 @@ mod tests {
     fn startup_diagnostics_are_kept_for_fresh_sessions_only() {
         let context = ContextBundle::disabled(PathBuf::new(), PathBuf::new());
         let mut fresh = AppState::new();
-        add_startup_diagnostics(&mut fresh, &context, false);
+        add_startup_diagnostics(&mut fresh, &context, false, &["a".into(), "b".into()]);
+        assert!(fresh
+            .messages()
+            .iter()
+            .any(|message| message.content == "plugins: a, b"));
         assert!(fresh
             .messages()
             .iter()
             .any(|message| message.content == "context: disabled"));
 
         let mut resumed = AppState::new();
-        add_startup_diagnostics(&mut resumed, &context, true);
+        add_startup_diagnostics(&mut resumed, &context, true, &["a".into()]);
         assert!(resumed.messages().is_empty());
     }
 
