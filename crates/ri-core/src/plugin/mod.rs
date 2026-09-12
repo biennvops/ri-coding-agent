@@ -52,3 +52,11 @@ mod tests {
 }
 
 mod tools;
+
+#[cfg(test)]
+pub(crate) use process::tests::Fixture;
+pub use protocol::{PluginToolDefinition, ToolCallParams, ToolCallResult, ToolsListResult};
+pub use tools::{
+    ExternalToolError, ExternalToolSet, MAX_EXTERNAL_TOOLS_PER_PLUGIN,
+    MAX_EXTERNAL_TOOL_DESCRIPTION_BYTES, MAX_EXTERNAL_TOOL_NAME_BYTES,
+};
