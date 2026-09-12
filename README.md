@@ -147,6 +147,8 @@ Logs are written under `~/.ri/agent/logs/`. They are not generated retroactively
 - `~/.ri/agent/sessions/<workspace-id>/`
 - `~/.ri/agent/logs/`
 
+Global settings and installed plugins use the first absolute path from `HOME`, then `USERPROFILE`; empty or relative values are ignored so repository files cannot become global executable configuration.
+
 If neither `HOME` nor `USERPROFILE` is available, setup-free commands such as `ri --help` and `ri --version` still work. Persistent operations that need a global path fail with an actionable error.
 
 ## Development

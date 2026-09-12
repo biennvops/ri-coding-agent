@@ -7,9 +7,7 @@ use super::{load_plugin_manifest, LoadedPluginManifest, PluginManifestError};
 pub const PLUGIN_MANIFEST_FILENAME: &str = "plugin.json";
 
 pub fn default_plugins_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(|home| PathBuf::from(home).join(".ri/agent/plugins"))
+    crate::fs::home_directory().map(|home| home.join(".ri/agent/plugins"))
 }
 
 #[derive(Debug, thiserror::Error)]

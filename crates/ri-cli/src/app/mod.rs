@@ -516,7 +516,7 @@ impl AppSetup {
             ri_core::PluginHost::builtin_only()
         } else {
             let root = root.ok_or_else(|| {
-                anyhow!("external plugins were enabled but no home directory is available")
+                anyhow!("external plugins were enabled but no absolute home directory is available; set HOME or USERPROFILE to an absolute path")
             })?;
             let manifests = ri_core::resolve_installed_plugins(root, &self.selected_plugin_ids)?;
             ri_core::PluginHost::activate(manifests).await?
@@ -2106,7 +2106,7 @@ mod tests {
             .err()
             .unwrap()
             .to_string()
-            .contains("no home directory"));
+            .contains("no absolute home directory"));
         let host = setup
             .activate_plugins_from(Some(&fixture.root))
             .await

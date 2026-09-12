@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -7,6 +6,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use thiserror::Error;
+
+use crate::fs::home_directory;
 
 use super::ConfigWarning;
 use super::ThinkingLevel;
@@ -295,12 +296,6 @@ fn optional_bool(
 
 fn format_path(source_path: &Path, field: &str) -> String {
     format!("{}.{field}", source_path.display())
-}
-
-fn home_directory() -> Option<PathBuf> {
-    env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
 }
 
 #[derive(Debug, Deserialize, Default)]

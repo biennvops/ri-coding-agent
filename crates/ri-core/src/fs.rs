@@ -4,6 +4,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub(crate) fn home_directory() -> Option<PathBuf> {
+    ["HOME", "USERPROFILE"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .find(|home| home.is_absolute())
+}
+
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug)]
