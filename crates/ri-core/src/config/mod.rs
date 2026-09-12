@@ -18,7 +18,8 @@ pub use thinking::{ThinkingLevel, ThinkingLevelError};
 
 pub use settings::{
     default_settings_path, load_default_settings, load_settings_from_paths, project_settings_path,
-    CompactionSettings, ContextSettings, ResolvedSettings, Settings, SettingsError, SettingsLoad,
+    CompactionSettings, ContextSettings, PluginSettings, ResolvedSettings, Settings, SettingsError,
+    SettingsLoad,
 };
 pub use state::{
     default_state_path, load_state, persist_recent_model, persist_recent_thinking, RecentModel,

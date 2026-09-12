@@ -18,9 +18,9 @@ pub use app::{
 pub use config::{
     default_state_path, load_state, persist_recent_model, persist_recent_thinking, ApiKind,
     CompactionSettings, Compatibility, ConfigError, ConfigWarning, ContextSettings, CostMetadata,
-    ModelCatalog, ModelRef, RecentModel, RecentModelState, ResolvedModel, ResolvedSettings,
-    Settings, SettingsError, SettingsLoad, StateError, ThinkingLevel, ThinkingLevelError,
-    WorkspaceRecentModel,
+    ModelCatalog, ModelRef, PluginSettings, RecentModel, RecentModelState, ResolvedModel,
+    ResolvedSettings, Settings, SettingsError, SettingsLoad, StateError, ThinkingLevel,
+    ThinkingLevelError, WorkspaceRecentModel,
 };
 pub use context::{
     automatic_trigger, compaction_target, input_budget, ConservativeTokenEstimator, ContextUsage,
