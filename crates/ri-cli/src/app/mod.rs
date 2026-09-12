@@ -2000,7 +2000,7 @@ mod tests {
     }
 
     impl InstalledFixture {
-        fn new(call: bool, fail_shutdown: bool) -> Self {
+        fn new(fail_shutdown: bool) -> Self {
             let root = std::env::temp_dir().join(format!(
                 "ri-installed-{}-{}",
                 std::process::id(),
@@ -2026,12 +2026,6 @@ mod tests {
                     serde_json::json!({"result":{"tools":[{"name":"echo","inputSchema":{}}]}}),
                 ),
             ];
-            if call {
-                exchanges.push((
-                    "tools/call",
-                    serde_json::json!({"result":{"content":"plugin echoed","isError":false}}),
-                ));
-            }
             exchanges.push((
                 "shutdown",
                 if fail_shutdown {
@@ -2097,7 +2091,7 @@ mod tests {
 
     #[tokio::test]
     async fn setup_activates_installed_plugins_and_rejects_missing_selection() {
-        let fixture = InstalledFixture::new(false, false);
+        let fixture = InstalledFixture::new(false);
         let mut setup = fixture.setup(Vec::new());
         let host = setup.activate_plugins_from(None).await.unwrap();
         assert_eq!(
@@ -2137,7 +2131,7 @@ mod tests {
     async fn plugin_shutdown_follows_success_and_error_without_masking_result() {
         for fail_run in [false, true] {
             for fail_shutdown in [false, true] {
-                let fixture = InstalledFixture::new(false, fail_shutdown);
+                let fixture = InstalledFixture::new(fail_shutdown);
                 let mut setup = fixture.setup(vec!["test.echo".into()]);
                 let host = setup
                     .activate_plugins_from(Some(&fixture.root))
@@ -2164,7 +2158,7 @@ mod tests {
 
     #[tokio::test]
     async fn safe_mode_never_starts_configured_plugin() {
-        let fixture = InstalledFixture::new(false, false);
+        let fixture = InstalledFixture::new(false);
         let options = Options::parse(["--no-plugins".into()]).unwrap();
         let selected =
             resolve_plugin_selection(&["test.echo".into()], &options.plugins, options.no_plugins);
@@ -2182,7 +2176,7 @@ mod tests {
 
     #[tokio::test]
     async fn installed_plugins_stay_alive_until_runtime_stops() {
-        let fixture = InstalledFixture::new(false, false);
+        let fixture = InstalledFixture::new(false);
         let mut setup = fixture.setup(resolve_plugin_selection(&["test.echo".into()], &[], false));
         let host = setup
             .activate_plugins_from(Some(&fixture.root))

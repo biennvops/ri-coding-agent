@@ -211,6 +211,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_collects_every_failure_and_activation_preserves_cleanup_errors() {
+        let base = Fixture::scripted(false, vec![]);
+        let log = base.load().directory.join("shutdown.log");
+        for collision in [false, true] {
+            let a = fixture("plugin-a", "alpha", &log);
+            let b = fixture("plugin-b", if collision { "read" } else { "beta" }, &log);
+            for fixture in [&a, &b] {
+                fixture.change_script(|s| {
+                    s.replace(
+                        r#""result":null"#,
+                        r#""error":{"code":-32000,"message":"shutdown failed"}"#,
+                    )
+                });
+            }
+            let failures = match PluginHost::activate(vec![a.load(), b.load()]).await {
+                Ok(host) => {
+                    assert!(!collision);
+                    host.shutdown().await
+                }
+                Err(PluginActivationError::Cleanup { source, cleanup }) => {
+                    assert!(collision);
+                    assert!(matches!(*source, PluginActivationError::Tools { .. }));
+                    cleanup
+                }
+                Err(error) => panic!("unexpected activation failure: {error}"),
+            };
+            assert_eq!(
+                failures
+                    .iter()
+                    .map(|f| f.plugin_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["plugin-b", "plugin-a"]
+            );
+            assert!(failures
+                .iter()
+                .all(|f| f.message.contains("shutdown failed")));
+        }
+    }
+
+    #[tokio::test]
     async fn startup_failure_cleans_up_previous_processes() {
         let base = Fixture::scripted(false, vec![]);
         let log = base.load().directory.join("shutdown.log");

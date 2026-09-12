@@ -101,6 +101,47 @@ fn run_tui_signal_torture(signal: &str) {
 }
 
 #[test]
+fn help_version_and_safe_mode_do_not_load_configured_broken_plugins() {
+    let _lock = cli_test_lock();
+    let fixture = Fixture::new(success_body());
+    let agent = fixture.home.join(".ri/agent");
+    fs::create_dir_all(agent.join("plugins/test.broken")).unwrap();
+    fs::write(
+        agent.join("plugins/test.broken/plugin.json"),
+        "invalid manifest",
+    )
+    .unwrap();
+    fs::write(
+        agent.join("settings.json"),
+        r#"{"plugins":{"enabled":["test.broken"]}}"#,
+    )
+    .unwrap();
+    for flag in ["--help", "--version"] {
+        let output = fixture.run(&[flag]);
+        assert!(output.status.success(), "{}", text(&output.stderr));
+    }
+    let output = fixture.run(&["--json", "-p", "hello", "--no-session", "--no-context"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(text(&output.stderr).contains("test.broken"));
+    assert!(output.stdout.is_empty());
+    let output = fixture.run(&[
+        "--no-plugins",
+        "--json",
+        "-p",
+        "hello",
+        "--no-session",
+        "--no-context",
+    ]);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert_eq!(
+        parse_records(&output.stdout).last().unwrap()["data"]["success"],
+        true
+    );
+    assert!(!text(&output.stderr).contains("plugins:"));
+    fixture.finish();
+}
+
+#[test]
 fn print_mode_keeps_stdout_plain_text() {
     let _lock = cli_test_lock();
     let fixture = Fixture::new(success_body());
