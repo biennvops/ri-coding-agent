@@ -202,6 +202,10 @@ impl PluginProcess {
         self.stderr.lock().unwrap().snapshot()
     }
 
+    pub(crate) fn client(&self) -> PluginClient {
+        self.transport.client.clone()
+    }
+
     /// Sends a generic request. Callers choose their own post-startup request deadline.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, PluginProcessError> {
         self.transport.request(method, params).await
@@ -219,7 +223,7 @@ impl PluginProcess {
             self.transport
                 .request("shutdown", serde_json::json!({}))
                 .await?;
-            self.transport.outgoing.take();
+            self.transport.close().await;
             let status = self.child.wait().await.map_err(PluginProcessError::Reap)?;
             if !status.success() {
                 return Err(PluginProcessError::Exited(status));
@@ -251,6 +255,13 @@ impl PluginProcess {
     }
 
     async fn cleanup_error(&mut self, error: PluginProcessError) -> PluginProcessError {
+        self.transport
+            .client
+            .state
+            .dispatch
+            .lock()
+            .unwrap()
+            .fail("plugin stdin closed".into());
         self.transport.reader.abort();
         self.transport.writer.abort();
         let _ = self.child.start_kill();
@@ -303,11 +314,25 @@ impl Drop for PendingRequest {
     }
 }
 
-struct Transport {
-    outgoing: Option<mpsc::Sender<String>>,
-    notifications: AsyncMutex<mpsc::Receiver<RpcNotification>>,
+enum WriterCommand {
+    Frame(String),
+    Close,
+}
+
+struct ClientState {
+    outgoing: mpsc::Sender<WriterCommand>,
     dispatch: Arc<Mutex<Dispatch>>,
     permits: Semaphore,
+}
+
+#[derive(Clone)]
+pub(crate) struct PluginClient {
+    state: Arc<ClientState>,
+}
+
+struct Transport {
+    client: PluginClient,
+    notifications: AsyncMutex<mpsc::Receiver<RpcNotification>>,
     reader: JoinHandle<()>,
     writer: JoinHandle<()>,
 }
@@ -323,12 +348,16 @@ impl Transport {
             ..Default::default()
         }));
         let (notifications_tx, notifications) = mpsc::channel(PLUGIN_NOTIFICATION_CHANNEL_CAPACITY);
-        let (outgoing, mut outgoing_rx) = mpsc::channel::<String>(MAX_PENDING_REQUESTS);
+        let (outgoing, mut outgoing_rx) = mpsc::channel::<WriterCommand>(MAX_PENDING_REQUESTS);
         let writer_failed = CancellationToken::new();
         let failure_signal = writer_failed.clone();
         let state = dispatch.clone();
         let writer = tokio::spawn(async move {
-            while let Some(line) = outgoing_rx.recv().await {
+            while let Some(command) = outgoing_rx.recv().await {
+                let WriterCommand::Frame(line) = command else {
+                    state.lock().unwrap().fail("plugin stdin closed".into());
+                    break;
+                };
                 if let Err(error) = write.write_all(line.as_bytes()).await {
                     state.lock().unwrap().fail(error.to_string());
                     failure_signal.cancel();
@@ -381,24 +410,49 @@ impl Transport {
             writer_abort.abort();
         });
         Self {
-            outgoing: Some(outgoing),
+            client: PluginClient {
+                state: Arc::new(ClientState {
+                    outgoing,
+                    dispatch,
+                    permits: Semaphore::new(MAX_PENDING_REQUESTS),
+                }),
+            },
             notifications: AsyncMutex::new(notifications),
-            dispatch,
-            permits: Semaphore::new(MAX_PENDING_REQUESTS),
             reader,
             writer,
         }
     }
 
+    async fn close(&self) {
+        self.client
+            .state
+            .dispatch
+            .lock()
+            .unwrap()
+            .fail("plugin stdin closed".into());
+        let _ = self.client.state.outgoing.send(WriterCommand::Close).await;
+    }
+
     async fn request(&self, method: &str, params: Value) -> Result<Value, PluginProcessError> {
+        self.client.request(method, params).await
+    }
+}
+
+impl PluginClient {
+    pub(crate) async fn request(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, PluginProcessError> {
         let _permit = self
+            .state
             .permits
             .acquire()
             .await
             .map_err(|error| PluginProcessError::Transport(error.to_string()))?;
         let (sender, receiver) = oneshot::channel();
         let id = {
-            let mut state = self.dispatch.lock().unwrap();
+            let mut state = self.state.dispatch.lock().unwrap();
             if let Some(reason) = &state.failure {
                 return Err(PluginProcessError::Transport(reason.clone()));
             }
@@ -411,15 +465,14 @@ impl Transport {
         };
         let _pending = PendingRequest {
             id,
-            dispatch: self.dispatch.clone(),
+            dispatch: self.state.dispatch.clone(),
         };
         let mut line = encode_request(id, method, params)
             .map_err(|error| PluginProcessError::Transport(error.to_string()))?;
         line.push('\n');
-        self.outgoing
-            .as_ref()
-            .ok_or_else(|| PluginProcessError::Transport("stdin closed".into()))?
-            .send(line)
+        self.state
+            .outgoing
+            .send(WriterCommand::Frame(line))
             .await
             .map_err(|_| PluginProcessError::Transport("stdin writer closed".into()))?;
         receiver
@@ -430,6 +483,12 @@ impl Transport {
 
 impl Drop for Transport {
     fn drop(&mut self) {
+        self.client
+            .state
+            .dispatch
+            .lock()
+            .unwrap()
+            .fail("plugin stdin closed".into());
         self.reader.abort();
         self.writer.abort();
     }
@@ -493,25 +552,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cloned_client_and_transport_share_request_ids() {
+        let (host, peer) = tokio::io::duplex(4096);
+        let (read, write) = tokio::io::split(host);
+        let transport = Transport::new(read, write);
+        let client = transport.client.clone();
+        let peer_task = tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(peer);
+            let mut lines = BufReader::new(read).lines();
+            for id in 1..=3 {
+                let request: Value =
+                    serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+                assert_eq!(request["id"], id);
+                write
+                    .write_all(
+                        format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{id}}}\n").as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert!(lines.next_line().await.unwrap().is_none());
+        });
+        assert_eq!(transport.request("a", Value::Null).await.unwrap(), 1);
+        assert_eq!(client.request("b", Value::Null).await.unwrap(), 2);
+        assert_eq!(client.clone().request("c", Value::Null).await.unwrap(), 3);
+        transport.close().await;
+        assert!(matches!(
+            client.request("closed", Value::Null).await,
+            Err(PluginProcessError::Transport(_))
+        ));
+        timeout(Duration::from_secs(1), peer_task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_stdin_even_while_client_clones_exist() {
+        let fixture = Fixture::new(initialize_result(), "", false);
+        fixture.change_script(|script| {
+            #[cfg(unix)]
+            let script = format!("{script}while IFS= read -r line; do :; done\n");
+            #[cfg(windows)]
+            let script = script.replace("exit /b 0", "set /p EOF=\r\nexit /b 0");
+            script
+        });
+        let process = PluginProcess::start(fixture.load()).await.unwrap();
+        let client = process.client();
+        process.shutdown().await.unwrap();
+        assert!(matches!(
+            client.request("closed", Value::Null).await,
+            Err(PluginProcessError::Transport(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn stdout_failure_resolves_requests_even_when_stdin_is_blocked() {
         let (host, peer) = tokio::io::duplex(1);
         let (read, write) = tokio::io::split(host);
         let transport = Transport::new(read, write);
         let (_peer_read, mut peer_write) = tokio::io::split(peer);
         transport
+            .client
+            .state
             .outgoing
-            .as_ref()
-            .unwrap()
-            .send("blocked\n".into())
+            .send(WriterCommand::Frame("blocked\n".into()))
             .await
             .unwrap();
         tokio::task::yield_now().await;
         for _ in 0..MAX_PENDING_REQUESTS {
             transport
+                .client
+                .state
                 .outgoing
-                .as_ref()
-                .unwrap()
-                .try_send("queued\n".into())
+                .try_send(WriterCommand::Frame("queued\n".into()))
                 .unwrap();
         }
         let result = timeout(Duration::from_secs(1), async {
