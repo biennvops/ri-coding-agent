@@ -65,3 +65,6 @@ mod installed;
 pub use installed::{
     default_plugins_dir, resolve_installed_plugins, InstalledPluginError, PLUGIN_MANIFEST_FILENAME,
 };
+
+mod host;
+pub use host::{PluginActivationError, PluginHost, PluginShutdownFailure};

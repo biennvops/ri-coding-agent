@@ -36,12 +36,13 @@ pub use model::{
 pub use plugin::{
     builtin_plugins, default_plugins_dir, load_plugin_manifest, resolve_installed_plugins,
     ExternalToolError, ExternalToolSet, InstalledPluginError, LoadedPluginManifest,
-    PluginCapabilities, PluginDiagnostics, PluginEntrypoint, PluginIdentity, PluginManifest,
-    PluginManifestError, PluginProcess, PluginProcessError, PluginRegistry, PluginToolDefinition,
-    ToolCallParams, ToolCallResult, ToolsListResult, MAX_EXTERNAL_TOOLS_PER_PLUGIN,
-    MAX_EXTERNAL_TOOL_DESCRIPTION_BYTES, MAX_EXTERNAL_TOOL_NAME_BYTES, MAX_PLUGIN_FRAME_BYTES,
-    MAX_PLUGIN_STDERR_BYTES, PLUGIN_MANIFEST_FILENAME, PLUGIN_MANIFEST_VERSION,
-    PLUGIN_PROTOCOL_VERSION, PLUGIN_SHUTDOWN_TIMEOUT, PLUGIN_STARTUP_TIMEOUT,
+    PluginActivationError, PluginCapabilities, PluginDiagnostics, PluginEntrypoint, PluginHost,
+    PluginIdentity, PluginManifest, PluginManifestError, PluginProcess, PluginProcessError,
+    PluginRegistry, PluginShutdownFailure, PluginToolDefinition, ToolCallParams, ToolCallResult,
+    ToolsListResult, MAX_EXTERNAL_TOOLS_PER_PLUGIN, MAX_EXTERNAL_TOOL_DESCRIPTION_BYTES,
+    MAX_EXTERNAL_TOOL_NAME_BYTES, MAX_PLUGIN_FRAME_BYTES, MAX_PLUGIN_STDERR_BYTES,
+    PLUGIN_MANIFEST_FILENAME, PLUGIN_MANIFEST_VERSION, PLUGIN_PROTOCOL_VERSION,
+    PLUGIN_SHUTDOWN_TIMEOUT, PLUGIN_STARTUP_TIMEOUT,
 };
 pub use session::{
     read_session, validate_name, workspace_id, MessageId, OpenedSession, SessionAssistantItem,
