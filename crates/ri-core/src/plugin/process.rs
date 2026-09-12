@@ -495,15 +495,47 @@ impl Drop for Transport {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, BufReader};
 
-    struct Fixture {
+    pub(crate) struct Fixture {
         directory: std::path::PathBuf,
     }
 
     impl Fixture {
+        pub(crate) fn scripted(tools: bool, exchanges: Vec<(&str, Value, Value)>) -> Self {
+            let mut initialize = initialize_result();
+            initialize["capabilities"]["tools"] = Value::Bool(tools);
+            let fixture = Self::new(initialize.clone(), "", false);
+            fixture.change_script(|_| {
+                let mut exchanges = exchanges;
+                exchanges.insert(0, ("initialize", serde_json::to_value(InitializeParams {
+                    protocol_version: PLUGIN_PROTOCOL_VERSION.into(),
+                    host: HostIdentity { name: "ri".into(), version: env!("CARGO_PKG_VERSION").into() },
+                }).unwrap(), serde_json::json!({"result": initialize})));
+                exchanges.push(("shutdown", serde_json::json!({}), serde_json::json!({"result":null})));
+                #[cfg(unix)]
+                let mut script = String::new();
+                #[cfg(windows)]
+                let mut script = String::from("@echo off\r\n");
+                for (index, (method, params, mut response)) in exchanges.into_iter().enumerate() {
+                    let id = index as u64 + 1;
+                    let request = encode_request(id, method, params).unwrap();
+                    response["jsonrpc"] = Value::String("2.0".into());
+                    response["id"] = Value::from(id);
+                    #[cfg(unix)]
+                    script.push_str(&format!("IFS= read -r request\n[ \"$request\" = '{request}' ] || exit 7\nprintf '%s\\n' '{response}'\n"));
+                    #[cfg(windows)]
+                    script.push_str(&format!("set /p REQUEST=\r\nif not \"%REQUEST%\"==\"{request}\" exit /b 7\r\necho {response}\r\n"));
+                }
+                #[cfg(windows)]
+                script.push_str("exit /b 0\r\n");
+                script
+            });
+            fixture
+        }
+
         fn new(result: Value, diagnostic: &str, stall: bool) -> Self {
             let directory = std::env::temp_dir().join(format!(
                 "ri-plugin-{}-{}",
@@ -524,7 +556,7 @@ mod tests {
             Self { directory }
         }
 
-        fn load(&self) -> LoadedPluginManifest {
+        pub(crate) fn load(&self) -> LoadedPluginManifest {
             super::super::manifest::load_plugin_manifest(self.directory.join("plugin.json"))
                 .unwrap()
         }
@@ -541,7 +573,7 @@ mod tests {
     }
 
     impl Fixture {
-        fn change_script(&self, change: impl FnOnce(String) -> String) {
+        pub(crate) fn change_script(&self, change: impl FnOnce(String) -> String) {
             #[cfg(unix)]
             let name = "fixture.sh";
             #[cfg(windows)]
