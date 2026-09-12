@@ -1,10 +1,15 @@
 use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::time::timeout;
 
 use super::{
     builtin_plugins, ExternalToolError, ExternalToolSet, LoadedPluginManifest, PluginProcess,
     PluginProcessError, PluginRegistry,
 };
 use crate::tools::builtin_tool_registry;
+
+const PLUGIN_TOOLS_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct PluginHost {
     registry: PluginRegistry,
@@ -26,6 +31,8 @@ pub enum PluginActivationError {
         #[source]
         source: ExternalToolError,
     },
+    #[error("could not load tools from plugin {plugin_id:?}: tools/list timed out")]
+    ToolsTimeout { plugin_id: String },
     #[error("plugin activation failed: {source}; cleanup failures: {cleanup:?}")]
     Cleanup {
         #[source]
@@ -65,12 +72,15 @@ impl PluginHost {
                 })?;
                 host.processes.push(process);
                 let process = host.processes.last().expect("just started process");
-                let tools = ExternalToolSet::load(process).await.map_err(|source| {
-                    PluginActivationError::Tools {
+                let tools = timeout(PLUGIN_TOOLS_TIMEOUT, ExternalToolSet::load(process))
+                    .await
+                    .map_err(|_| PluginActivationError::ToolsTimeout {
+                        plugin_id: plugin_id.clone(),
+                    })?
+                    .map_err(|source| PluginActivationError::Tools {
                         plugin_id: plugin_id.clone(),
                         source,
-                    }
-                })?;
+                    })?;
                 tools.register_into(&mut registry).map_err(|source| {
                     PluginActivationError::Tools {
                         plugin_id: plugin_id.clone(),
@@ -248,6 +258,44 @@ mod tests {
                 .iter()
                 .all(|f| f.message.contains("shutdown failed")));
         }
+    }
+
+    #[tokio::test]
+    async fn stalled_tools_list_times_out_and_cleans_up_in_reverse_order() {
+        let base = Fixture::scripted(false, vec![]);
+        let log = base.load().directory.join("shutdown.log");
+        let a = fixture("plugin-a", "alpha", &log);
+        let b = fixture("plugin-b", "beta", &log);
+        b.change_script(|script| {
+            #[cfg(unix)]
+            let newline = "\n";
+            #[cfg(windows)]
+            let newline = "\r\n";
+            script
+                .lines()
+                .filter(|line| !line.contains("inputSchema"))
+                .collect::<Vec<_>>()
+                .join(newline)
+                + newline
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(9),
+            PluginHost::activate(vec![a.load(), b.load()]),
+        )
+        .await
+        .expect("capability loading must have a deadline");
+        let error = result
+            .err()
+            .expect("stalled tools/list must fail activation");
+        assert!(error.to_string().contains("plugin-b"));
+        assert!(error.to_string().contains("tools/list timed out"));
+        assert_eq!(
+            std::fs::read_to_string(log)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["plugin-b", "plugin-a"]
+        );
     }
 
     #[tokio::test]
