@@ -81,16 +81,17 @@ pub fn clamp_request_output_tokens(
     limits: ModelLimits,
     estimated_input_tokens: u64,
 ) -> Result<Option<u64>, NoOutputCapacity> {
+    let Some(maximum) = limits.max_output_tokens else {
+        return Ok(None);
+    };
     let Some(remaining) = request_input_budget(limits.context_window, estimated_input_tokens)
     else {
         return Ok(None);
     };
-    if remaining == 0 || limits.max_output_tokens == Some(0) {
+    if remaining == 0 || maximum == 0 {
         return Err(NoOutputCapacity);
     }
-    Ok(limits
-        .max_output_tokens
-        .map(|maximum| maximum.min(remaining)))
+    Ok(Some(maximum.min(remaining)))
 }
 
 pub fn compaction_target(budget: u64) -> u64 {
@@ -242,6 +243,24 @@ mod tests {
             ),
             Some(0)
         );
+    }
+
+    #[test]
+    fn unknown_output_limit_preserves_provider_default_even_at_exhaustion() {
+        for context_window in [None, Some(8_000)] {
+            for input in [0, 3_903, 3_904, 8_000, u64::MAX] {
+                assert_eq!(
+                    clamp_request_output_tokens(
+                        ModelLimits {
+                            context_window,
+                            max_output_tokens: None,
+                        },
+                        input
+                    ),
+                    Ok(None)
+                );
+            }
+        }
     }
 
     #[test]
