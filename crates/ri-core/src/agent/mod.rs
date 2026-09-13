@@ -850,20 +850,23 @@ where
                 )))
                 .await;
 
+            let reserve_tokens = compaction.effective_reserve_tokens(limits.context_window);
+            let threshold = automatic_compaction_threshold(limits, reserve_tokens);
             let effective_max_output_tokens = clamp_request_output_tokens(limits, estimate);
             tracing::debug!(
                 estimated_input_tokens = estimate,
                 context_window = ?limits.context_window,
-                compaction_reserve_tokens = compaction.reserve_tokens,
-                compaction_threshold = ?automatic_compaction_threshold(limits, compaction.reserve_tokens),
+                compaction_reserve_tokens = reserve_tokens,
+                compaction_threshold = ?threshold,
                 effective_max_output_tokens = ?effective_max_output_tokens,
                 "context preflight"
             );
+            let exhausted = effective_max_output_tokens.is_err();
             if compaction.enabled
                 && !emergency_compaction
-                && automatic_compaction_threshold(limits, compaction.reserve_tokens)
-                    .is_some_and(|threshold| estimate > threshold)
+                && (exhausted || threshold.is_some_and(|threshold| estimate > threshold))
             {
+                emergency_compaction = exhausted;
                 match compact_conversation(
                     Arc::clone(&provider),
                     Arc::clone(&registry),
@@ -872,7 +875,7 @@ where
                     events.clone(),
                     cancel.clone(),
                     true,
-                    false,
+                    exhausted,
                     compaction,
                     steering_message.as_ref(),
                 )
@@ -893,8 +896,13 @@ where
                 }
             }
 
-            if let Some(output_tokens) = effective_max_output_tokens {
-                request.max_tokens = Some(output_tokens);
+            match effective_max_output_tokens {
+                Ok(Some(output_tokens)) => request.max_tokens = Some(output_tokens),
+                Ok(None) => {}
+                Err(_) => {
+                    fail_turn(&events, "no safe output capacity remains in the selected model context; shorten the request, compact history, or select a larger-context model".to_owned()).await;
+                    return turn_outcome(history, StopReason::Error);
+                }
             }
 
             if !assistant_started && !steering_pending {
@@ -1219,9 +1227,12 @@ where
         provisional_message,
     );
     let before_tokens = estimator.estimate_request(&before_request);
-    let target = automatic_compaction_threshold(limits, compaction.reserve_tokens)
-        .map(compaction_target)
-        .unwrap_or_else(|| before_tokens.saturating_div(2).max(1));
+    let target = automatic_compaction_threshold(
+        limits,
+        compaction.effective_reserve_tokens(limits.context_window),
+    )
+    .map(compaction_target)
+    .unwrap_or_else(|| before_tokens.saturating_div(2).max(1));
     // Manual compaction runs only while idle, so its latest segment is complete.
     let compact_latest = !automatic;
     let Some((prefix, retained)) = select_compaction_prefix(
@@ -3741,6 +3752,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exhausted_output_capacity_compacts_or_errors_without_dispatching_zero() {
+        for (enabled, eligible, oversized_prompt) in [
+            (true, true, false),
+            (false, true, false),
+            (true, false, true),
+            (true, true, true),
+        ] {
+            let mut history = Vec::new();
+            if eligible {
+                for _ in 0..3 {
+                    history.push(ModelMessage::user("x".repeat(62_000)));
+                    history.push(ModelMessage::Assistant {
+                        items: vec![ModelAssistantItem::Text {
+                            content: "done".to_owned(),
+                        }],
+                    });
+                }
+            }
+            let prompt = "y".repeat(if oversized_prompt { 372_000 } else { 186_000 });
+            let limits = ModelLimits {
+                context_window: Some(128_000),
+                max_output_tokens: Some(64_000),
+            };
+            let provider = ScriptedProvider::new(vec![final_step("summary"), final_step("done")])
+                .with_limits(limits);
+            let requests = Arc::clone(&provider.requests);
+            let (command_tx, command_rx) = mpsc::channel(8);
+            let (event_tx, mut event_rx) = mpsc::channel(128);
+            let runtime = AgentRuntime::with_config_and_compaction(
+                provider,
+                AgentRuntimeConfig {
+                    initial_history: history,
+                    ..AgentRuntimeConfig::new(ToolContext::from_current_dir().unwrap())
+                },
+                CompactionSettings {
+                    enabled,
+                    reserve_tokens: Some(0),
+                },
+            );
+            let task = tokio::spawn(runtime.run(command_rx, event_tx));
+            command_tx
+                .send(AgentCommand::Submit { text: prompt })
+                .await
+                .unwrap();
+            let events = collect_turn(&mut event_rx).await;
+            command_tx.send(AgentCommand::Shutdown).await.unwrap();
+            task.await.unwrap();
+            let requests = requests.lock().unwrap();
+            assert!(requests.iter().all(|request| request.max_tokens != Some(0)));
+            let recovered = enabled && eligible && !oversized_prompt;
+            assert_eq!(
+                requests.len(),
+                if recovered {
+                    2
+                } else {
+                    usize::from(enabled && eligible)
+                }
+            );
+            assert!(events.iter().any(|event| matches!(event,
+                AgentEvent::TurnFinished { reason } if *reason == if recovered { StopReason::Stop } else { StopReason::Error })));
+            if !recovered {
+                assert!(
+                    events.iter().any(|event| matches!(event,
+                    AgentEvent::Error(error) if error.message.contains("no safe output capacity")))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn small_context_default_does_not_compact_every_turn() {
+        for window in [8_000, 16_000] {
+            let provider = ScriptedProvider::new(vec![final_step("done"), final_step("done")])
+                .with_limits(ModelLimits {
+                    context_window: Some(window),
+                    max_output_tokens: Some(1_000),
+                });
+            let mut history = Vec::new();
+            for _ in 0..3 {
+                history.push(ModelMessage::user("old request"));
+                history.push(ModelMessage::Assistant {
+                    items: vec![ModelAssistantItem::Text {
+                        content: "old answer".to_owned(),
+                    }],
+                });
+            }
+            let (command_tx, command_rx) = mpsc::channel(8);
+            let (event_tx, mut event_rx) = mpsc::channel(128);
+            let runtime = AgentRuntime::with_config(
+                provider,
+                AgentRuntimeConfig {
+                    initial_history: history,
+                    ..AgentRuntimeConfig::new(ToolContext::from_current_dir().unwrap())
+                },
+            );
+            let task = tokio::spawn(runtime.run(command_rx, event_tx));
+            for _ in 0..2 {
+                command_tx
+                    .send(AgentCommand::Submit {
+                        text: "continue".to_owned(),
+                    })
+                    .await
+                    .unwrap();
+                let events = collect_turn(&mut event_rx).await;
+                assert!(!events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::CompactionStarted { .. })));
+                assert!(events.iter().any(|event| matches!(
+                    event,
+                    AgentEvent::TurnFinished {
+                        reason: StopReason::Stop
+                    }
+                )));
+            }
+            command_tx.send(AgentCommand::Shutdown).await.unwrap();
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn premature_compaction_does_not_trigger_in_old_failure_range() {
         check_context_preflight(30_000, false, 16_384).await;
     }
@@ -3795,7 +3926,7 @@ mod tests {
             },
             CompactionSettings {
                 enabled: true,
-                reserve_tokens,
+                reserve_tokens: Some(reserve_tokens),
             },
         );
         let task = tokio::spawn(runtime.run(command_rx, event_tx));
@@ -3915,7 +4046,10 @@ mod tests {
             "initial".to_owned(),
             event_tx.clone(),
             CancellationToken::new(),
-            CompactionSettings::default(),
+            CompactionSettings {
+                reserve_tokens: Some(16_384),
+                ..CompactionSettings::default()
+            },
             steering,
             None,
             None,
@@ -4383,7 +4517,7 @@ mod tests {
         let requests = Arc::clone(&provider.requests);
         let (command_tx, command_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(128);
-        let runtime = AgentRuntime::with_config(
+        let runtime = AgentRuntime::with_config_and_compaction(
             provider,
             AgentRuntimeConfig {
                 plugins: builtin_plugins(),
@@ -4392,6 +4526,10 @@ mod tests {
                 initial_history,
                 session: SessionMode::Disabled,
                 reasoning_effort: None,
+            },
+            CompactionSettings {
+                reserve_tokens: Some(16_384),
+                ..CompactionSettings::default()
             },
         );
         let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
@@ -4656,7 +4794,7 @@ mod tests {
             });
         let (command_tx, command_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(128);
-        let runtime = AgentRuntime::with_config(
+        let runtime = AgentRuntime::with_config_and_compaction(
             provider,
             AgentRuntimeConfig {
                 plugins: builtin_plugins(),
@@ -4665,6 +4803,10 @@ mod tests {
                 initial_history: initial_history.clone(),
                 session: SessionMode::Enabled(handle.clone()),
                 reasoning_effort: None,
+            },
+            CompactionSettings {
+                reserve_tokens: Some(16_384),
+                ..CompactionSettings::default()
             },
         );
         let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));

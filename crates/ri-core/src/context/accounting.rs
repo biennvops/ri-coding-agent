@@ -74,15 +74,23 @@ pub fn request_input_budget(context_window: Option<u64>, output_tokens: u64) -> 
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NoOutputCapacity;
+
 pub fn clamp_request_output_tokens(
     limits: ModelLimits,
     estimated_input_tokens: u64,
-) -> Option<u64> {
-    let maximum = limits.max_output_tokens?;
-    Some(maximum.min(request_input_budget(
-        limits.context_window,
-        estimated_input_tokens,
-    )?))
+) -> Result<Option<u64>, NoOutputCapacity> {
+    let Some(remaining) = request_input_budget(limits.context_window, estimated_input_tokens)
+    else {
+        return Ok(None);
+    };
+    if remaining == 0 || limits.max_output_tokens == Some(0) {
+        return Err(NoOutputCapacity);
+    }
+    Ok(limits
+        .max_output_tokens
+        .map(|maximum| maximum.min(remaining)))
 }
 
 pub fn compaction_target(budget: u64) -> u64 {
@@ -246,9 +254,15 @@ mod tests {
             (40_000, 64_000),
             (60_000, 63_904),
             (100_000, 23_904),
-            (u64::MAX, 0),
+            (123_903, 1),
         ] {
-            assert_eq!(clamp_request_output_tokens(limits, input), Some(output));
+            assert_eq!(clamp_request_output_tokens(limits, input), Ok(Some(output)));
+        }
+        for input in [123_904, 128_000, u64::MAX] {
+            assert_eq!(
+                clamp_request_output_tokens(limits, input),
+                Err(NoOutputCapacity)
+            );
         }
         assert_eq!(
             clamp_request_output_tokens(
@@ -258,7 +272,7 @@ mod tests {
                 },
                 0
             ),
-            None
+            Ok(None)
         );
         assert_eq!(
             clamp_request_output_tokens(
@@ -268,7 +282,7 @@ mod tests {
                 },
                 0
             ),
-            None
+            Ok(None)
         );
         assert_eq!(request_input_budget(Some(128_000), 4_096), Some(119_808));
         assert_eq!(request_input_budget(Some(0), u64::MAX), Some(0));

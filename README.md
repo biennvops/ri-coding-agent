@@ -81,6 +81,8 @@ The project file is relative to the discovered project root. CLI model selection
 }
 ```
 
+The example explicitly fixes the reserve at 16,384 tokens. Omit `reserveTokens` to use the model-adaptive default. JSON `null` is invalid.
+
 Nested compaction settings merge field-by-field: a project override of `enabled` preserves the global `reserveTokens`, and vice versa.
 
 ## AGENTS.md
@@ -117,9 +119,9 @@ The interactive equivalents are `/new` and `/resume`. Session metadata and compa
 
 ## Compaction
 
-Context files and conversation history are projected for the selected model. Automatic compaction is enabled by default and triggers when estimated input exceeds `contextWindow - reserveTokens`; `reserveTokens` defaults to 16,384. `/compact` requests compaction manually. Set `compaction.enabled` to `false` in settings to disable automatic compaction, or use the runtime's normal error reporting when a selected model still cannot fit the request.
+Context files and conversation history are projected for the selected model. Automatic compaction is enabled by default and triggers when estimated input exceeds `contextWindow - effectiveReserve`. When `reserveTokens` is omitted, the effective reserve is `min(16,384, contextWindow / 5)` (integer division): 1,600 for an 8k model, 3,200 for a 16k model, and 16,384 for a 128k model. Explicit reserves retain their literal value, including zero; values at or above the context window yield a zero threshold. `/compact` requests compaction manually. Set `compaction.enabled` to `false` in settings to disable automatic compaction, or use the runtime's normal error reporting when a selected model still cannot fit the request.
 
-`maxTokens` remains the model's maximum output allowance, not a compaction reserve. For models with known context and output limits, `ri` clamps each request's effective output allowance to the remaining context after estimated input and a 4,096-token safety margin. Estimates remain provider-neutral, not exact provider token counts. Private compaction-summary requests budget against their own output cap of at most 4,096 tokens. Compaction retains the 50% target of the reserve-adjusted context budget.
+`maxTokens` remains the model's maximum output allowance, not a compaction reserve. For models with known context and output limits, `ri` clamps each request's effective output allowance to the remaining context after estimated input and a 4,096-token safety margin. If no safe output capacity remains, `ri` attempts compaction once when enabled, even below the reserve threshold. If compaction is disabled, unavailable, or insufficient, it reports a local error instead of sending a zero output limit. The 4,096-token safety margin still applies to small models. Estimates remain provider-neutral, not exact provider token counts. Private compaction-summary requests budget against their own output cap of at most 4,096 tokens. Compaction retains the 50% target of the reserve-adjusted context budget.
 
 ## Print mode
 
