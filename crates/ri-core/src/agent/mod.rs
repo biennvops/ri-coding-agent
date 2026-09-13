@@ -1372,6 +1372,11 @@ where
         .map(|limit| limit.min(COMPACTION_MAX_OUTPUT_TOKENS))
         .unwrap_or(COMPACTION_MAX_OUTPUT_TOKENS)
         .max(1);
+    // Leave at least half the post-safety context for summary instructions and history.
+    let output_limit = request_input_budget(limits.context_window, 0)
+        .map_or(output_limit, |available| {
+            output_limit.min((available / 2).max(1))
+        });
     let budget = request_input_budget(limits.context_window, output_limit);
     let mut units = compaction_units(prefix);
 
@@ -3817,6 +3822,84 @@ mod tests {
                     events.iter().any(|event| matches!(event,
                     AgentEvent::Error(error) if error.message.contains("no safe output capacity")))
                 );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn small_context_compaction_recovers_exhausted_capacity() {
+        for manual in [false, true] {
+            let limits = ModelLimits {
+                context_window: Some(8_000),
+                max_output_tokens: Some(4_096),
+            };
+            let provider = ScriptedProvider::new((0..8).map(|_| final_step("done")).collect())
+                .with_limits(limits)
+                .with_enforced_input_budget();
+            let requests = Arc::clone(&provider.requests);
+            let mut history = Vec::new();
+            for _ in 0..3 {
+                history.push(ModelMessage::user("x".repeat(4_000)));
+                history.push(ModelMessage::Assistant {
+                    items: vec![ModelAssistantItem::Text {
+                        content: "old answer".to_owned(),
+                    }],
+                });
+            }
+            let (command_tx, command_rx) = mpsc::channel(8);
+            let (event_tx, mut event_rx) = mpsc::channel(128);
+            let runtime = AgentRuntime::with_config(
+                provider,
+                AgentRuntimeConfig {
+                    initial_history: history,
+                    ..AgentRuntimeConfig::new(ToolContext::from_current_dir().unwrap())
+                },
+            );
+            let task = tokio::spawn(runtime.run(command_rx, event_tx));
+            let mut events = Vec::new();
+            if manual {
+                command_tx.send(AgentCommand::Compact).await.unwrap();
+                loop {
+                    let event = event_rx.recv().await.unwrap();
+                    let finished = matches!(
+                        event,
+                        AgentEvent::CompactionFinished { .. } | AgentEvent::CompactionFailed { .. }
+                    );
+                    events.push(event);
+                    if finished {
+                        break;
+                    }
+                }
+            }
+            command_tx
+                .send(AgentCommand::Submit {
+                    text: "continue".to_owned(),
+                })
+                .await
+                .unwrap();
+            events.extend(collect_turn(&mut event_rx).await);
+            command_tx.send(AgentCommand::Shutdown).await.unwrap();
+            task.await.unwrap();
+            assert!(events.iter().any(|event| matches!(event, AgentEvent::CompactionFinished {
+                automatic, before_tokens, after_tokens,
+            } if *automatic == !manual && *before_tokens >= 3_904 && *before_tokens < 6_400 && *after_tokens < 3_904)));
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AgentEvent::TurnFinished {
+                    reason: StopReason::Stop
+                }
+            )));
+            let requests = requests.lock().unwrap();
+            assert!(requests.len() >= 2);
+            for request in requests.iter() {
+                let output = request.max_tokens.unwrap();
+                assert!(output > 0);
+                assert!(
+                    ConservativeTokenEstimator.estimate_request(request) + output + 4_096 <= 8_000
+                );
+            }
+            for summary in &requests[..requests.len() - 1] {
+                assert_eq!(summary.max_tokens, Some(1_952));
             }
         }
     }
