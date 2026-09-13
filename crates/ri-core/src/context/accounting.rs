@@ -2,9 +2,9 @@ use crate::model::{ModelAssistantItem, ModelMessage, ModelToolCall, ToolDefiniti
 
 use super::super::model::{ModelLimits, ModelRequest};
 
-pub const AUTO_COMPACTION_TRIGGER_PERCENT: u64 = 80;
+pub const DEFAULT_COMPACTION_RESERVE_TOKENS: u64 = 16_384;
 pub const AUTO_COMPACTION_TARGET_PERCENT: u64 = 50;
-pub const DEFAULT_RESERVED_OUTPUT_TOKENS: u64 = 4_096;
+pub const CONTEXT_SAFETY_TOKENS: u64 = 4_096;
 pub const COMPACTION_MAX_OUTPUT_TOKENS: u64 = 4_096;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -62,20 +62,27 @@ impl TokenEstimator for ConservativeTokenEstimator {
 
 pub type GenericTokenEstimator = ConservativeTokenEstimator;
 
-pub fn input_budget(limits: ModelLimits) -> Option<u64> {
-    let context_window = limits.context_window?;
-    if context_window == 0 {
-        return Some(0);
-    }
-    let reserve = limits
-        .max_output_tokens
-        .unwrap_or_else(|| (context_window / 5).min(DEFAULT_RESERVED_OUTPUT_TOKENS))
-        .min(context_window.saturating_sub(1));
-    Some(context_window.saturating_sub(reserve))
+pub fn automatic_compaction_threshold(limits: ModelLimits, reserve_tokens: u64) -> Option<u64> {
+    Some(limits.context_window?.saturating_sub(reserve_tokens))
 }
 
-pub fn automatic_trigger(budget: u64) -> u64 {
-    budget.saturating_mul(AUTO_COMPACTION_TRIGGER_PERCENT) / 100
+pub fn request_input_budget(context_window: Option<u64>, output_tokens: u64) -> Option<u64> {
+    Some(
+        context_window?
+            .saturating_sub(output_tokens)
+            .saturating_sub(CONTEXT_SAFETY_TOKENS),
+    )
+}
+
+pub fn clamp_request_output_tokens(
+    limits: ModelLimits,
+    estimated_input_tokens: u64,
+) -> Option<u64> {
+    let maximum = limits.max_output_tokens?;
+    Some(maximum.min(request_input_budget(
+        limits.context_window,
+        estimated_input_tokens,
+    )?))
 }
 
 pub fn compaction_target(budget: u64) -> u64 {
@@ -196,21 +203,75 @@ mod tests {
     }
 
     #[test]
-    fn input_budget_reserves_configured_or_bounded_output() {
+    fn automatic_compaction_threshold_uses_configured_reserve_not_model_max_output() {
+        for max_output_tokens in [None, Some(8_192), Some(64_000)] {
+            let limits = ModelLimits {
+                context_window: Some(128_000),
+                max_output_tokens,
+            };
+            assert_eq!(
+                automatic_compaction_threshold(limits, 16_384),
+                Some(111_616)
+            );
+            for (reserve, expected) in [(0, 128_000), (128_000, 0), (u64::MAX, 0)] {
+                assert_eq!(
+                    automatic_compaction_threshold(limits, reserve),
+                    Some(expected)
+                );
+            }
+        }
         assert_eq!(
-            input_budget(ModelLimits {
-                context_window: Some(200_000),
-                max_output_tokens: Some(32_000),
-            }),
-            Some(168_000)
+            automatic_compaction_threshold(ModelLimits::default(), 0),
+            None
         );
         assert_eq!(
-            input_budget(ModelLimits {
-                context_window: Some(200_000),
-                max_output_tokens: None,
-            }),
-            Some(195_904)
+            automatic_compaction_threshold(
+                ModelLimits {
+                    context_window: Some(0),
+                    max_output_tokens: None
+                },
+                16_384
+            ),
+            Some(0)
         );
-        assert_eq!(input_budget(ModelLimits::default()), None);
+    }
+
+    #[test]
+    fn request_output_clamp_uses_remaining_context() {
+        let limits = ModelLimits {
+            context_window: Some(128_000),
+            max_output_tokens: Some(64_000),
+        };
+        for (input, output) in [
+            (40_000, 64_000),
+            (60_000, 63_904),
+            (100_000, 23_904),
+            (u64::MAX, 0),
+        ] {
+            assert_eq!(clamp_request_output_tokens(limits, input), Some(output));
+        }
+        assert_eq!(
+            clamp_request_output_tokens(
+                ModelLimits {
+                    context_window: None,
+                    ..limits
+                },
+                0
+            ),
+            None
+        );
+        assert_eq!(
+            clamp_request_output_tokens(
+                ModelLimits {
+                    max_output_tokens: None,
+                    ..limits
+                },
+                0
+            ),
+            None
+        );
+        assert_eq!(request_input_budget(Some(128_000), 4_096), Some(119_808));
+        assert_eq!(request_input_budget(Some(0), u64::MAX), Some(0));
+        assert_eq!(request_input_budget(None, 4_096), None);
     }
 }

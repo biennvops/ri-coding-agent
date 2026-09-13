@@ -11,8 +11,9 @@ use ri_core::{
     },
     context::{build_system_prompt, discover_project, load_context, ContextBundle},
     workspace_id, AgentCommand, AgentEvent, AgentRuntime, AgentRuntimeConfig, AppState,
-    ConfiguredProvider, ModelCatalog, ModelMessage, ModelRef, OpenedSession, ResolvedModel,
-    SessionHandle, SessionInfo, SessionMode, SessionRepository, StopReason, ToolContext,
+    CompactionSettings, ConfiguredProvider, ModelCatalog, ModelMessage, ModelRef, OpenedSession,
+    ResolvedModel, SessionHandle, SessionInfo, SessionMode, SessionRepository, StopReason,
+    ToolContext,
 };
 use tokio::sync::mpsc;
 
@@ -278,7 +279,7 @@ struct AppSetup {
     session: Option<SessionHandle>,
     initial_history: Vec<ModelMessage>,
     initial_transcript: Vec<ModelMessage>,
-    compaction_enabled: bool,
+    compaction: CompactionSettings,
     thinking_level: Option<ri_core::ThinkingLevel>,
     reasoning_effort: Option<String>,
     cli_thinking_level: Option<ri_core::ThinkingLevel>,
@@ -490,7 +491,7 @@ impl AppSetup {
             session,
             initial_history,
             initial_transcript,
-            compaction_enabled: settings.settings.compaction.enabled,
+            compaction: settings.settings.compaction,
             thinking_level,
             reasoning_effort,
             cli_thinking_level: options.thinking,
@@ -630,7 +631,7 @@ async fn run_print(prompt: String, setup: AppSetup) -> Result<()> {
     let runtime = AgentRuntime::with_config_and_compaction(
         setup.provider.clone(),
         runtime_config,
-        setup.compaction_enabled,
+        setup.compaction,
     );
     let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
 
@@ -793,7 +794,7 @@ async fn run_json(prompt: String, setup: AppSetup) -> Result<()> {
     let runtime = AgentRuntime::with_config_and_compaction(
         setup.provider.clone(),
         setup.runtime_config(),
-        setup.compaction_enabled,
+        setup.compaction,
     );
     let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
 
@@ -954,7 +955,7 @@ async fn run_tui(mut setup: AppSetup) -> Result<()> {
     let runtime = AgentRuntime::with_config_and_compaction(
         setup.provider.clone(),
         runtime_config,
-        setup.compaction_enabled,
+        setup.compaction,
     );
     let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
 
@@ -2069,7 +2070,10 @@ mod tests {
                 session: None,
                 initial_history: Vec::new(),
                 initial_transcript: Vec::new(),
-                compaction_enabled: false,
+                compaction: CompactionSettings {
+                    enabled: false,
+                    ..CompactionSettings::default()
+                },
                 thinking_level: None,
                 reasoning_effort: None,
                 cli_thinking_level: None,
@@ -2483,7 +2487,10 @@ mod tests {
             session: None,
             initial_history: Vec::new(),
             initial_transcript: Vec::new(),
-            compaction_enabled: false,
+            compaction: CompactionSettings {
+                enabled: false,
+                ..CompactionSettings::default()
+            },
             thinking_level: Some(Medium),
             reasoning_effort: Some("medium".to_owned()),
             cli_thinking_level: None,
