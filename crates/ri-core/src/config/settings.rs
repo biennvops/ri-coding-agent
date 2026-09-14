@@ -46,14 +46,28 @@ impl Default for ContextSettings {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompactionSettings {
     pub enabled: bool,
+    /// None selects a model-adaptive default; Some preserves an explicit setting.
+    pub reserve_tokens: Option<u64>,
 }
 
 impl Default for CompactionSettings {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            reserve_tokens: None,
+        }
+    }
+}
+
+impl CompactionSettings {
+    pub fn effective_reserve_tokens(self, context_window: Option<u64>) -> u64 {
+        self.reserve_tokens.unwrap_or_else(|| {
+            let default = crate::context::DEFAULT_COMPACTION_RESERVE_TOKENS;
+            context_window.map_or(default, |window| default.min(window / 5))
+        })
     }
 }
 
@@ -214,6 +228,17 @@ fn apply_raw_settings(
         "compaction.enabled",
     )?;
 
+    match raw.compaction.reserve_tokens {
+        RawField::Missing => {}
+        RawField::Null => {
+            return Err(SettingsError::Invalid {
+                path: format_path(source_path, "compaction.reserveTokens"),
+                message: "compaction.reserveTokens must be a non-negative integer".to_owned(),
+            })
+        }
+        RawField::Value(value) => load.settings.compaction.reserve_tokens = Some(value),
+    }
+
     if default_provider.is_some() {
         load.settings.default_provider = default_provider;
     }
@@ -357,6 +382,8 @@ struct RawContextSettings {
 
 #[derive(Debug, Deserialize, Default)]
 struct RawCompactionSettings {
+    #[serde(rename = "reserveTokens", default)]
+    reserve_tokens: RawField<u64>,
     #[serde(default)]
     enabled: RawField<bool>,
     #[serde(flatten)]
@@ -452,6 +479,73 @@ mod tests {
     }
 
     #[test]
+    fn omitted_compaction_reserve_adapts_but_explicit_values_remain_literal() {
+        let default = CompactionSettings::default();
+        assert_eq!(default.reserve_tokens, None);
+        for (window, reserve) in [(8_000, 1_600), (16_000, 3_200), (128_000, 16_384)] {
+            assert_eq!(default.effective_reserve_tokens(Some(window)), reserve);
+        }
+        for reserve in [0, 16_384, 24_000] {
+            let explicit = CompactionSettings {
+                reserve_tokens: Some(reserve),
+                ..default
+            };
+            assert_eq!(explicit.effective_reserve_tokens(Some(8_000)), reserve);
+        }
+        assert_eq!(default.effective_reserve_tokens(None), 16_384);
+    }
+
+    #[test]
+    fn compaction_reserve_defaults_merges_and_validates() {
+        assert_eq!(CompactionSettings::default().reserve_tokens, None);
+        let root = unique_test_dir("compaction-reserve");
+        fs::create_dir_all(&root).unwrap();
+        let global = root.join("global.json");
+        let project = root.join("project.json");
+        fs::write(
+            &global,
+            r#"{"compaction":{"enabled":false,"reserveTokens":24000}}"#,
+        )
+        .unwrap();
+        for (json, enabled, reserve) in [
+            (r#"{"compaction":{"enabled":true}}"#, true, 24_000),
+            (r#"{"compaction":{"reserveTokens":8000}}"#, false, 8_000),
+            (r#"{"compaction":{"reserveTokens":16384}}"#, false, 16_384),
+            (r#"{"compaction":{"reserveTokens":0}}"#, false, 0),
+            ("{}", false, 24_000),
+        ] {
+            fs::write(&project, json).unwrap();
+            let load = load_settings_from_paths(Some(&global), Some(&project)).unwrap();
+            assert_eq!(
+                load.settings.compaction,
+                CompactionSettings {
+                    enabled,
+                    reserve_tokens: Some(reserve)
+                }
+            );
+        }
+        for value in ["null", "-1", "\"bad\"", "1.5"] {
+            fs::write(
+                &project,
+                format!(r#"{{"compaction":{{"reserveTokens":{value}}}}}"#),
+            )
+            .unwrap();
+            let error = load_settings_from_paths(None, Some(&project)).unwrap_err();
+            if value == "null" {
+                assert!(error.to_string().contains("compaction.reserveTokens"));
+            }
+        }
+        fs::write(&project, r#"{"compaction":{"surprise":true}}"#).unwrap();
+        let load = load_settings_from_paths(None, Some(&project)).unwrap();
+        assert_eq!(load.settings.compaction.reserve_tokens, None);
+        assert!(load
+            .warnings
+            .iter()
+            .any(|warning| warning.path.contains("compaction.surprise")));
+        remove_test_dir(root);
+    }
+
+    #[test]
     fn compaction_setting_merges_with_project_precedence() {
         let root = unique_test_dir("settings-compaction");
         fs::create_dir_all(&root).unwrap();
@@ -463,6 +557,13 @@ mod tests {
         let load = load_settings_from_paths(Some(&global), Some(&project)).unwrap();
 
         assert!(load.settings.compaction.enabled);
+        assert_eq!(load.settings.compaction.reserve_tokens, None);
+        assert_eq!(
+            load.settings
+                .compaction
+                .effective_reserve_tokens(Some(8_000)),
+            1_600
+        );
         remove_test_dir(root);
     }
 

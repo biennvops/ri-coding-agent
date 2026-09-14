@@ -70,7 +70,20 @@ Built-in settings are overridden by the global settings file and then the projec
 built-in settings → ~/.ri/agent/settings.json → .ri/settings.json
 ```
 
-The project file is relative to the discovered project root. CLI model selection overrides settings where applicable. Supported settings currently include `defaultProvider`, `defaultModel`, `context.enabled`, and `compaction.enabled`.
+The project file is relative to the discovered project root. CLI model selection overrides settings where applicable. Supported settings currently include `defaultProvider`, `defaultModel`, `context.enabled`, `compaction.enabled`, and `compaction.reserveTokens`.
+
+```json
+{
+  "compaction": {
+    "enabled": true,
+    "reserveTokens": 16384
+  }
+}
+```
+
+The example explicitly fixes the reserve at 16,384 tokens. Omit `reserveTokens` to use the model-adaptive default. JSON `null` is invalid.
+
+Nested compaction settings merge field-by-field: a project override of `enabled` preserves the global `reserveTokens`, and vice versa.
 
 ## AGENTS.md
 
@@ -106,7 +119,13 @@ The interactive equivalents are `/new` and `/resume`. Session metadata and compa
 
 ## Compaction
 
-Context files and conversation history are projected for the selected model. Automatic compaction is enabled by default when the context budget requires it; `/compact` requests it manually. Set `compaction.enabled` to `false` in settings to disable automatic compaction, or use the runtime's normal error reporting when a selected model still cannot fit the request.
+Context files and conversation history are projected for the selected model. Automatic compaction is enabled by default and triggers when estimated input exceeds `contextWindow - effectiveReserve`. When `reserveTokens` is omitted, the effective reserve is `min(16,384, contextWindow / 5)` (integer division): 1,600 for an 8k model, 3,200 for a 16k model, and 16,384 for a 128k model. Explicit reserves retain their literal value, including zero; values at or above the context window yield a zero threshold. `/compact` requests compaction manually. Set `compaction.enabled` to `false` in settings to disable automatic compaction, or use the runtime's normal error reporting when a selected model still cannot fit the request.
+
+`maxTokens` remains the model's maximum output allowance, not a compaction reserve. For models with known context and output limits, `ri` clamps each request's effective output allowance to the remaining context after estimated input and a 4,096-token safety margin. If either normal-request limit is unknown, `ri` leaves the output override unset to preserve provider defaults. With both limits known, if no safe output capacity remains, `ri` attempts compaction once when enabled, even below the reserve threshold. If compaction is disabled, unavailable, or insufficient, it reports a local error instead of sending a zero output limit. The 4,096-token safety margin still applies to small models. Estimates remain provider-neutral, not exact provider token counts.
+
+Private compaction-summary requests have an output ceiling of at most 4,096 tokens, bounded by the model output limit and half the post-safety context. That ceiling is not a fixed allocation: when multiple chunks are needed, `ri` lowers it to leave room for summary instructions (including retry instructions), a full carry-forward summary, another safe history unit, and the next output allowance. An existing summary is also included in the first chunk's budget. A prefix that already fits in one request does not need the extra carry-forward reserve.
+
+Compaction aims for 50% of the reserve-adjusted context budget, bounded by safe normal-request input capacity. Prefix selection reserves the summary output ceiling instead of assuming a tiny placeholder summary; the projection includes the summary wrapper, retained history, tools, base messages, and provisional steering. The summary cap is further bounded by the headroom remaining beside retained context, leaving at least one normal-response token. Consequently an 8k/4k model's summary cap can be lower than 1,952 tokens. History units are never split unsafely, and an irreducible prompt or unit that cannot fit still produces a local error. These budgets use the conservative estimator, not an exact provider tokenizer.
 
 ## Print mode
 
@@ -195,6 +214,7 @@ Run these checks with a real configured provider after installation:
 - Fresh task: inspect a real repository, use `read`, `bash`, `edit`, and `write`, then run the relevant tests.
 - Cancel: start a deliberately long safe command, press `Esc` or `Ctrl+C`, verify the prompt remains usable, then quit and resume.
 - Resume: use `ri -c` and confirm the transcript, current context, and tools still work.
+- Context budgeting: with a model whose `maxTokens` is large relative to `contextWindow`, continue a multi-turn session around 30–40% context. Submit a small continuation and verify it completes without auto-compacting merely because of `maxTokens`. With `RI_LOG=debug`, check the numeric input estimate, context window, reserve, threshold, and effective output cap. Run `/compact` manually once and verify the session can continue.
 - Model switch: use `/model`, switch models, and verify footer limits, compaction, and recent-model persistence.
 - Machine modes: pipe `ri -p`, `ri --json -p`, and their `-c` variants into another program; stdout must remain within its documented contract.
 - Scrollback: generate more than one screen of output, then verify PgUp/PgDn, Ctrl+U/Ctrl+D, mouse/trackpad scrolling, the footer indicator, and stable anchoring while new output streams.

@@ -2929,7 +2929,7 @@ mod tests {
     }
 
     #[test]
-    fn footer_keeps_provider_usage_separate_from_estimated_context() {
+    fn footer_uses_current_provider_usage_then_fresh_estimate() {
         let mut state = AppState::new();
         let limits = ModelLimits {
             context_window: Some(200_000),
@@ -2945,7 +2945,9 @@ mod tests {
             output_tokens: Some(100),
             ..Usage::default()
         }));
-        assert_footer_context(&state, 42_000, 200_000);
+        let footer = footer_text(&state, 200, 0, false, false).to_string();
+        assert!(footer.contains("45%/200k"));
+        assert!(!footer.contains("~45%"));
 
         state.reduce(AgentEvent::ContextUsageUpdated(ContextUsage::estimated(
             44_000, limits,
