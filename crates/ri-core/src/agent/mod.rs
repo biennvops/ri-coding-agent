@@ -1233,13 +1233,16 @@ where
     )
     .map(compaction_target)
     .unwrap_or_else(|| before_tokens.saturating_div(2).max(1));
+    let output_limit = compaction_output_limit(limits);
+    let target = request_input_budget(limits.context_window, 1)
+        .map_or(target, |safe_input| target.min(safe_input));
     // Manual compaction runs only while idle, so its latest segment is complete.
     let compact_latest = !automatic;
     let Some((prefix, retained)) = select_compaction_prefix(
         &history,
         &config.base_messages,
         &tools,
-        target,
+        target.saturating_sub(output_limit),
         force,
         compact_latest,
         provisional_message,
@@ -1272,11 +1275,22 @@ where
         ));
     }
 
+    let retained_tokens = projected_tokens(
+        &config.base_messages,
+        &tools,
+        &retained,
+        provisional_message,
+    );
+    let output_limit = request_input_budget(limits.context_window, 1)
+        .map_or(output_limit, |safe_input| {
+            output_limit.min(safe_input.saturating_sub(retained_tokens))
+        });
     let summary = match summarize_compaction_prefix(
         provider,
         history.summary().cloned(),
         prefix,
         limits,
+        output_limit,
         cancel.clone(),
     )
     .await
@@ -1357,28 +1371,84 @@ where
     Ok(compacted)
 }
 
-async fn summarize_compaction_prefix<P>(
-    provider: Arc<P>,
-    mut summary: Option<CompactionSummary>,
-    prefix: Vec<ModelMessage>,
-    limits: ModelLimits,
-    cancel: CancellationToken,
-) -> Result<CompactionSummary, CompactionError>
-where
-    P: ModelProvider,
-{
+fn compaction_output_limit(limits: ModelLimits) -> u64 {
     let output_limit = limits
         .max_output_tokens
         .map(|limit| limit.min(COMPACTION_MAX_OUTPUT_TOKENS))
         .unwrap_or(COMPACTION_MAX_OUTPUT_TOKENS)
         .max(1);
-    // Leave at least half the post-safety context for summary instructions and history.
-    let output_limit = request_input_budget(limits.context_window, 0)
-        .map_or(output_limit, |available| {
-            output_limit.min((available / 2).max(1))
-        });
-    let budget = request_input_budget(limits.context_window, output_limit);
+    request_input_budget(limits.context_window, 0).map_or(output_limit, |available| {
+        output_limit.min((available / 2).max(1))
+    })
+}
+
+async fn summarize_compaction_prefix<P>(
+    provider: Arc<P>,
+    mut summary: Option<CompactionSummary>,
+    prefix: Vec<ModelMessage>,
+    limits: ModelLimits,
+    output_limit: u64,
+    cancel: CancellationToken,
+) -> Result<CompactionSummary, CompactionError>
+where
+    P: ModelProvider,
+{
+    if output_limit == 0 {
+        return Err(CompactionError::Failed(
+            "compaction failed: no safe output capacity remains alongside the retained context"
+                .to_owned(),
+        ));
+    }
     let mut units = compaction_units(prefix);
+    let estimator = ConservativeTokenEstimator;
+    let initial_overhead =
+        estimator.estimate_request(&compaction_request(summary.as_ref(), Vec::new(), 1, true));
+    let all_input = initial_overhead.saturating_add(
+        units
+            .iter()
+            .map(|unit| estimator.estimate_messages(unit))
+            .sum::<u64>(),
+    );
+    let mut output_limit = output_limit;
+    if request_input_budget(limits.context_window, output_limit)
+        .is_some_and(|budget| all_input > budget)
+    {
+        let carry_overhead = estimator.estimate_request(&compaction_request(
+            Some(&CompactionSummary::new("")),
+            Vec::new(),
+            1,
+            true,
+        ));
+        let largest_unit = units
+            .iter()
+            .map(|unit| estimator.estimate_messages(unit))
+            .max()
+            .unwrap_or(0);
+        let first_unit = units
+            .front()
+            .map_or(0, |unit| estimator.estimate_messages(unit));
+        // Budget a full carry-forward summary, another safe unit, and the next output.
+        let available = request_input_budget(limits.context_window, 0).expect("known input budget");
+        output_limit = output_limit
+            .min(
+                available
+                    .saturating_sub(carry_overhead)
+                    .saturating_sub(largest_unit)
+                    / 2,
+            )
+            .min(
+                available
+                    .saturating_sub(initial_overhead)
+                    .saturating_sub(first_unit),
+            );
+        if output_limit == 0 {
+            return Err(CompactionError::Failed(
+                "compaction failed: no room for a summary alongside a safe history chunk"
+                    .to_owned(),
+            ));
+        }
+    }
+    let budget = request_input_budget(limits.context_window, output_limit);
 
     while !units.is_empty() {
         if cancel.is_cancelled() {
@@ -1594,10 +1664,7 @@ fn projected_tokens(
     retained: &[ModelMessage],
     provisional_message: Option<&ModelMessage>,
 ) -> u64 {
-    let placeholder = ConversationHistory::new(
-        Some(CompactionSummary::new("[summary of earlier conversation]")),
-        retained.to_vec(),
-    );
+    let placeholder = ConversationHistory::new(Some(CompactionSummary::new("")), retained.to_vec());
     ConservativeTokenEstimator.estimate_request(&request_with_provisional_message(
         normal_request(base_messages, &placeholder, tools),
         provisional_message,
@@ -3807,14 +3874,7 @@ mod tests {
             let requests = requests.lock().unwrap();
             assert!(requests.iter().all(|request| request.max_tokens != Some(0)));
             let recovered = enabled && eligible && !oversized_prompt;
-            assert_eq!(
-                requests.len(),
-                if recovered {
-                    2
-                } else {
-                    usize::from(enabled && eligible)
-                }
-            );
+            assert_eq!(requests.len(), if recovered { 2 } else { 0 });
             assert!(events.iter().any(|event| matches!(event,
                 AgentEvent::TurnFinished { reason } if *reason == if recovered { StopReason::Stop } else { StopReason::Error })));
             if !recovered {
@@ -3828,14 +3888,15 @@ mod tests {
 
     #[tokio::test]
     async fn small_context_compaction_recovers_exhausted_capacity() {
-        for manual in [false, true] {
+        for (manual, prompt_bytes) in [(false, 0), (true, 0), (false, 9_000)] {
             let limits = ModelLimits {
                 context_window: Some(8_000),
                 max_output_tokens: Some(4_096),
             };
             let provider = ScriptedProvider::new((0..8).map(|_| final_step("done")).collect())
                 .with_limits(limits)
-                .with_enforced_input_budget();
+                .with_enforced_input_budget()
+                .with_full_compaction_summaries();
             let requests = Arc::clone(&provider.requests);
             let mut history = Vec::new();
             for _ in 0..3 {
@@ -3873,7 +3934,11 @@ mod tests {
             }
             command_tx
                 .send(AgentCommand::Submit {
-                    text: "continue".to_owned(),
+                    text: if prompt_bytes == 0 {
+                        "continue".to_owned()
+                    } else {
+                        "y".repeat(prompt_bytes)
+                    },
                 })
                 .await
                 .unwrap();
@@ -3882,15 +3947,28 @@ mod tests {
             task.await.unwrap();
             assert!(events.iter().any(|event| matches!(event, AgentEvent::CompactionFinished {
                 automatic, before_tokens, after_tokens,
-            } if *automatic == !manual && *before_tokens >= 3_904 && *before_tokens < 6_400 && *after_tokens < 3_904)));
+            } if *automatic == !manual && *before_tokens >= 3_904 && (prompt_bytes != 0 || *before_tokens < 6_400) && *after_tokens < 3_904)));
             assert!(events.iter().any(|event| matches!(
                 event,
                 AgentEvent::TurnFinished {
                     reason: StopReason::Stop
                 }
             )));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AgentEvent::CompactionStarted { .. }))
+                    .count(),
+                1
+            );
             let requests = requests.lock().unwrap();
             assert!(requests.len() >= 2);
+            let last_summary_cap = requests[requests.len() - 2].max_tokens.unwrap() as usize;
+            assert!(requests
+                .last()
+                .unwrap()
+                .messages
+                .contains(&CompactionSummary::new("sum".repeat(last_summary_cap)).as_message()));
             for request in requests.iter() {
                 let output = request.max_tokens.unwrap();
                 assert!(output > 0);
@@ -3899,7 +3977,7 @@ mod tests {
                 );
             }
             for summary in &requests[..requests.len() - 1] {
-                assert_eq!(summary.max_tokens, Some(1_952));
+                assert!(summary.max_tokens.is_some_and(|limit| limit <= 1_952));
             }
         }
     }
@@ -5052,6 +5130,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn small_context_chunks_carry_full_summaries_forward() {
+        for prior in [None, Some(CompactionSummary::new("sum".repeat(1_952)))] {
+            let limits = ModelLimits {
+                context_window: Some(8_000),
+                max_output_tokens: Some(4_096),
+            };
+            let provider = Arc::new(
+                ScriptedProvider::new((0..12).map(|_| final_step("unused")).collect())
+                    .with_limits(limits)
+                    .with_enforced_input_budget()
+                    .with_full_compaction_summaries(),
+            );
+            let requests = Arc::clone(&provider.requests);
+            let summary = summarize_compaction_prefix(
+                provider,
+                prior,
+                (0..6)
+                    .map(|_| ModelMessage::user("x".repeat(4_000)))
+                    .collect(),
+                limits,
+                compaction_output_limit(limits),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{}", compaction_error_message(error)));
+            let requests = requests.lock().unwrap();
+            assert!(requests.len() >= 3);
+            let mut previous = None;
+            for request in requests.iter() {
+                let output = request.max_tokens.unwrap();
+                assert!(output > 0);
+                assert!(
+                    ConservativeTokenEstimator.estimate_request(request) + output + 4_096 <= 8_000
+                );
+                if let Some(previous) = previous {
+                    assert!(request
+                        .messages
+                        .contains(&CompactionSummary::new("sum".repeat(previous)).as_message()));
+                }
+                previous = Some(output as usize);
+            }
+            assert_eq!(summary.content, "sum".repeat(previous.unwrap()));
+        }
+    }
+
+    #[tokio::test]
     async fn compaction_chunk_capacity_is_independent_of_model_output_maximum() {
         let prefix = vec![ModelMessage::user("x".repeat(240_000))];
         for maximum in [8_192, 64_000] {
@@ -5067,6 +5191,7 @@ mod tests {
                 None,
                 prefix.clone(),
                 limits,
+                compaction_output_limit(limits),
                 CancellationToken::new(),
             )
             .await
@@ -5523,6 +5648,7 @@ mod tests {
         overflow_once: Arc<Mutex<bool>>,
         overflow_after_tool_result_once: Arc<Mutex<bool>>,
         enforce_input_budget: bool,
+        full_compaction_summaries: bool,
     }
 
     struct ScriptedStep {
@@ -5540,6 +5666,7 @@ mod tests {
                 overflow_once: Arc::new(Mutex::new(false)),
                 overflow_after_tool_result_once: Arc::new(Mutex::new(false)),
                 enforce_input_budget: false,
+                full_compaction_summaries: false,
             }
         }
 
@@ -5560,6 +5687,11 @@ mod tests {
 
         fn with_overflow_after_tool_result_once(self) -> Self {
             *self.overflow_after_tool_result_once.lock().unwrap() = true;
+            self
+        }
+
+        fn with_full_compaction_summaries(mut self) -> Self {
+            self.full_compaction_summaries = true;
             self
         }
 
@@ -5591,6 +5723,8 @@ mod tests {
                 .max_tokens
                 .or(self.limits.max_output_tokens)
                 .unwrap_or(4_096);
+            let full_summary =
+                self.full_compaction_summaries && request.tool_choice == Some(ToolChoice::None);
             self.requests.lock().unwrap().push(request);
             if !self.delay.is_zero() {
                 tokio::select! {
@@ -5620,6 +5754,12 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .expect("scripted step");
+            let step = if full_summary {
+                // Three ASCII bytes per estimated token fills the entire output allowance.
+                final_step(&"sum".repeat(output_tokens as usize))
+            } else {
+                step
+            };
             for event in step.events {
                 tokio::select! {
                     _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
