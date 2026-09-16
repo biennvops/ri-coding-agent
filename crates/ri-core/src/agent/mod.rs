@@ -1,3 +1,10 @@
+mod compaction;
+
+use compaction::{
+    compact_native, compaction_output_limit, projected_tokens, select_compaction_prefix,
+    CompactionError, CompactionReplacement,
+};
+
 use std::collections::VecDeque;
 use std::future::{poll_fn, Future};
 use std::path::PathBuf;
@@ -12,14 +19,11 @@ use crate::config::{CompactionSettings, ModelRef};
 use crate::context::{
     automatic_compaction_threshold, clamp_request_output_tokens, compaction_target,
     request_input_budget, ConservativeTokenEstimator, ContextUsage, TokenEstimator,
-    COMPACTION_MAX_OUTPUT_TOKENS,
 };
-use crate::conversation::{
-    segment_history, CompactionSummary, ConversationHistory, HistorySegment,
-};
+use crate::conversation::ConversationHistory;
 use crate::model::{
     ModelAssistantItem, ModelEvent, ModelLimits, ModelMessage, ModelProvider, ModelRequest,
-    ModelResponse, ModelToolCall, ProviderError, StopReason, ToolChoice, Usage,
+    ModelResponse, ModelToolCall, ProviderError, StopReason, Usage,
 };
 use crate::plugin::{builtin_plugins, PluginRegistry};
 use crate::session::{SessionInfo, SessionMode, SessionWriteOutcome};
@@ -776,12 +780,6 @@ async fn apply_task_result<P>(
     }
 }
 
-enum CompactionError {
-    Cancelled,
-    NoHistory,
-    Failed(String),
-}
-
 fn compaction_error_message(error: CompactionError) -> String {
     match error {
         CompactionError::Cancelled => "compaction cancelled".to_owned(),
@@ -1179,10 +1177,6 @@ fn normal_request_with_effort(
     request
 }
 
-const COMPACTION_SYSTEM_INSTRUCTION: &str = "Summarize the earlier coding-agent conversation for future continuation.\n\nPreserve concrete technical state:\n- user goals and constraints\n- decisions and rationale that affect future work\n- files inspected or modified and important changes\n- important code architecture and interfaces\n- commands/tests and their significant results\n- important errors and attempted fixes\n- unresolved work and next steps\n- current task state\n- exact identifiers or values when they matter\n\nDo not invent work that did not happen.\nDo not copy large tool outputs verbatim.\nDo not call tools.\nDo not emit function calls or tool calls.\nDo not request external actions.\nReturn only the continuation summary.";
-const COMPACTION_RETRY_INSTRUCTION: &str = "Retry after an invalid tool call: output plain text only. Never emit a tool/function call or request an external action.";
-const COMPACTION_TOOL_CALL_RETRY_LIMIT: usize = 1;
-
 fn normal_request(
     base_messages: &[ModelMessage],
     history: &ConversationHistory,
@@ -1285,17 +1279,18 @@ where
         .map_or(output_limit, |safe_input| {
             output_limit.min(safe_input.saturating_sub(retained_tokens))
         });
-    let summary = match summarize_compaction_prefix(
+    let replacement = match compact_native(
         provider,
-        history.summary().cloned(),
+        &history,
         prefix,
+        retained,
         limits,
         output_limit,
         cancel.clone(),
     )
     .await
     {
-        Ok(summary) => summary,
+        Ok(replacement) => replacement,
         Err(CompactionError::Cancelled) => {
             let _ = events
                 .send(AgentEvent::CompactionFailed {
@@ -1322,9 +1317,12 @@ where
             .await;
         return Err(CompactionError::Cancelled);
     }
-    let compacted = ConversationHistory::new(Some(summary.clone()), retained.clone());
+    let projected = ConversationHistory::new(
+        Some(replacement.summary.clone()),
+        replacement.retained.clone(),
+    );
     let after_tokens = estimator.estimate_request(&request_with_provisional_message(
-        normal_request(&config.base_messages, &compacted, &tools),
+        normal_request(&config.base_messages, &projected, &tools),
         provisional_message,
     ));
     if after_tokens >= before_tokens {
@@ -1339,18 +1337,17 @@ where
         return Err(CompactionError::Failed(message));
     }
 
-    if let Err(error) = config
-        .session
-        .append_compaction(&summary.content, &retained)
-    {
-        let message = format!("session persistence failed during compaction: {error}");
-        let _ = events
-            .send(AgentEvent::CompactionFailed {
-                message: message.clone(),
-            })
-            .await;
-        return Err(CompactionError::Failed(message));
-    }
+    let compacted = match commit_compaction(&config.session, replacement) {
+        Ok(compacted) => compacted,
+        Err(message) => {
+            let _ = events
+                .send(AgentEvent::CompactionFailed {
+                    message: message.clone(),
+                })
+                .await;
+            return Err(CompactionError::Failed(message));
+        }
+    };
     if let Ok(Some(info)) = config.session.info() {
         let _ = events.send(AgentEvent::SessionChanged { info }).await;
     }
@@ -1371,386 +1368,17 @@ where
     Ok(compacted)
 }
 
-fn compaction_output_limit(limits: ModelLimits) -> u64 {
-    let output_limit = limits
-        .max_output_tokens
-        .map(|limit| limit.min(COMPACTION_MAX_OUTPUT_TOKENS))
-        .unwrap_or(COMPACTION_MAX_OUTPUT_TOKENS)
-        .max(1);
-    request_input_budget(limits.context_window, 0).map_or(output_limit, |available| {
-        output_limit.min((available / 2).max(1))
-    })
-}
-
-async fn summarize_compaction_prefix<P>(
-    provider: Arc<P>,
-    mut summary: Option<CompactionSummary>,
-    prefix: Vec<ModelMessage>,
-    limits: ModelLimits,
-    output_limit: u64,
-    cancel: CancellationToken,
-) -> Result<CompactionSummary, CompactionError>
-where
-    P: ModelProvider,
-{
-    if output_limit == 0 {
-        return Err(CompactionError::Failed(
-            "compaction failed: no safe output capacity remains alongside the retained context"
-                .to_owned(),
-        ));
-    }
-    let mut units = compaction_units(prefix);
-    let estimator = ConservativeTokenEstimator;
-    let initial_overhead =
-        estimator.estimate_request(&compaction_request(summary.as_ref(), Vec::new(), 1, true));
-    let all_input = initial_overhead.saturating_add(
-        units
-            .iter()
-            .map(|unit| estimator.estimate_messages(unit))
-            .sum::<u64>(),
-    );
-    let mut output_limit = output_limit;
-    if request_input_budget(limits.context_window, output_limit)
-        .is_some_and(|budget| all_input > budget)
-    {
-        let carry_overhead = estimator.estimate_request(&compaction_request(
-            Some(&CompactionSummary::new("")),
-            Vec::new(),
-            1,
-            true,
-        ));
-        let largest_unit = units
-            .iter()
-            .map(|unit| estimator.estimate_messages(unit))
-            .max()
-            .unwrap_or(0);
-        let first_unit = units
-            .front()
-            .map_or(0, |unit| estimator.estimate_messages(unit));
-        // Budget a full carry-forward summary, another safe unit, and the next output.
-        let available = request_input_budget(limits.context_window, 0).expect("known input budget");
-        output_limit = output_limit
-            .min(
-                available
-                    .saturating_sub(carry_overhead)
-                    .saturating_sub(largest_unit)
-                    / 2,
-            )
-            .min(
-                available
-                    .saturating_sub(initial_overhead)
-                    .saturating_sub(first_unit),
-            );
-        if output_limit == 0 {
-            return Err(CompactionError::Failed(
-                "compaction failed: no room for a summary alongside a safe history chunk"
-                    .to_owned(),
-            ));
-        }
-    }
-    let budget = request_input_budget(limits.context_window, output_limit);
-
-    while !units.is_empty() {
-        if cancel.is_cancelled() {
-            return Err(CompactionError::Cancelled);
-        }
-        let messages = take_compaction_chunk(&mut units, summary.as_ref(), budget)?;
-        let mut summary_content = None;
-        for attempt in 0..=COMPACTION_TOOL_CALL_RETRY_LIMIT {
-            let retrying = attempt > 0;
-            let request =
-                compaction_request(summary.as_ref(), messages.clone(), output_limit, retrying);
-            let response =
-                match stream_private_model(Arc::clone(&provider), request, cancel.clone()).await {
-                    Ok(response) => response,
-                    Err(ProviderError::Cancelled) => return Err(CompactionError::Cancelled),
-                    Err(error) => {
-                        return Err(CompactionError::Failed(format!(
-                            "compaction failed: {error}"
-                        )))
-                    }
-                };
-            let extracted = extract_summary(&response);
-            if cancel.is_cancelled() {
-                return Err(CompactionError::Cancelled);
-            }
-            match extracted {
-                Ok(content) => {
-                    summary_content = Some(content);
-                    break;
-                }
-                Err(SummaryExtractionError::UnexpectedToolCall)
-                    if attempt < COMPACTION_TOOL_CALL_RETRY_LIMIT =>
-                {
-                    tracing::warn!(
-                        target: "ri_core::agent",
-                        "compaction model returned unexpected tool call; retrying text-only request"
-                    );
-                }
-                Err(SummaryExtractionError::UnexpectedToolCall) => {
-                    return Err(CompactionError::Failed(
-                        "compaction failed: model violated the text-only compaction contract by returning tool calls on both attempts"
-                            .to_owned(),
-                    ));
-                }
-                Err(SummaryExtractionError::Invalid(message)) => {
-                    return Err(CompactionError::Failed(message));
-                }
-            }
-        }
-        summary = Some(CompactionSummary::new(
-            summary_content.expect("compaction attempts produce a summary or return an error"),
-        ));
-    }
-
-    summary.ok_or_else(|| CompactionError::Failed("compaction selected no history".to_owned()))
-}
-
-fn compaction_request(
-    summary: Option<&CompactionSummary>,
-    messages: Vec<ModelMessage>,
-    output_limit: u64,
-    retrying: bool,
-) -> ModelRequest {
-    let system_instruction = if retrying {
-        format!("{COMPACTION_SYSTEM_INSTRUCTION}\n\n{COMPACTION_RETRY_INSTRUCTION}")
-    } else {
-        COMPACTION_SYSTEM_INSTRUCTION.to_owned()
-    };
-    let mut summary_messages = Vec::with_capacity(messages.len() + 2);
-    summary_messages.push(ModelMessage::System {
-        content: system_instruction,
-    });
-    if let Some(summary) = summary {
-        summary_messages.push(summary.as_message());
-    }
-    summary_messages.extend(messages);
-    ModelRequest {
-        messages: summary_messages,
-        tools: Vec::new(),
-        tool_choice: Some(ToolChoice::None),
-        max_tokens: Some(output_limit),
-        reasoning_effort: None,
-        sampling_params: Default::default(),
-    }
-}
-
-fn compaction_units(messages: Vec<ModelMessage>) -> VecDeque<Vec<ModelMessage>> {
-    let mut units = VecDeque::new();
-    let mut current = Vec::new();
-    let mut pending_tool_results = 0usize;
-
-    for message in messages {
-        match &message {
-            ModelMessage::Assistant { items } => {
-                debug_assert_eq!(pending_tool_results, 0);
-                pending_tool_results += items
-                    .iter()
-                    .filter(|item| matches!(item, ModelAssistantItem::ToolCall(_)))
-                    .count();
-            }
-            ModelMessage::ToolResult { .. } => {
-                debug_assert!(pending_tool_results > 0);
-                pending_tool_results = pending_tool_results.saturating_sub(1);
-            }
-            ModelMessage::System { .. }
-            | ModelMessage::Developer { .. }
-            | ModelMessage::User { .. } => {}
-        }
-        current.push(message);
-        if pending_tool_results == 0 {
-            units.push_back(std::mem::take(&mut current));
-        }
-    }
-
-    debug_assert!(current.is_empty());
-    if !current.is_empty() {
-        units.push_back(current);
-    }
-    units
-}
-
-fn take_compaction_chunk(
-    units: &mut VecDeque<Vec<ModelMessage>>,
-    summary: Option<&CompactionSummary>,
-    budget: Option<u64>,
-) -> Result<Vec<ModelMessage>, CompactionError> {
-    let Some(budget) = budget else {
-        return Ok(units.drain(..).flatten().collect());
-    };
-
-    let estimator = ConservativeTokenEstimator;
-    let mut estimated_tokens =
-        estimator.estimate_request(&compaction_request(summary, Vec::new(), 1, true));
-    let mut messages = Vec::new();
-    while let Some(unit) = units.front() {
-        let next_tokens = estimated_tokens.saturating_add(estimator.estimate_messages(unit));
-        if next_tokens > budget {
-            if messages.is_empty() {
-                return Err(CompactionError::Failed(format!(
-                    "compaction failed: the smallest safe history chunk is estimated at {next_tokens} input tokens, exceeding the model budget of {budget}"
-                )));
-            }
-            break;
-        }
-        estimated_tokens = next_tokens;
-        messages.extend(units.pop_front().expect("front unit exists"));
-    }
-    Ok(messages)
-}
-
-fn select_compaction_prefix(
-    history: &ConversationHistory,
-    base_messages: &[ModelMessage],
-    tools: &[crate::model::ToolDefinition],
-    target: u64,
-    force: bool,
-    compact_latest: bool,
-    provisional_message: Option<&ModelMessage>,
-) -> Option<(Vec<ModelMessage>, Vec<ModelMessage>)> {
-    let segments = segment_history(history.messages());
-    if segments.is_empty() {
-        return None;
-    }
-    let user_segments: Vec<usize> = segments
-        .iter()
-        .enumerate()
-        .filter_map(|(index, segment)| segment.has_user_message.then_some(index))
-        .collect();
-    let current_segment = user_segments.last().copied().unwrap_or(segments.len() - 1);
-    let eligible_end = if compact_latest {
-        segments.len()
-    } else if force {
-        current_segment
-    } else if user_segments.len() > 2 {
-        user_segments[user_segments.len() - 2].min(current_segment)
-    } else {
-        0
-    };
-
-    let before_tokens =
-        ConservativeTokenEstimator.estimate_request(&request_with_provisional_message(
-            normal_request(base_messages, history, tools),
-            provisional_message,
-        ));
-    if !force && before_tokens <= target {
-        return None;
-    }
-
-    let mut prefix = Vec::new();
-    let mut retained_start = 0;
-    for (index, segment) in segments.iter().take(eligible_end).enumerate() {
-        if !segment.safe_to_compact {
-            break;
-        }
-        prefix.extend(segment.messages.iter().cloned());
-        retained_start = index + 1;
-        let retained = messages_from_segments(&segments, retained_start);
-        if projected_tokens(base_messages, tools, &retained, provisional_message) <= target {
-            return Some((prefix, retained));
-        }
-    }
-
-    if !prefix.is_empty() {
-        Some((prefix, messages_from_segments(&segments, retained_start)))
-    } else {
-        None
-    }
-}
-
-fn projected_tokens(
-    base_messages: &[ModelMessage],
-    tools: &[crate::model::ToolDefinition],
-    retained: &[ModelMessage],
-    provisional_message: Option<&ModelMessage>,
-) -> u64 {
-    let placeholder = ConversationHistory::new(Some(CompactionSummary::new("")), retained.to_vec());
-    ConservativeTokenEstimator.estimate_request(&request_with_provisional_message(
-        normal_request(base_messages, &placeholder, tools),
-        provisional_message,
+fn commit_compaction(
+    session: &SessionMode,
+    replacement: CompactionReplacement,
+) -> Result<ConversationHistory, String> {
+    session
+        .append_compaction(&replacement.summary.content, &replacement.retained)
+        .map_err(|error| format!("session persistence failed during compaction: {error}"))?;
+    Ok(ConversationHistory::new(
+        Some(replacement.summary),
+        replacement.retained,
     ))
-}
-
-fn messages_from_segments(segments: &[HistorySegment], start: usize) -> Vec<ModelMessage> {
-    segments
-        .iter()
-        .skip(start)
-        .flat_map(|segment| segment.messages.iter().cloned())
-        .collect()
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum SummaryExtractionError {
-    UnexpectedToolCall,
-    Invalid(String),
-}
-
-fn extract_summary(response: &ModelResponse) -> Result<String, SummaryExtractionError> {
-    if response.stop_reason == StopReason::ToolCalls
-        || response
-            .items
-            .iter()
-            .any(|item| matches!(item, ModelAssistantItem::ToolCall(_)))
-    {
-        return Err(SummaryExtractionError::UnexpectedToolCall);
-    }
-    if response.stop_reason != StopReason::Stop {
-        return Err(SummaryExtractionError::Invalid(format!(
-            "compaction response did not finish successfully: {:?}",
-            response.stop_reason
-        )));
-    }
-    let summary: String = response
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            ModelAssistantItem::Text { content } => Some(content.as_str()),
-            ModelAssistantItem::Reasoning(_)
-            | ModelAssistantItem::Refusal { .. }
-            | ModelAssistantItem::ToolCall(_) => None,
-        })
-        .collect();
-    if summary.trim().is_empty() {
-        return Err(SummaryExtractionError::Invalid(
-            "compaction response was empty".to_owned(),
-        ));
-    }
-    Ok(summary)
-}
-
-async fn stream_private_model<P>(
-    provider: Arc<P>,
-    request: ModelRequest,
-    cancel: CancellationToken,
-) -> Result<ModelResponse, ProviderError>
-where
-    P: ModelProvider,
-{
-    let (model_event_tx, mut model_event_rx) = mpsc::channel(MODEL_EVENT_CHANNEL_CAPACITY);
-    let provider_cancel = cancel.clone();
-    let mut provider_task = tokio::spawn(async move {
-        provider
-            .stream(request, model_event_tx, provider_cancel)
-            .await
-    });
-    let provider_result = loop {
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                provider_task.abort();
-                let _ = provider_task.await;
-                return Err(ProviderError::Cancelled);
-            }
-            _ = model_event_rx.recv() => {}
-            result = &mut provider_task => break result,
-        }
-    };
-    while model_event_rx.recv().await.is_some() {}
-    match provider_result {
-        Ok(result) => result,
-        Err(error) => Err(ProviderError::Failed {
-            message: format!("provider task failed: {error}"),
-        }),
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2218,6 +1846,12 @@ fn agent_event_from_model(event: ModelEvent) -> AgentEvent {
 
 #[cfg(test)]
 mod tests {
+    use super::compaction::{
+        extract_summary, serialize_compaction_history, summarize_compaction_prefix,
+        COMPACTION_RETRY_INSTRUCTION,
+    };
+    use crate::conversation::{segment_history, CompactionSummary};
+    use crate::model::ToolChoice;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -2692,7 +2326,7 @@ mod tests {
                 plugins: builtin_plugins(),
                 tool_context: ToolContext::new(&root).unwrap(),
                 base_messages: Vec::new(),
-                initial_history,
+                initial_history: initial_history.clone(),
                 session: SessionMode::Enabled(handle.clone()),
                 reasoning_effort: None,
             },
@@ -2713,11 +2347,18 @@ mod tests {
         runtime_task.await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         while let Ok(event) = event_rx.try_recv() {
-            assert!(!matches!(event, AgentEvent::TurnStarted));
+            assert!(!matches!(
+                event,
+                AgentEvent::TurnStarted | AgentEvent::CompactionFinished { .. }
+            ));
         }
         drop(handle);
         let snapshot = crate::session::read_session(&session_path).unwrap();
-        assert_eq!(snapshot.history.len(), 6);
+        assert_eq!(snapshot.history, initial_history);
+        assert_eq!(snapshot.active_summary, None);
+        assert!(!std::fs::read_to_string(&session_path)
+            .unwrap()
+            .contains("\"type\":\"compaction\""));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -5006,6 +4647,203 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_compaction_checkpoint_retains_message_ids_and_reloads_committed_history() {
+        use crate::session::SessionRecord;
+
+        let root = unique_test_dir("agent-manual-compaction-checkpoint");
+        std::fs::create_dir_all(&root).unwrap();
+        let repository =
+            crate::session::SessionRepository::new(root.join("sessions"), &root, &root).unwrap();
+        let handle = repository.create().unwrap();
+        let messages = vec![
+            ModelMessage::user("old request ".repeat(100)),
+            ModelMessage::Assistant {
+                items: vec![ModelAssistantItem::Text {
+                    content: "old answer ".repeat(100),
+                }],
+            },
+            ModelMessage::user("retained request"),
+            ModelMessage::Assistant {
+                items: vec![ModelAssistantItem::Text {
+                    content: "retained answer".into(),
+                }],
+            },
+        ];
+        for message in &messages {
+            handle.append_message(message).unwrap();
+        }
+        let path = handle.info().unwrap().path;
+        let original_records: Vec<SessionRecord> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let message_ids: Vec<_> = original_records
+            .iter()
+            .filter_map(|record| match record {
+                SessionRecord::Message { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let provider = Arc::new(
+            ScriptedProvider::new(vec![final_step("summary")]).with_limits(ModelLimits {
+                context_window: Some(128_000),
+                max_output_tokens: Some(100),
+            }),
+        );
+        let history = ConversationHistory::new(None, messages.clone());
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let compacted = compact_conversation(
+            provider,
+            Arc::new(crate::tools::builtin_tool_registry()),
+            AgentRuntimeConfig {
+                plugins: builtin_plugins(),
+                tool_context: ToolContext::new(&root).unwrap(),
+                base_messages: Vec::new(),
+                initial_history: Vec::new(),
+                session: SessionMode::Enabled(handle.clone()),
+                reasoning_effort: None,
+            },
+            history.clone(),
+            event_tx,
+            CancellationToken::new(),
+            false,
+            true,
+            CompactionSettings::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(history.messages(), messages);
+        assert_eq!(compacted.messages(), &messages[2..]);
+        assert_eq!(
+            compacted.summary(),
+            Some(&CompactionSummary::new("summary"))
+        );
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                AgentEvent::CompactionStarted { automatic: false },
+                AgentEvent::SessionChanged { .. },
+                AgentEvent::ContextUsageUpdated(_),
+                AgentEvent::CompactionFinished {
+                    automatic: false,
+                    ..
+                },
+            ]
+        ));
+        drop(handle);
+        let reopened = repository.open_path(&path).unwrap();
+        assert_eq!(
+            ConversationHistory::from_provider_messages(reopened.history),
+            compacted
+        );
+        let snapshot = crate::session::read_session(&path).unwrap();
+        assert_eq!(snapshot.transcript, messages);
+        let records: Vec<SessionRecord> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(matches!(
+            records.first(),
+            Some(SessionRecord::Session { version: 1, .. })
+        ));
+        assert!(
+            matches!(records.last(), Some(SessionRecord::Compaction { retained_message_ids, .. })
+            if retained_message_ids == &message_ids[2..])
+        );
+        drop(reopened.handle);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn compaction_persistence_failure_does_not_replace_live_history() {
+        let root = unique_test_dir("agent-compaction-persistence-failure");
+        std::fs::create_dir_all(&root).unwrap();
+        let sessions_path = root.join("sessions");
+        std::fs::write(&sessions_path, "not a directory").unwrap();
+        let repository =
+            crate::session::SessionRepository::new(&sessions_path, &root, &root).unwrap();
+        let handle = repository.create().unwrap();
+        let initial_history = vec![
+            ModelMessage::user("investigate foo ".repeat(100)),
+            ModelMessage::Assistant {
+                items: vec![ModelAssistantItem::Text {
+                    content: "finished investigation ".repeat(100),
+                }],
+            },
+        ];
+        let provider = ScriptedProvider::new(vec![final_step("summary"), final_step("continued")]);
+        let requests = Arc::clone(&provider.requests);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let runtime = AgentRuntime::with_config(
+            provider,
+            AgentRuntimeConfig {
+                plugins: builtin_plugins(),
+                tool_context: ToolContext::new(&root).unwrap(),
+                base_messages: Vec::new(),
+                initial_history: initial_history.clone(),
+                session: SessionMode::Enabled(handle.clone()),
+                reasoning_effort: None,
+            },
+        );
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+        command_tx.send(AgentCommand::Compact).await.unwrap();
+        let mut started = false;
+        loop {
+            match event_rx.recv().await.unwrap() {
+                AgentEvent::CompactionStarted { automatic: false } => started = true,
+                AgentEvent::CompactionFailed { message } => {
+                    assert!(message.contains("session persistence failed during compaction"));
+                    break;
+                }
+                AgentEvent::CompactionFinished { .. } | AgentEvent::TurnStarted => {
+                    panic!("failed compaction must not commit or start a turn")
+                }
+                _ => {}
+            }
+        }
+        assert!(started);
+        assert!(!handle.info().unwrap().path.exists());
+        // Restore storage so the next request can expose the still-authoritative history.
+        std::fs::rename(&sessions_path, root.join("blocked-sessions-file")).unwrap();
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "continue".into(),
+            })
+            .await
+            .unwrap();
+        let events = collect_turn(&mut event_rx).await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TurnFinished {
+                reason: StopReason::Stop
+            }
+        )));
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            &requests[1].messages[..initial_history.len()],
+            &initial_history
+        );
+        assert_eq!(
+            requests[1].messages.last(),
+            Some(&ModelMessage::user("continue"))
+        );
+        let path = handle.info().unwrap().path;
+        assert!(!std::fs::read_to_string(path)
+            .unwrap()
+            .contains("\"type\":\"compaction\""));
+        drop(handle);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn non_reducing_compaction_is_not_persisted() {
         let root = unique_test_dir("agent-non-reducing-compaction");
         std::fs::create_dir_all(&root).unwrap();
@@ -5066,6 +4904,87 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(!raw.contains("\"type\":\"compaction\""));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    async fn capture_manual_compaction_request(with_tool_exchange: bool) -> ModelRequest {
+        let mut initial_history = vec![ModelMessage::user("investigate foo")];
+        if with_tool_exchange {
+            initial_history.extend([
+                ModelMessage::Assistant {
+                    items: vec![ModelAssistantItem::ToolCall(tool_call(
+                        "read-1",
+                        "read",
+                        r#"{"path":"foo.rs"}"#,
+                    ))],
+                },
+                ModelMessage::ToolResult {
+                    tool_call_id: "read-1".to_owned(),
+                    tool_name: "read".to_owned(),
+                    content: "foo source".to_owned(),
+                },
+            ]);
+        }
+        initial_history.push(ModelMessage::Assistant {
+            items: vec![ModelAssistantItem::Text {
+                content: "finished investigation ".repeat(100),
+            }],
+        });
+        let provider = ScriptedProvider::new(vec![final_step("done")]);
+        let requests = Arc::clone(&provider.requests);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let runtime = AgentRuntime::with_config(
+            provider,
+            AgentRuntimeConfig {
+                plugins: builtin_plugins(),
+                tool_context: ToolContext::from_current_dir().unwrap(),
+                base_messages: Vec::new(),
+                initial_history,
+                session: SessionMode::Disabled,
+                reasoning_effort: None,
+            },
+        );
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+        command_tx.send(AgentCommand::Compact).await.unwrap();
+        wait_for_compaction_finished(&mut event_rx).await;
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        requests[0].clone()
+    }
+
+    #[tokio::test]
+    async fn compaction_request_ends_with_user_turn() {
+        let request = capture_manual_compaction_request(false).await;
+        assert!(matches!(
+            request.messages.last(),
+            Some(ModelMessage::User { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn compaction_request_does_not_replay_assistant_roles() {
+        let request = capture_manual_compaction_request(false).await;
+        assert!(!request
+            .messages
+            .iter()
+            .any(|message| { matches!(message, ModelMessage::Assistant { .. }) }));
+    }
+
+    #[tokio::test]
+    async fn compaction_request_after_completed_tool_exchange_ends_with_user() {
+        let request = capture_manual_compaction_request(true).await;
+        assert!(matches!(
+            request.messages.last(),
+            Some(ModelMessage::User { .. })
+        ));
+        assert!(!request.messages.iter().any(|message| {
+            matches!(
+                message,
+                ModelMessage::Assistant { .. } | ModelMessage::ToolResult { .. }
+            )
+        }));
     }
 
     #[tokio::test]
@@ -5165,9 +5084,11 @@ mod tests {
                     ConservativeTokenEstimator.estimate_request(request) + output + 4_096 <= 8_000
                 );
                 if let Some(previous) = previous {
-                    assert!(request
-                        .messages
-                        .contains(&CompactionSummary::new("sum".repeat(previous)).as_message()));
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(request.last_user_message())
+                            .unwrap()["previous_summary"],
+                        "sum".repeat(previous)
+                    );
                 }
                 previous = Some(output as usize);
             }
@@ -5267,30 +5188,48 @@ mod tests {
         assert!(requests
             .iter()
             .all(|request| request.tool_choice == Some(ToolChoice::None)));
-        assert!(requests
+        for (index, request) in requests.iter().enumerate() {
+            assert!(
+                ConservativeTokenEstimator.estimate_request(request)
+                    <= request_input_budget(limits.context_window, request.max_tokens.unwrap())
+                        .unwrap()
+            );
+            if index > 0 {
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(request.last_user_message()).unwrap()
+                        ["previous_summary"],
+                    format!("summary through chunk {}", index - 1)
+                );
+            }
+            for tool_index in 0..8 {
+                let payload: serde_json::Value =
+                    serde_json::from_str(request.last_user_message()).unwrap();
+                let occurrences = payload["history"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|record| record["call_id"] == format!("read-{tool_index}"))
+                    .count();
+                assert!(
+                    occurrences == 0 || occurrences == 2,
+                    "tool call and result must share a chunk"
+                );
+            }
+        }
+        let summarized_history: Vec<serde_json::Value> = requests
             .iter()
-            .all(|request| { ConservativeTokenEstimator.estimate_request(request) <= budget }));
-        assert!(requests.iter().skip(1).all(|request| request
-            .messages
-            .iter()
-            .any(|message| matches!(message, ModelMessage::Developer { .. }))));
-        assert!(requests
-            .iter()
-            .all(|request| segment_history(&request.messages)
-                .iter()
-                .all(|segment| segment.safe_to_compact)));
-        let summarized_history: Vec<ModelMessage> = requests
-            .iter()
-            .flat_map(|request| request.messages.iter())
-            .filter(|message| {
-                !matches!(
-                    message,
-                    ModelMessage::System { .. } | ModelMessage::Developer { .. }
-                )
+            .flat_map(|request| {
+                serde_json::from_str::<serde_json::Value>(request.last_user_message()).unwrap()
+                    ["history"]
+                    .as_array()
+                    .unwrap()
+                    .clone()
             })
-            .cloned()
             .collect();
-        assert_eq!(summarized_history, initial_history);
+        assert_eq!(
+            serde_json::json!(summarized_history),
+            serialize_compaction_history(&initial_history)
+        );
     }
 
     #[tokio::test]
@@ -5431,9 +5370,11 @@ mod tests {
 
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 4);
-        assert!(requests[2].messages.iter().any(|message| {
-            matches!(message, ModelMessage::Developer { content } if content.contains("summary A"))
-        }));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(requests[2].last_user_message()).unwrap()
+                ["previous_summary"],
+            "summary A"
+        );
         let summaries: Vec<&str> = requests[3]
             .messages
             .iter()
