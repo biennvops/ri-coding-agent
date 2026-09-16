@@ -5068,6 +5068,87 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    async fn capture_manual_compaction_request(with_tool_exchange: bool) -> ModelRequest {
+        let mut initial_history = vec![ModelMessage::user("investigate foo")];
+        if with_tool_exchange {
+            initial_history.extend([
+                ModelMessage::Assistant {
+                    items: vec![ModelAssistantItem::ToolCall(tool_call(
+                        "read-1",
+                        "read",
+                        r#"{"path":"foo.rs"}"#,
+                    ))],
+                },
+                ModelMessage::ToolResult {
+                    tool_call_id: "read-1".to_owned(),
+                    tool_name: "read".to_owned(),
+                    content: "foo source".to_owned(),
+                },
+            ]);
+        }
+        initial_history.push(ModelMessage::Assistant {
+            items: vec![ModelAssistantItem::Text {
+                content: "finished investigation ".repeat(100),
+            }],
+        });
+        let provider = ScriptedProvider::new(vec![final_step("done")]);
+        let requests = Arc::clone(&provider.requests);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let runtime = AgentRuntime::with_config(
+            provider,
+            AgentRuntimeConfig {
+                plugins: builtin_plugins(),
+                tool_context: ToolContext::from_current_dir().unwrap(),
+                base_messages: Vec::new(),
+                initial_history,
+                session: SessionMode::Disabled,
+                reasoning_effort: None,
+            },
+        );
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+        command_tx.send(AgentCommand::Compact).await.unwrap();
+        wait_for_compaction_finished(&mut event_rx).await;
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        requests[0].clone()
+    }
+
+    #[tokio::test]
+    async fn compaction_request_ends_with_user_turn() {
+        let request = capture_manual_compaction_request(false).await;
+        assert!(matches!(
+            request.messages.last(),
+            Some(ModelMessage::User { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn compaction_request_does_not_replay_assistant_roles() {
+        let request = capture_manual_compaction_request(false).await;
+        assert!(!request
+            .messages
+            .iter()
+            .any(|message| { matches!(message, ModelMessage::Assistant { .. }) }));
+    }
+
+    #[tokio::test]
+    async fn compaction_request_after_completed_tool_exchange_ends_with_user() {
+        let request = capture_manual_compaction_request(true).await;
+        assert!(matches!(
+            request.messages.last(),
+            Some(ModelMessage::User { .. })
+        ));
+        assert!(!request.messages.iter().any(|message| {
+            matches!(
+                message,
+                ModelMessage::Assistant { .. } | ModelMessage::ToolResult { .. }
+            )
+        }));
+    }
+
     #[tokio::test]
     async fn manual_compaction_does_not_create_a_turn() {
         let initial_history = vec![
