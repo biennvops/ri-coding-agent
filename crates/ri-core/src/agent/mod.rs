@@ -1833,7 +1833,8 @@ fn agent_event_from_model(event: ModelEvent) -> AgentEvent {
 #[cfg(test)]
 mod tests {
     use super::compaction::{
-        extract_summary, summarize_compaction_prefix, COMPACTION_RETRY_INSTRUCTION,
+        extract_summary, serialize_compaction_history, summarize_compaction_prefix,
+        COMPACTION_RETRY_INSTRUCTION,
     };
     use crate::conversation::{segment_history, CompactionSummary};
     use crate::model::ToolChoice;
@@ -4865,9 +4866,9 @@ mod tests {
                     ConservativeTokenEstimator.estimate_request(request) + output + 4_096 <= 8_000
                 );
                 if let Some(previous) = previous {
-                    assert!(request
-                        .messages
-                        .contains(&CompactionSummary::new("sum".repeat(previous)).as_message()));
+                    assert!(request.last_user_message().contains(
+                        &CompactionSummary::new("sum".repeat(previous)).as_prompt_content()
+                    ));
                 }
                 previous = Some(output as usize);
             }
@@ -4967,30 +4968,46 @@ mod tests {
         assert!(requests
             .iter()
             .all(|request| request.tool_choice == Some(ToolChoice::None)));
-        assert!(requests
+        for (index, request) in requests.iter().enumerate() {
+            assert!(
+                ConservativeTokenEstimator.estimate_request(request)
+                    <= request_input_budget(limits.context_window, request.max_tokens.unwrap())
+                        .unwrap()
+            );
+            if index > 0 {
+                assert!(request.last_user_message().contains(
+                    &CompactionSummary::new(format!("summary through chunk {}", index - 1))
+                        .as_prompt_content()
+                ));
+            }
+            for tool_index in 0..8 {
+                let occurrences = request
+                    .last_user_message()
+                    .matches(&format!("call_id: read-{tool_index}\n"))
+                    .count();
+                assert!(
+                    occurrences == 0 || occurrences == 2,
+                    "tool call and result must share a chunk"
+                );
+            }
+        }
+        let summarized_history: String = requests
             .iter()
-            .all(|request| { ConservativeTokenEstimator.estimate_request(request) <= budget }));
-        assert!(requests.iter().skip(1).all(|request| request
-            .messages
-            .iter()
-            .any(|message| matches!(message, ModelMessage::Developer { .. }))));
-        assert!(requests
-            .iter()
-            .all(|request| segment_history(&request.messages)
-                .iter()
-                .all(|segment| segment.safe_to_compact)));
-        let summarized_history: Vec<ModelMessage> = requests
-            .iter()
-            .flat_map(|request| request.messages.iter())
-            .filter(|message| {
-                !matches!(
-                    message,
-                    ModelMessage::System { .. } | ModelMessage::Developer { .. }
-                )
+            .map(|request| {
+                request
+                    .last_user_message()
+                    .split_once("<conversation-history>\n")
+                    .unwrap()
+                    .1
+                    .split_once("</conversation-history>")
+                    .unwrap()
+                    .0
             })
-            .cloned()
             .collect();
-        assert_eq!(summarized_history, initial_history);
+        assert_eq!(
+            summarized_history,
+            serialize_compaction_history(&initial_history)
+        );
     }
 
     #[tokio::test]
@@ -5131,9 +5148,9 @@ mod tests {
 
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 4);
-        assert!(requests[2].messages.iter().any(|message| {
-            matches!(message, ModelMessage::Developer { content } if content.contains("summary A"))
-        }));
+        assert!(requests[2]
+            .last_user_message()
+            .contains(&CompactionSummary::new("summary A").as_prompt_content()));
         let summaries: Vec<&str> = requests[3]
             .messages
             .iter()
