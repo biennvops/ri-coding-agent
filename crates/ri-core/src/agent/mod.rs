@@ -5084,9 +5084,11 @@ mod tests {
                     ConservativeTokenEstimator.estimate_request(request) + output + 4_096 <= 8_000
                 );
                 if let Some(previous) = previous {
-                    assert!(request.last_user_message().contains(
-                        &CompactionSummary::new("sum".repeat(previous)).as_prompt_content()
-                    ));
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(request.last_user_message())
+                            .unwrap()["previous_summary"],
+                        "sum".repeat(previous)
+                    );
                 }
                 previous = Some(output as usize);
             }
@@ -5193,15 +5195,20 @@ mod tests {
                         .unwrap()
             );
             if index > 0 {
-                assert!(request.last_user_message().contains(
-                    &CompactionSummary::new(format!("summary through chunk {}", index - 1))
-                        .as_prompt_content()
-                ));
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(request.last_user_message()).unwrap()
+                        ["previous_summary"],
+                    format!("summary through chunk {}", index - 1)
+                );
             }
             for tool_index in 0..8 {
-                let occurrences = request
-                    .last_user_message()
-                    .matches(&format!("call_id: read-{tool_index}\n"))
+                let payload: serde_json::Value =
+                    serde_json::from_str(request.last_user_message()).unwrap();
+                let occurrences = payload["history"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|record| record["call_id"] == format!("read-{tool_index}"))
                     .count();
                 assert!(
                     occurrences == 0 || occurrences == 2,
@@ -5209,21 +5216,18 @@ mod tests {
                 );
             }
         }
-        let summarized_history: String = requests
+        let summarized_history: Vec<serde_json::Value> = requests
             .iter()
-            .map(|request| {
-                request
-                    .last_user_message()
-                    .split_once("<conversation-history>\n")
+            .flat_map(|request| {
+                serde_json::from_str::<serde_json::Value>(request.last_user_message()).unwrap()
+                    ["history"]
+                    .as_array()
                     .unwrap()
-                    .1
-                    .split_once("</conversation-history>")
-                    .unwrap()
-                    .0
+                    .clone()
             })
             .collect();
         assert_eq!(
-            summarized_history,
+            serde_json::json!(summarized_history),
             serialize_compaction_history(&initial_history)
         );
     }
@@ -5366,9 +5370,11 @@ mod tests {
 
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 4);
-        assert!(requests[2]
-            .last_user_message()
-            .contains(&CompactionSummary::new("summary A").as_prompt_content()));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(requests[2].last_user_message()).unwrap()
+                ["previous_summary"],
+            "summary A"
+        );
         let summaries: Vec<&str> = requests[3]
             .messages
             .iter()
