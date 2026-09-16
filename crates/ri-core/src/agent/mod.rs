@@ -2,7 +2,7 @@ mod compaction;
 
 use compaction::{
     compact_native, compaction_output_limit, projected_tokens, select_compaction_prefix,
-    CompactionError,
+    CompactionError, CompactionReplacement,
 };
 
 use std::collections::VecDeque;
@@ -1317,10 +1317,12 @@ where
             .await;
         return Err(CompactionError::Cancelled);
     }
-    let compaction::CompactionReplacement { summary, retained } = replacement;
-    let compacted = ConversationHistory::new(Some(summary.clone()), retained.clone());
+    let projected = ConversationHistory::new(
+        Some(replacement.summary.clone()),
+        replacement.retained.clone(),
+    );
     let after_tokens = estimator.estimate_request(&request_with_provisional_message(
-        normal_request(&config.base_messages, &compacted, &tools),
+        normal_request(&config.base_messages, &projected, &tools),
         provisional_message,
     ));
     if after_tokens >= before_tokens {
@@ -1335,18 +1337,17 @@ where
         return Err(CompactionError::Failed(message));
     }
 
-    if let Err(error) = config
-        .session
-        .append_compaction(&summary.content, &retained)
-    {
-        let message = format!("session persistence failed during compaction: {error}");
-        let _ = events
-            .send(AgentEvent::CompactionFailed {
-                message: message.clone(),
-            })
-            .await;
-        return Err(CompactionError::Failed(message));
-    }
+    let compacted = match commit_compaction(&config.session, replacement) {
+        Ok(compacted) => compacted,
+        Err(message) => {
+            let _ = events
+                .send(AgentEvent::CompactionFailed {
+                    message: message.clone(),
+                })
+                .await;
+            return Err(CompactionError::Failed(message));
+        }
+    };
     if let Ok(Some(info)) = config.session.info() {
         let _ = events.send(AgentEvent::SessionChanged { info }).await;
     }
@@ -1365,6 +1366,19 @@ where
         })
         .await;
     Ok(compacted)
+}
+
+fn commit_compaction(
+    session: &SessionMode,
+    replacement: CompactionReplacement,
+) -> Result<ConversationHistory, String> {
+    session
+        .append_compaction(&replacement.summary.content, &replacement.retained)
+        .map_err(|error| format!("session persistence failed during compaction: {error}"))?;
+    Ok(ConversationHistory::new(
+        Some(replacement.summary),
+        replacement.retained,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2312,7 +2326,7 @@ mod tests {
                 plugins: builtin_plugins(),
                 tool_context: ToolContext::new(&root).unwrap(),
                 base_messages: Vec::new(),
-                initial_history,
+                initial_history: initial_history.clone(),
                 session: SessionMode::Enabled(handle.clone()),
                 reasoning_effort: None,
             },
@@ -2333,11 +2347,18 @@ mod tests {
         runtime_task.await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         while let Ok(event) = event_rx.try_recv() {
-            assert!(!matches!(event, AgentEvent::TurnStarted));
+            assert!(!matches!(
+                event,
+                AgentEvent::TurnStarted | AgentEvent::CompactionFinished { .. }
+            ));
         }
         drop(handle);
         let snapshot = crate::session::read_session(&session_path).unwrap();
-        assert_eq!(snapshot.history.len(), 6);
+        assert_eq!(snapshot.history, initial_history);
+        assert_eq!(snapshot.active_summary, None);
+        assert!(!std::fs::read_to_string(&session_path)
+            .unwrap()
+            .contains("\"type\":\"compaction\""));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -4622,6 +4643,203 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.contains("\"type\":\"compaction\""));
         assert!(raw.contains("old request 0"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_checkpoint_retains_message_ids_and_reloads_committed_history() {
+        use crate::session::SessionRecord;
+
+        let root = unique_test_dir("agent-manual-compaction-checkpoint");
+        std::fs::create_dir_all(&root).unwrap();
+        let repository =
+            crate::session::SessionRepository::new(root.join("sessions"), &root, &root).unwrap();
+        let handle = repository.create().unwrap();
+        let messages = vec![
+            ModelMessage::user("old request ".repeat(100)),
+            ModelMessage::Assistant {
+                items: vec![ModelAssistantItem::Text {
+                    content: "old answer ".repeat(100),
+                }],
+            },
+            ModelMessage::user("retained request"),
+            ModelMessage::Assistant {
+                items: vec![ModelAssistantItem::Text {
+                    content: "retained answer".into(),
+                }],
+            },
+        ];
+        for message in &messages {
+            handle.append_message(message).unwrap();
+        }
+        let path = handle.info().unwrap().path;
+        let original_records: Vec<SessionRecord> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let message_ids: Vec<_> = original_records
+            .iter()
+            .filter_map(|record| match record {
+                SessionRecord::Message { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let provider = Arc::new(
+            ScriptedProvider::new(vec![final_step("summary")]).with_limits(ModelLimits {
+                context_window: Some(128_000),
+                max_output_tokens: Some(100),
+            }),
+        );
+        let history = ConversationHistory::new(None, messages.clone());
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let compacted = compact_conversation(
+            provider,
+            Arc::new(crate::tools::builtin_tool_registry()),
+            AgentRuntimeConfig {
+                plugins: builtin_plugins(),
+                tool_context: ToolContext::new(&root).unwrap(),
+                base_messages: Vec::new(),
+                initial_history: Vec::new(),
+                session: SessionMode::Enabled(handle.clone()),
+                reasoning_effort: None,
+            },
+            history.clone(),
+            event_tx,
+            CancellationToken::new(),
+            false,
+            true,
+            CompactionSettings::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(history.messages(), messages);
+        assert_eq!(compacted.messages(), &messages[2..]);
+        assert_eq!(
+            compacted.summary(),
+            Some(&CompactionSummary::new("summary"))
+        );
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                AgentEvent::CompactionStarted { automatic: false },
+                AgentEvent::SessionChanged { .. },
+                AgentEvent::ContextUsageUpdated(_),
+                AgentEvent::CompactionFinished {
+                    automatic: false,
+                    ..
+                },
+            ]
+        ));
+        drop(handle);
+        let reopened = repository.open_path(&path).unwrap();
+        assert_eq!(
+            ConversationHistory::from_provider_messages(reopened.history),
+            compacted
+        );
+        let snapshot = crate::session::read_session(&path).unwrap();
+        assert_eq!(snapshot.transcript, messages);
+        let records: Vec<SessionRecord> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(matches!(
+            records.first(),
+            Some(SessionRecord::Session { version: 1, .. })
+        ));
+        assert!(
+            matches!(records.last(), Some(SessionRecord::Compaction { retained_message_ids, .. })
+            if retained_message_ids == &message_ids[2..])
+        );
+        drop(reopened.handle);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn compaction_persistence_failure_does_not_replace_live_history() {
+        let root = unique_test_dir("agent-compaction-persistence-failure");
+        std::fs::create_dir_all(&root).unwrap();
+        let sessions_path = root.join("sessions");
+        std::fs::write(&sessions_path, "not a directory").unwrap();
+        let repository =
+            crate::session::SessionRepository::new(&sessions_path, &root, &root).unwrap();
+        let handle = repository.create().unwrap();
+        let initial_history = vec![
+            ModelMessage::user("investigate foo ".repeat(100)),
+            ModelMessage::Assistant {
+                items: vec![ModelAssistantItem::Text {
+                    content: "finished investigation ".repeat(100),
+                }],
+            },
+        ];
+        let provider = ScriptedProvider::new(vec![final_step("summary"), final_step("continued")]);
+        let requests = Arc::clone(&provider.requests);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let runtime = AgentRuntime::with_config(
+            provider,
+            AgentRuntimeConfig {
+                plugins: builtin_plugins(),
+                tool_context: ToolContext::new(&root).unwrap(),
+                base_messages: Vec::new(),
+                initial_history: initial_history.clone(),
+                session: SessionMode::Enabled(handle.clone()),
+                reasoning_effort: None,
+            },
+        );
+        let runtime_task = tokio::spawn(runtime.run(command_rx, event_tx));
+        command_tx.send(AgentCommand::Compact).await.unwrap();
+        let mut started = false;
+        loop {
+            match event_rx.recv().await.unwrap() {
+                AgentEvent::CompactionStarted { automatic: false } => started = true,
+                AgentEvent::CompactionFailed { message } => {
+                    assert!(message.contains("session persistence failed during compaction"));
+                    break;
+                }
+                AgentEvent::CompactionFinished { .. } | AgentEvent::TurnStarted => {
+                    panic!("failed compaction must not commit or start a turn")
+                }
+                _ => {}
+            }
+        }
+        assert!(started);
+        assert!(!handle.info().unwrap().path.exists());
+        // Restore storage so the next request can expose the still-authoritative history.
+        std::fs::rename(&sessions_path, root.join("blocked-sessions-file")).unwrap();
+        command_tx
+            .send(AgentCommand::Submit {
+                text: "continue".into(),
+            })
+            .await
+            .unwrap();
+        let events = collect_turn(&mut event_rx).await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TurnFinished {
+                reason: StopReason::Stop
+            }
+        )));
+        command_tx.send(AgentCommand::Shutdown).await.unwrap();
+        runtime_task.await.unwrap();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            &requests[1].messages[..initial_history.len()],
+            &initial_history
+        );
+        assert_eq!(
+            requests[1].messages.last(),
+            Some(&ModelMessage::user("continue"))
+        );
+        let path = handle.info().unwrap().path;
+        assert!(!std::fs::read_to_string(path)
+            .unwrap()
+            .contains("\"type\":\"compaction\""));
+        drop(handle);
         std::fs::remove_dir_all(root).unwrap();
     }
 
