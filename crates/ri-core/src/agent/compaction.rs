@@ -21,6 +21,7 @@ const COMPACTION_SYSTEM_INSTRUCTION: &str = "Summarize the earlier coding-agent 
 pub(super) const COMPACTION_RETRY_INSTRUCTION: &str = "Retry after an invalid tool call: output plain text only. Never emit a tool/function call or request an external action.";
 const COMPACTION_TOOL_CALL_RETRY_LIMIT: usize = 1;
 
+#[derive(Debug)]
 pub(crate) enum CompactionError {
     Cancelled,
     NoHistory,
@@ -85,48 +86,36 @@ where
                 .to_owned(),
         ));
     }
-    let mut units = compaction_units(prefix);
     let estimator = ConservativeTokenEstimator;
-    let initial_overhead =
-        estimator.estimate_request(&compaction_request(summary.as_ref(), Vec::new(), 1, true));
-    let all_input = initial_overhead.saturating_add(
-        units
-            .iter()
-            .map(|unit| estimator.estimate_messages(unit))
-            .sum::<u64>(),
-    );
+    let all_input =
+        estimate_compaction_request(&estimator, summary.as_ref(), &prefix, output_limit, true);
+    let mut units = compaction_units(prefix);
     let mut output_limit = output_limit;
     if request_input_budget(limits.context_window, output_limit)
         .is_some_and(|budget| all_input > budget)
     {
-        let carry_overhead = estimator.estimate_request(&compaction_request(
-            Some(&CompactionSummary::new("")),
-            Vec::new(),
-            1,
-            true,
-        ));
-        let largest_unit = units
+        let empty_summary = CompactionSummary::new("");
+        let largest_carry_input = units
             .iter()
-            .map(|unit| estimator.estimate_messages(unit))
+            .map(|unit| {
+                estimate_compaction_request(
+                    &estimator,
+                    Some(&empty_summary),
+                    unit,
+                    output_limit,
+                    true,
+                )
+            })
             .max()
             .unwrap_or(0);
-        let first_unit = units
-            .front()
-            .map_or(0, |unit| estimator.estimate_messages(unit));
-        // Budget a full carry-forward summary, another safe unit, and the next output.
+        let first_input = units.front().map_or(0, |unit| {
+            estimate_compaction_request(&estimator, summary.as_ref(), unit, output_limit, true)
+        });
+        // Reserve a full carry-forward summary and the next output around a safe unit.
         let available = request_input_budget(limits.context_window, 0).expect("known input budget");
         output_limit = output_limit
-            .min(
-                available
-                    .saturating_sub(carry_overhead)
-                    .saturating_sub(largest_unit)
-                    / 2,
-            )
-            .min(
-                available
-                    .saturating_sub(initial_overhead)
-                    .saturating_sub(first_unit),
-            );
+            .min(available.saturating_sub(largest_carry_input) / 2)
+            .min(available.saturating_sub(first_input));
         if output_limit == 0 {
             return Err(CompactionError::Failed(
                 "compaction failed: no room for a summary alongside a safe history chunk"
@@ -140,7 +129,7 @@ where
         if cancel.is_cancelled() {
             return Err(CompactionError::Cancelled);
         }
-        let messages = take_compaction_chunk(&mut units, summary.as_ref(), budget)?;
+        let messages = take_compaction_chunk(&mut units, summary.as_ref(), output_limit, budget)?;
         let mut summary_content = None;
         for attempt in 0..=COMPACTION_TOOL_CALL_RETRY_LIMIT {
             let retrying = attempt > 0;
@@ -317,9 +306,25 @@ fn compaction_units(messages: Vec<ModelMessage>) -> VecDeque<Vec<ModelMessage>> 
     units
 }
 
+fn estimate_compaction_request(
+    estimator: &impl TokenEstimator,
+    summary: Option<&CompactionSummary>,
+    messages: &[ModelMessage],
+    output_limit: u64,
+    retrying: bool,
+) -> u64 {
+    estimator.estimate_request(&compaction_request(
+        summary,
+        messages.to_vec(),
+        output_limit,
+        retrying,
+    ))
+}
+
 fn take_compaction_chunk(
     units: &mut VecDeque<Vec<ModelMessage>>,
     summary: Option<&CompactionSummary>,
+    output_limit: u64,
     budget: Option<u64>,
 ) -> Result<Vec<ModelMessage>, CompactionError> {
     let Some(budget) = budget else {
@@ -327,12 +332,14 @@ fn take_compaction_chunk(
     };
 
     let estimator = ConservativeTokenEstimator;
-    let mut estimated_tokens =
-        estimator.estimate_request(&compaction_request(summary, Vec::new(), 1, true));
     let mut messages = Vec::new();
     while let Some(unit) = units.front() {
-        let next_tokens = estimated_tokens.saturating_add(estimator.estimate_messages(unit));
+        let previous_len = messages.len();
+        messages.extend_from_slice(unit);
+        let next_tokens =
+            estimate_compaction_request(&estimator, summary, &messages, output_limit, true);
         if next_tokens > budget {
+            messages.truncate(previous_len);
             if messages.is_empty() {
                 return Err(CompactionError::Failed(format!(
                     "compaction failed: the smallest safe history chunk is estimated at {next_tokens} input tokens, exceeding the model budget of {budget}"
@@ -340,8 +347,7 @@ fn take_compaction_chunk(
             }
             break;
         }
-        estimated_tokens = next_tokens;
-        messages.extend(units.pop_front().expect("front unit exists"));
+        units.pop_front();
     }
     Ok(messages)
 }
@@ -504,6 +510,86 @@ where
 mod tests {
     use super::*;
     use crate::model::{ModelThinking, ModelToolCall};
+
+    #[test]
+    fn compaction_budget_estimates_the_real_request_with_summary_and_retry() {
+        let estimator = ConservativeTokenEstimator;
+        let messages = vec![ModelMessage::user("history")];
+        let summary = CompactionSummary::new("prior context ".repeat(100));
+        for prior in [None, Some(&summary)] {
+            for retrying in [false, true] {
+                assert_eq!(
+                    estimate_compaction_request(&estimator, prior, &messages, 100, retrying),
+                    estimator.estimate_request(&compaction_request(
+                        prior,
+                        messages.clone(),
+                        100,
+                        retrying
+                    )),
+                );
+            }
+        }
+        let initial = estimate_compaction_request(&estimator, None, &messages, 100, false);
+        let retry = estimate_compaction_request(&estimator, None, &messages, 100, true);
+        let with_summary =
+            estimate_compaction_request(&estimator, Some(&summary), &messages, 100, true);
+        assert!(retry > initial);
+        assert!(with_summary > retry);
+        for (prior, budget) in [(None, initial), (Some(&summary), retry)] {
+            let mut units = compaction_units(messages.clone());
+            assert!(take_compaction_chunk(&mut units, prior, 100, Some(budget)).is_err());
+            assert_eq!(units.into_iter().flatten().collect::<Vec<_>>(), messages);
+        }
+    }
+
+    #[test]
+    fn compaction_chunks_large_serialized_tool_results_at_safe_boundaries() {
+        let messages: Vec<_> = (0..3)
+            .flat_map(|index| {
+                let call_id = format!("call-{index}");
+                [
+                    ModelMessage::Assistant {
+                        items: vec![ModelAssistantItem::ToolCall(ModelToolCall {
+                            name: Some("read".into()),
+                            call_id: Some(call_id.clone()),
+                            arguments: r#"{"path":"foo.rs"}"#.into(),
+                            ..Default::default()
+                        })],
+                    },
+                    ModelMessage::ToolResult {
+                        tool_call_id: call_id,
+                        tool_name: "read".into(),
+                        content: "result ".repeat(1_000),
+                    },
+                ]
+            })
+            .collect();
+        let summary = CompactionSummary::new("previous summary");
+        let estimator = ConservativeTokenEstimator;
+        let budget =
+            estimate_compaction_request(&estimator, Some(&summary), &messages[..2], 100, true);
+        let mut units = compaction_units(messages.clone());
+        let mut chunks = Vec::new();
+        while !units.is_empty() {
+            let chunk =
+                take_compaction_chunk(&mut units, Some(&summary), 100, Some(budget)).unwrap();
+            assert_eq!(chunk.len(), 2);
+            assert!(segment_history(&chunk)
+                .iter()
+                .all(|segment| segment.safe_to_compact));
+            for retrying in [false, true] {
+                let request = compaction_request(Some(&summary), chunk.clone(), 100, retrying);
+                assert!(estimator.estimate_request(&request) <= budget);
+            }
+            chunks.extend(chunk);
+        }
+        assert_eq!(chunks, messages);
+        let mut oversized = compaction_units(messages[..2].to_vec());
+        assert!(
+            take_compaction_chunk(&mut oversized, Some(&summary), 100, Some(budget - 1)).is_err()
+        );
+        assert_eq!(oversized.len(), 1);
+    }
 
     #[test]
     fn serializer_preserves_user_and_assistant_text() {
