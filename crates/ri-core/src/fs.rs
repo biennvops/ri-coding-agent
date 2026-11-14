@@ -85,6 +85,21 @@ pub(crate) fn temporary_path(parent: &Path) -> PathBuf {
     ))
 }
 
+/// Create a new file that only the current user can read or write.
+///
+/// The mode is applied at creation, so the file is never briefly readable by
+/// others. `create_new` also refuses to follow a pre-placed file or symlink.
+pub(crate) fn create_private_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 #[cfg(not(windows))]
 fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
     fs::rename(temporary, destination)

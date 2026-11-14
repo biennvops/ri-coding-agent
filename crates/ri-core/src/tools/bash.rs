@@ -1,4 +1,4 @@
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Write;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::fs::create_private_file;
 use crate::model::ToolDefinition;
 
 use super::write::temporary_path;
@@ -986,13 +987,9 @@ impl BashOutput {
 
     fn create_spill(&mut self) -> Result<(), ToolError> {
         let path = temporary_path(&std::env::temp_dir());
-        let mut spill = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|error| {
-                ToolError::Failed(format!("could not create output spill file: {error}"))
-            })?;
+        let mut spill = create_private_file(&path).map_err(|error| {
+            ToolError::Failed(format!("could not create output spill file: {error}"))
+        })?;
         spill.write_all(self.tail.as_bytes()).map_err(|error| {
             ToolError::Failed(format!("could not initialize output spill file: {error}"))
         })?;
@@ -1397,6 +1394,21 @@ mod tests {
         assert!(result.model_content.contains("50.0KB limit"));
         let path = result.metadata.full_output_path.unwrap();
         assert_eq!(fs::metadata(&path).unwrap().len(), size as u64);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spill_file_is_private_to_the_user() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let result = run_bash("bash-spill-mode", "seq 1 5000".to_owned()).await;
+
+        let path = result.metadata.full_output_path.unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         fs::remove_file(path).unwrap();
     }
 
