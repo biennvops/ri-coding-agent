@@ -282,7 +282,6 @@ pub(crate) fn bounded_preview_with_limits<'a>(
 #[derive(Debug)]
 pub(crate) struct BoundedText {
     limit: usize,
-    total_bytes: usize,
     truncated: bool,
     head: String,
     tail: String,
@@ -292,15 +291,10 @@ impl BoundedText {
     pub(crate) fn new(limit: usize) -> Self {
         Self {
             limit: limit.max(2),
-            total_bytes: 0,
             truncated: false,
             head: String::new(),
             tail: String::new(),
         }
-    }
-
-    pub(crate) fn total_bytes(&self) -> usize {
-        self.total_bytes
     }
 
     pub(crate) fn is_truncated(&self) -> bool {
@@ -308,7 +302,6 @@ impl BoundedText {
     }
 
     pub(crate) fn push(&mut self, text: &str) {
-        self.total_bytes = self.total_bytes.saturating_add(text.len());
         if !self.truncated && self.head.len().saturating_add(text.len()) <= self.limit {
             self.head.push_str(text);
             return;
@@ -340,10 +333,6 @@ impl BoundedText {
             };
         }
         self.truncated = true;
-    }
-
-    pub(crate) fn retained(&self) -> &str {
-        &self.head
     }
 
     pub(crate) fn render(&self) -> String {
@@ -419,7 +408,6 @@ pub(crate) mod tests {
         output.push("abcdefghij");
 
         assert!(output.is_truncated());
-        assert_eq!(output.total_bytes(), 20);
         assert!(output.render().contains("01234"));
         assert!(output.render().contains("fghij"));
         assert!(output.render().is_char_boundary(output.render().len()));
