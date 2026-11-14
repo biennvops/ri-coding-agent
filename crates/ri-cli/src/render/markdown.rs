@@ -1,7 +1,7 @@
 //! CommonMark stays in the presentation layer; cached rows never replace source text.
 use std::ops::Range;
 
-use pulldown_cmark::{CodeBlockKind, Event, LinkType, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, LinkType, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -54,6 +54,30 @@ impl LogicalLine {
     }
 }
 
+impl CachedRow {
+    fn push(&mut self, text: &str, style: Style) {
+        if text.is_empty() {
+            return;
+        }
+        let start = self.text.width();
+        self.text.push_str(text);
+        let width = self.text.width().saturating_sub(start);
+        if let Some(last) = self
+            .spans
+            .last_mut()
+            .filter(|s| s.style == style && s.start + s.width == start)
+        {
+            last.width += width;
+        } else {
+            self.spans.push(StyledRange {
+                start,
+                width,
+                style,
+            });
+        }
+    }
+}
+
 struct Prefix {
     first: String,
     rest: String,
@@ -66,9 +90,58 @@ struct CodeBlockState {
     source: String,
 }
 
+struct TableState {
+    alignments: Vec<Alignment>,
+    header: Vec<LogicalLine>,
+    rows: Vec<Vec<LogicalLine>>,
+    current_row: Vec<LogicalLine>,
+}
+
+#[derive(Default)]
+struct WrappedCellLine {
+    width: usize,
+    spans: Vec<(String, Style)>,
+}
+
+fn wrap_cell(cell: &LogicalLine, col_width: usize) -> Vec<WrappedCellLine> {
+    if cell.text.is_empty() {
+        return vec![WrappedCellLine::default()];
+    }
+    let mut lines = Vec::new();
+    let mut current = WrappedCellLine::default();
+    let mut span_index = 0;
+    for (offset, grapheme) in cell.text.grapheme_indices(true) {
+        let displayed = if grapheme.width() > col_width {
+            ""
+        } else {
+            grapheme
+        };
+        let width = displayed.width();
+        if current.width > 0 && current.width + width > col_width {
+            lines.push(current);
+            current = WrappedCellLine::default();
+        }
+        while span_index + 1 < cell.spans.len() && cell.spans[span_index].0.end <= offset {
+            span_index += 1;
+        }
+        let style = cell.spans.get(span_index).map(|s| s.1).unwrap_or_default();
+        if let Some(last) = current.spans.last_mut().filter(|s| s.1 == style) {
+            last.0.push_str(displayed);
+        } else {
+            current.spans.push((displayed.to_owned(), style));
+        }
+        current.width += width;
+    }
+    if !current.spans.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
 struct Renderer {
     max_streaming_code_bytes: Option<usize>,
     code_block: Option<CodeBlockState>,
+    table: Option<TableState>,
     rows: Vec<CachedRow>,
     line: LogicalLine,
     prefixes: Vec<Prefix>,
@@ -90,6 +163,20 @@ impl Renderer {
 
     fn text(&mut self, text: &str) {
         self.line.push(text, self.style());
+    }
+
+    fn prefix_width(&self) -> usize {
+        let budget = self.width.saturating_sub(2);
+        let mut width = 0;
+        for prefix in &self.prefixes {
+            for g in prefix.rest.graphemes(true) {
+                if width + g.width() > budget {
+                    break;
+                }
+                width += g.width();
+            }
+        }
+        width
     }
 
     fn prefix(&mut self) -> CachedRow {
@@ -144,22 +231,7 @@ impl Renderer {
                 span_index += 1;
             }
             let style = line.spans.get(span_index).map(|s| s.1).unwrap_or_default();
-            let start = row.text.width();
-            row.text.push_str(displayed);
-            let width = displayed.width();
-            if let Some(last) = row
-                .spans
-                .last_mut()
-                .filter(|s| s.style == style && s.start + s.width == start)
-            {
-                last.width += width;
-            } else {
-                row.spans.push(StyledRange {
-                    start,
-                    width,
-                    style,
-                });
-            }
+            row.push(displayed, style);
             content = true;
         }
         self.rows.push(row);
@@ -205,6 +277,132 @@ impl Renderer {
         for line in source.split_terminator('\n') {
             self.text(line);
             self.flush(true);
+        }
+    }
+
+    fn finish_table(&mut self) {
+        let Some(table) = self.table.take() else {
+            return;
+        };
+        let num_cols = table
+            .alignments
+            .len()
+            .max(table.header.len())
+            .max(table.rows.iter().map(Vec::len).max().unwrap_or(0));
+        if num_cols == 0 {
+            return;
+        }
+        let mut natural_widths = vec![1usize; num_cols];
+        for (c, cell) in table.header.iter().enumerate() {
+            natural_widths[c] = natural_widths[c].max(cell.text.width());
+        }
+        for row in &table.rows {
+            for (c, cell) in row.iter().enumerate() {
+                natural_widths[c] = natural_widths[c].max(cell.text.width());
+            }
+        }
+        let avail = self.width.saturating_sub(self.prefix_width());
+        let border_overhead = 3 * num_cols + 1;
+        if avail < border_overhead + num_cols {
+            for row in std::iter::once(table.header).chain(table.rows) {
+                if row.is_empty() {
+                    continue;
+                }
+                for (c, cell) in row.into_iter().enumerate() {
+                    if c > 0 {
+                        self.line.push(" │ ", self.palette.dim);
+                    }
+                    let offset = self.line.text.len();
+                    self.line.text.push_str(&cell.text);
+                    for (range, style) in cell.spans {
+                        self.line
+                            .spans
+                            .push((offset + range.start..offset + range.end, style));
+                    }
+                }
+                self.flush(true);
+            }
+            self.separate();
+            return;
+        }
+        let content_budget = avail - border_overhead;
+        let mut col_widths: Vec<usize> = natural_widths
+            .iter()
+            .map(|&w| w.clamp(1, content_budget))
+            .collect();
+        let mut total_width: usize = col_widths.iter().sum();
+        while total_width > content_budget {
+            if let Some(max_col) = col_widths.iter_mut().max() {
+                *max_col -= 1;
+                total_width -= 1;
+            }
+        }
+        self.push_table_border(&col_widths, "┌", "┬", "┐");
+        if !table.header.is_empty() {
+            self.push_table_row(&table.header, &col_widths, &table.alignments);
+            if !table.rows.is_empty() {
+                self.push_table_border(&col_widths, "├", "┼", "┤");
+            }
+        }
+        for row in &table.rows {
+            self.push_table_row(row, &col_widths, &table.alignments);
+        }
+        self.push_table_border(&col_widths, "└", "┴", "┘");
+        self.separate();
+    }
+
+    fn push_table_border(&mut self, col_widths: &[usize], left: &str, mid: &str, right: &str) {
+        let mut row = self.prefix();
+        let mut border = String::from(left);
+        for (i, &w) in col_widths.iter().enumerate() {
+            if i > 0 {
+                border.push_str(mid);
+            }
+            border.push_str(&"─".repeat(w + 2));
+        }
+        border.push_str(right);
+        row.push(&border, self.palette.dim);
+        self.rows.push(row);
+    }
+
+    fn push_table_row(
+        &mut self,
+        cells: &[LogicalLine],
+        col_widths: &[usize],
+        alignments: &[Alignment],
+    ) {
+        let num_cols = col_widths.len();
+        let empty = LogicalLine::default();
+        let wrapped_cols: Vec<Vec<WrappedCellLine>> = (0..num_cols)
+            .map(|c| wrap_cell(cells.get(c).unwrap_or(&empty), col_widths[c]))
+            .collect();
+        let row_height = wrapped_cols.iter().map(Vec::len).max().unwrap_or(1).max(1);
+        for line_idx in 0..row_height {
+            let mut row = self.prefix();
+            row.push("│", self.palette.dim);
+            for (c, &col_width) in col_widths.iter().enumerate() {
+                let alignment = alignments.get(c).copied().unwrap_or(Alignment::None);
+                if let Some(cell_line) = wrapped_cols[c].get(line_idx) {
+                    let pad = col_width.saturating_sub(cell_line.width);
+                    let left_pad = match alignment {
+                        Alignment::Left | Alignment::None => 0,
+                        Alignment::Right => pad,
+                        Alignment::Center => pad / 2,
+                    };
+                    row.push(&" ".repeat(1 + left_pad), Style::default());
+                    let cell_start = row.text.width();
+                    for (text, style) in &cell_line.spans {
+                        row.push(text, *style);
+                    }
+                    let actual_width = row.text.width().saturating_sub(cell_start);
+                    let right_pad = col_width.saturating_sub(left_pad.saturating_add(actual_width));
+                    row.push(&" ".repeat(right_pad + 1), Style::default());
+                } else {
+                    row.push(&" ".repeat(col_width + 2), Style::default());
+                }
+                row.push("│", self.palette.dim);
+            }
+            self.rows.push(row);
         }
     }
 
@@ -279,6 +477,29 @@ impl Renderer {
                         pending: true,
                     });
                 }
+                Tag::Table(alignments) => {
+                    self.flush(false);
+                    self.table = Some(TableState {
+                        alignments,
+                        header: Vec::new(),
+                        rows: Vec::new(),
+                        current_row: Vec::new(),
+                    });
+                }
+                Tag::TableHead => {
+                    self.push_style(self.palette.heading);
+                    if let Some(table) = &mut self.table {
+                        table.current_row.clear();
+                    }
+                }
+                Tag::TableRow => {
+                    if let Some(table) = &mut self.table {
+                        table.current_row.clear();
+                    }
+                }
+                Tag::TableCell => {
+                    self.line = LogicalLine::default();
+                }
                 Tag::Link {
                     dest_url,
                     link_type,
@@ -331,6 +552,24 @@ impl Renderer {
                     }
                 }
                 TagEnd::CodeBlock => self.finish_code_block(),
+                TagEnd::TableHead => {
+                    self.styles.pop();
+                    if let Some(table) = &mut self.table {
+                        table.header = std::mem::take(&mut table.current_row);
+                    }
+                }
+                TagEnd::TableRow => {
+                    if let Some(table) = &mut self.table {
+                        table.rows.push(std::mem::take(&mut table.current_row));
+                    }
+                }
+                TagEnd::TableCell => {
+                    let cell = std::mem::take(&mut self.line);
+                    if let Some(table) = &mut self.table {
+                        table.current_row.push(cell);
+                    }
+                }
+                TagEnd::Table => self.finish_table(),
                 TagEnd::Link | TagEnd::Image => {
                     self.styles.pop();
                     if let Some((url, auto, image)) = self.links.pop() {
@@ -350,13 +589,23 @@ impl Renderer {
                 while let Some(part) = parts.next() {
                     self.text(part);
                     if parts.peek().is_some() {
-                        self.flush(true);
+                        if self.table.is_some() {
+                            self.text(" ");
+                        } else {
+                            self.flush(true);
+                        }
                     }
                 }
             }
             Event::Code(text) => self.line.push(&text, self.style().patch(self.palette.code)),
             Event::SoftBreak => self.text(" "),
-            Event::HardBreak => self.flush(true),
+            Event::HardBreak => {
+                if self.table.is_some() {
+                    self.text(" ");
+                } else {
+                    self.flush(true);
+                }
+            }
             Event::Rule => {
                 self.flush(false);
                 self.line.push("───", self.palette.dim);
@@ -388,6 +637,7 @@ fn layout_markdown_with_code_limit(
     let mut renderer = Renderer {
         max_streaming_code_bytes,
         code_block: None,
+        table: None,
         rows: Vec::new(),
         line: LogicalLine::default(),
         prefixes: vec![Prefix {
@@ -404,11 +654,12 @@ fn layout_markdown_with_code_limit(
     };
     for event in Parser::new_ext(
         source,
-        Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS,
+        Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_TABLES,
     ) {
         renderer.event(event);
     }
     renderer.finish_code_block();
+    renderer.finish_table();
     renderer.flush(false);
     while renderer.rows.last().is_some_and(|r| r.text.is_empty()) {
         renderer.rows.pop();
@@ -502,8 +753,90 @@ mod tests {
             "  [image: architecture] (diagram.png)"
         );
         assert!(visible("<details>hi</details>", 100).contains("<details>hi</details>"));
-        assert!(visible("a | b\n-- | --\n1 | 2", 100).contains("-- | --"));
+        assert!(visible("a | b\n1 | 2", 100).contains("a | b 1 | 2"));
         assert!(!visible("```\n\u{1b}[31m\u{7}\n```", 100).contains('\u{1b}'));
+    }
+
+    #[test]
+    fn tables_render_borders_alignments_inline_styles_and_wrap_cells() {
+        let table = "\
+| Left | Center | Right |\n\
+| :--- | :----: | ----: |\n\
+| **bold** | `code` | 42 |\n\
+| 世界 | 🦀 | [x](https://e.co) |";
+        let rows = layout_markdown(table, 100);
+        let rendered = rows
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            rendered,
+            [
+                "  ┌──────┬────────┬──────────────────┐",
+                "  │ Left │ Center │            Right │",
+                "  ├──────┼────────┼──────────────────┤",
+                "  │ bold │  code  │               42 │",
+                "  │ 世界 │   🦀   │ x (https://e.co) │",
+                "  └──────┴────────┴──────────────────┘",
+            ]
+            .join("\n")
+        );
+        assert_eq!(
+            style_at(&rows, "Left"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        );
+        assert!(style_at(&rows, "bold")
+            .add_modifier
+            .contains(Modifier::BOLD));
+        assert_eq!(style_at(&rows, "code").fg, Some(Color::Yellow));
+        assert!(style_at(&rows, "x (https://e.co)")
+            .add_modifier
+            .contains(Modifier::UNDERLINED));
+        assert_eq!(style_at(&rows, "┌"), Style::default().fg(Color::DarkGray));
+
+        let wide = "\
+| Flag | Description |\n\
+| --- | --- |\n\
+| `--release` | Build artifacts in release mode with optimizations |";
+        assert_eq!(
+            visible(wide, 40),
+            [
+                "  ┌───────────┬────────────────────────┐",
+                "  │ Flag      │ Description            │",
+                "  ├───────────┼────────────────────────┤",
+                "  │ --release │ Build artifacts in rel │",
+                "  │           │ ease mode with optimiz │",
+                "  │           │ ations                 │",
+                "  └───────────┴────────────────────────┘",
+            ]
+            .join("\n")
+        );
+
+        let quoted = "> | A | B |\n> | - | - |\n> | 1 | 2 |";
+        assert_eq!(
+            visible(quoted, 80),
+            [
+                "  │ ┌───┬───┐",
+                "  │ │ A │ B │",
+                "  │ ├───┼───┤",
+                "  │ │ 1 │ 2 │",
+                "  │ └───┴───┘",
+            ]
+            .join("\n")
+        );
+
+        for width in 1..60 {
+            for row in layout_markdown(table, width) {
+                assert!(row.text.width() <= width, "{width}: {}", row.text);
+                assert!(row
+                    .spans
+                    .iter()
+                    .all(|s| s.start + s.width <= row.text.width()));
+            }
+        }
     }
 
     #[test]
