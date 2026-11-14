@@ -376,12 +376,7 @@ impl Renderer {
         let wrapped_cols: Vec<Vec<WrappedCellLine>> = (0..num_cols)
             .map(|c| wrap_cell(cells.get(c).unwrap_or(&empty), col_widths[c]))
             .collect();
-        let row_height = wrapped_cols
-            .iter()
-            .map(Vec::len)
-            .max()
-            .unwrap_or(1)
-            .max(1);
+        let row_height = wrapped_cols.iter().map(Vec::len).max().unwrap_or(1).max(1);
         for line_idx in 0..row_height {
             let mut row = self.prefix();
             row.push("│", self.palette.dim);
