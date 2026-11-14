@@ -9,10 +9,10 @@ use crate::model::ToolDefinition;
 
 use super::path::resolve_existing;
 use super::{
-    BoundedText, Tool, ToolCallPresentation, ToolContext, ToolError, ToolEventSender,
+    format_size, Tool, ToolCallPresentation, ToolContext, ToolError, ToolEventSender,
     ToolExecutionResult, ToolOutputKind, ToolSummaryKind,
 };
-use super::{MAX_READ_FILE_BYTES, MAX_READ_LINES, MAX_TOOL_OUTPUT_BYTES};
+use super::{MAX_READ_FILE_BYTES, MAX_TOOL_OUTPUT_BYTES, MAX_TOOL_OUTPUT_LINES};
 
 const DEFAULT_READ_LIMIT: usize = 200;
 
@@ -38,7 +38,10 @@ impl Tool for ReadTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read".to_owned(),
-            description: Some("Read text from a file with numbered lines.".to_owned()),
+            description: Some(
+                "Read text from a file with numbered lines. Output is truncated to 2000 lines or 50KB (whichever is hit first); use offset/limit and continue with offset until complete."
+                    .to_owned(),
+            ),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -147,12 +150,14 @@ impl Tool for ReadTool {
             )));
         }
 
-        let limit = requested_limit.min(MAX_READ_LINES);
+        let limit = requested_limit.min(MAX_TOOL_OUTPUT_LINES);
         let end_line = offset
             .saturating_add(limit)
             .saturating_sub(1)
             .min(total_lines);
-        let mut output = BoundedText::new(MAX_TOOL_OUTPUT_BYTES);
+        let mut output = String::new();
+        let mut last_shown = offset - 1;
+        let mut byte_limited = false;
         for (index, line) in content.split_inclusive('\n').enumerate() {
             let line_number = index + 1;
             if line_number < offset {
@@ -161,29 +166,61 @@ impl Tool for ReadTool {
             if line_number > end_line {
                 break;
             }
-            output.push(&format!("{line_number} | "));
-            output.push(trim_line_ending(line));
-            output.push("\n");
+            let rendered = format!("{line_number} | {}\n", trim_line_ending(line));
+            if output.len() + rendered.len() > MAX_TOOL_OUTPUT_BYTES {
+                byte_limited = true;
+                break;
+            }
+            output.push_str(&rendered);
+            last_shown = line_number;
         }
 
-        let mut result = output.render();
-        if end_line < total_lines {
+        if last_shown < offset {
+            let line_size = format_size(
+                trim_line_ending(
+                    content
+                        .split_inclusive('\n')
+                        .nth(offset - 1)
+                        .unwrap_or_default(),
+                )
+                .len(),
+            );
+            return Ok(ToolExecutionResult {
+                model_content: format!(
+                    "[Line {offset} is {line_size}, exceeds {} limit. Use bash: sed -n '{offset}p' {} | head -c {MAX_TOOL_OUTPUT_BYTES}]",
+                    format_size(MAX_TOOL_OUTPUT_BYTES),
+                    arguments.path
+                ),
+                metadata: super::ToolExecutionMetadata {
+                    truncated: true,
+                    ..super::ToolExecutionMetadata::success()
+                },
+            });
+        }
+
+        let mut result = output;
+        if byte_limited {
+            result.push_str(&format!(
+                "\n[Showing lines {offset}-{last_shown} of {total_lines} ({} limit). Continue with offset={}.]",
+                format_size(MAX_TOOL_OUTPUT_BYTES),
+                last_shown + 1
+            ));
+        } else if end_line < total_lines {
             result.push_str(&format!(
                 "\n[Showing lines {offset}-{end_line} of {total_lines}. Continue with offset={}.]",
                 end_line + 1
             ));
         }
-        if requested_limit > MAX_READ_LINES {
-            result.push_str(&format!("\n[Read limit capped at {MAX_READ_LINES} lines.]"));
-        }
-        if output.is_truncated() {
-            result.push_str("\n[Read output was truncated by the byte limit.]");
+        if requested_limit > MAX_TOOL_OUTPUT_LINES {
+            result.push_str(&format!(
+                "\n[Read limit capped at {MAX_TOOL_OUTPUT_LINES} lines.]"
+            ));
         }
 
         Ok(ToolExecutionResult {
             model_content: result,
             metadata: super::ToolExecutionMetadata {
-                truncated: output.is_truncated(),
+                truncated: byte_limited,
                 ..super::ToolExecutionMetadata::success()
             },
         })
@@ -245,6 +282,99 @@ mod tests {
             "2 | two\n3 | three\n\n[Showing lines 2-3 of 4. Continue with offset=4.]"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    async fn read_file(name: &str, content: &str, arguments: Value) -> ToolExecutionResult {
+        let root = unique_test_dir(name);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("file.txt"), content).unwrap();
+        let context = ToolContext::new(&root).unwrap();
+        let result = ReadTool
+            .execute(
+                arguments,
+                &context,
+                tokio::sync::mpsc::channel(1).0,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        fs::remove_dir_all(root).unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn line_cap_matches_the_shared_tool_limit() {
+        let total = MAX_TOOL_OUTPUT_LINES + 500;
+        let content = (1..=total).map(|n| format!("{n}\n")).collect::<String>();
+        let result = read_file(
+            "read-line-cap",
+            &content,
+            json!({"path": "file.txt", "limit": total}),
+        )
+        .await;
+
+        assert!(result.model_content.contains(&format!(
+            "\n{MAX_TOOL_OUTPUT_LINES} | {MAX_TOOL_OUTPUT_LINES}\n"
+        )));
+        assert!(!result
+            .model_content
+            .contains(&format!("{} | ", MAX_TOOL_OUTPUT_LINES + 1)));
+        assert!(result.model_content.contains(&format!(
+            "[Showing lines 1-{MAX_TOOL_OUTPUT_LINES} of {total}. Continue with offset={}.]",
+            MAX_TOOL_OUTPUT_LINES + 1
+        )));
+        assert!(result.model_content.contains(&format!(
+            "[Read limit capped at {MAX_TOOL_OUTPUT_LINES} lines.]"
+        )));
+        assert!(!result.metadata.truncated);
+    }
+
+    #[tokio::test]
+    async fn byte_cap_keeps_whole_lines_and_says_where_to_continue() {
+        let line = "x".repeat(99);
+        let content = (0..1000).map(|_| format!("{line}\n")).collect::<String>();
+        let result = read_file(
+            "read-byte-cap",
+            &content,
+            json!({"path": "file.txt", "limit": 1000}),
+        )
+        .await;
+
+        assert!(result.metadata.truncated);
+        assert!(result.model_content.len() < MAX_TOOL_OUTPUT_BYTES + 256);
+        let notice = result.model_content.lines().last().unwrap();
+        let shown: usize = notice
+            .strip_prefix("[Showing lines 1-")
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .expect("byte-limit notice");
+        assert!(notice.contains("of 1000 (50.0KB limit)"));
+        assert!(notice.ends_with(&format!("Continue with offset={}.]", shown + 1)));
+        assert!(result
+            .model_content
+            .contains(&format!("\n{shown} | {line}\n")));
+        assert!(!result
+            .model_content
+            .contains(&format!("\n{} | ", shown + 1)));
+    }
+
+    #[tokio::test]
+    async fn line_longer_than_the_byte_cap_points_at_bash() {
+        let content = format!("short\n{}\nafter\n", "y".repeat(MAX_TOOL_OUTPUT_BYTES * 2));
+        let result = read_file(
+            "read-huge-line",
+            &content,
+            json!({"path": "file.txt", "offset": 2}),
+        )
+        .await;
+
+        assert!(result.metadata.truncated);
+        assert!(result
+            .model_content
+            .starts_with("[Line 2 is 100.0KB, exceeds 50.0KB limit."));
+        assert!(result
+            .model_content
+            .contains("sed -n '2p' file.txt | head -c 51200"));
     }
 
     #[tokio::test]

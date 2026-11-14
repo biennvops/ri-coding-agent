@@ -8,7 +8,7 @@ The current baseline is intended for dogfooding. It is not a hosted service and 
 
 - OpenAI Responses and Chat Completions-compatible APIs
 - `read`, `write`, `edit`, and `bash` tools
-- bounded `bash` output (last 2,000 lines / 50 KiB, full output spilled to a temp file); file tools are not confined to the workspace, so use an OS-level sandbox (e.g. `bubblewrap`) for isolation
+- bounded tool output: `bash` returns the last 2,000 lines / 50 KiB (full output spilled to a temp file) and `read` returns the first 2,000 lines / 50 KiB with a continue-from offset; file tools are not confined to the workspace, so use an OS-level sandbox (e.g. `bubblewrap`) for isolation
 - hierarchical `AGENTS.md` context
 - persistent JSONL sessions, resume, crash repair, and compaction
 - interactive model picker and recent-model state

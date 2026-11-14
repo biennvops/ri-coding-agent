@@ -16,19 +16,18 @@ use crate::model::ToolDefinition;
 
 use super::write::temporary_path;
 use super::{
-    bounded_preview, preview_lines, suffix_at_byte_boundary, Tool, ToolCallPresentation,
-    ToolContext, ToolError, ToolEvent, ToolEventSender, ToolExecutionMetadata, ToolExecutionResult,
-    ToolOutputStream, ToolPreviewKind,
+    bounded_preview, format_size, preview_lines, suffix_at_byte_boundary, Tool,
+    ToolCallPresentation, ToolContext, ToolError, ToolEvent, ToolEventSender,
+    ToolExecutionMetadata, ToolExecutionResult, ToolOutputStream, ToolPreviewKind,
+    MAX_TOOL_OUTPUT_BYTES, MAX_TOOL_OUTPUT_LINES,
 };
 
 pub const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const TERMINATION_GRACE: Duration = Duration::from_millis(75);
 const READER_DRAIN_GRACE: Duration = Duration::from_millis(100);
-const MAX_BASH_OUTPUT_LINES: usize = 2000;
-const MAX_BASH_OUTPUT_BYTES: usize = 50 * 1024;
 // Only the end of the output is kept once it spills, so memory stays bounded.
-const TAIL_RETAINED_BYTES: usize = MAX_BASH_OUTPUT_BYTES * 2;
+const TAIL_RETAINED_BYTES: usize = MAX_TOOL_OUTPUT_BYTES * 2;
 const BASH_CHUNK_BYTES: usize = 8 * 1024;
 
 pub(crate) struct BashTool;
@@ -929,16 +928,6 @@ fn truncate_tail(text: &str, max_lines: usize, max_bytes: usize) -> TailTruncati
     }
 }
 
-fn format_size(bytes: usize) -> String {
-    if bytes < 1024 {
-        format!("{bytes}B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1}KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
-    }
-}
-
 /// Merged stdout/stderr in arrival order. Everything is buffered until a limit
 /// is crossed; from then on the full output goes to a spill file and only a
 /// rolling tail stays in memory.
@@ -1013,11 +1002,11 @@ impl BashOutput {
     }
 
     fn truncated(&self) -> bool {
-        self.total_bytes > MAX_BASH_OUTPUT_BYTES || self.total_lines() > MAX_BASH_OUTPUT_LINES
+        self.total_bytes > MAX_TOOL_OUTPUT_BYTES || self.total_lines() > MAX_TOOL_OUTPUT_LINES
     }
 
     fn tail_truncation(&self) -> TailTruncation {
-        truncate_tail(&self.tail, MAX_BASH_OUTPUT_LINES, MAX_BASH_OUTPUT_BYTES)
+        truncate_tail(&self.tail, MAX_TOOL_OUTPUT_LINES, MAX_TOOL_OUTPUT_BYTES)
     }
 
     fn truncation_notice(&self, tail: &TailTruncation, path: Option<&std::path::Path>) -> String {
@@ -1035,7 +1024,7 @@ impl BashOutput {
         } else if tail.by_bytes {
             format!(
                 "[Showing lines {start}-{total} of {total} ({} limit). {full}]",
-                format_size(MAX_BASH_OUTPUT_BYTES)
+                format_size(MAX_TOOL_OUTPUT_BYTES)
             )
         } else {
             format!("[Showing lines {start}-{total} of {total}. {full}]")
@@ -1379,7 +1368,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn line_limit_keeps_tail_and_spills_full_output() {
-        let total = MAX_BASH_OUTPUT_LINES + 500;
+        let total = MAX_TOOL_OUTPUT_LINES + 500;
         let result = run_bash("bash-lines", format!("seq 1 {total}")).await;
 
         assert!(result.metadata.truncated);
@@ -1388,7 +1377,7 @@ mod tests {
         assert_eq!(spilled.lines().count(), total);
         assert!(result.model_content.contains(&format!("\n{total}\n")));
         assert!(!result.model_content.contains("\n1\n"));
-        let start = total - MAX_BASH_OUTPUT_LINES + 1;
+        let start = total - MAX_TOOL_OUTPUT_LINES + 1;
         assert!(result.model_content.contains(&format!(
             "[Showing lines {start}-{total} of {total}. Full output: {}]",
             path.display()
@@ -1404,7 +1393,7 @@ mod tests {
         let result = run_bash("bash-bytes", format!("yes {line} | head -c {size}")).await;
 
         assert!(result.metadata.truncated);
-        assert!(result.model_content.len() < MAX_BASH_OUTPUT_BYTES + 1024);
+        assert!(result.model_content.len() < MAX_TOOL_OUTPUT_BYTES + 1024);
         assert!(result.model_content.contains("50.0KB limit"));
         let path = result.metadata.full_output_path.unwrap();
         assert_eq!(fs::metadata(&path).unwrap().len(), size as u64);
@@ -1414,11 +1403,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn stderr_is_merged_and_counts_toward_the_limit() {
-        let size = MAX_BASH_OUTPUT_BYTES * 2;
+        let size = MAX_TOOL_OUTPUT_BYTES * 2;
         let result = run_bash("bash-stderr", format!("yes x | head -c {size} 1>&2")).await;
 
         assert!(result.metadata.truncated);
-        assert!(result.model_content.len() < MAX_BASH_OUTPUT_BYTES + 1024);
+        assert!(result.model_content.len() < MAX_TOOL_OUTPUT_BYTES + 1024);
         let path = result.metadata.full_output_path.unwrap();
         assert_eq!(fs::metadata(&path).unwrap().len(), size as u64);
         fs::remove_file(path).unwrap();
@@ -1427,7 +1416,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn oversized_final_line_is_clipped_to_its_end() {
-        let size = MAX_BASH_OUTPUT_BYTES * 2;
+        let size = MAX_TOOL_OUTPUT_BYTES * 2;
         let result = run_bash(
             "bash-long-line",
             format!("head -c {size} /dev/zero | tr '\\0' 'a'; printf END"),
@@ -1438,7 +1427,7 @@ mod tests {
         assert!(result
             .model_content
             .contains("END\n\n[Showing last 50.0KB of line 1"));
-        assert!(result.model_content.len() < MAX_BASH_OUTPUT_BYTES + 1024);
+        assert!(result.model_content.len() < MAX_TOOL_OUTPUT_BYTES + 1024);
         fs::remove_file(result.metadata.full_output_path.unwrap()).unwrap();
     }
 
