@@ -89,7 +89,7 @@ pub(crate) fn temporary_path(parent: &Path) -> PathBuf {
 ///
 /// The mode is applied at creation, so the file is never briefly readable by
 /// others. `create_new` also refuses to follow a pre-placed file or symlink.
-pub(crate) fn create_private_file(path: &Path) -> io::Result<File> {
+pub fn create_private_file(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -98,6 +98,17 @@ pub(crate) fn create_private_file(path: &Path) -> io::Result<File> {
         options.mode(0o600);
     }
     options.open(path)
+}
+
+/// Create a directory (and parents) restricted to the current user.
+pub fn ensure_private_directory(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -273,6 +284,32 @@ mod tests {
 
         assert_eq!(fs::read_to_string(&destination).unwrap(), "current");
         assert_eq!(fs::read_to_string(stale).unwrap(), "stale");
+        remove_test_dir(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_file_and_directory_helpers_set_expected_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_test_dir("private-fs");
+        let private_dir = root.join("nested").join("dir");
+        ensure_private_directory(&private_dir).unwrap();
+        assert_eq!(
+            fs::metadata(&private_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let private_file = private_dir.join("file.txt");
+        let _file = create_private_file(&private_file).unwrap();
+        assert_eq!(
+            fs::metadata(&private_file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // create_private_file uses create_new and fails if the file exists.
+        assert!(create_private_file(&private_file).is_err());
+
         remove_test_dir(root);
     }
 

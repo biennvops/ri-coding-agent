@@ -1,5 +1,5 @@
 use std::env;
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Result};
+use ri_core::fs::{create_private_file, ensure_private_directory};
 use tracing::field::{Field, Visit};
 use tracing::level_filters::LevelFilter;
 use tracing::span;
@@ -227,26 +228,20 @@ pub fn init() -> Result<Option<PathBuf>> {
     let value = value.to_string_lossy();
     let filter = LogFilter::parse(&value)?;
     let directory = default_log_directory()?;
-    fs::create_dir_all(&directory).map_err(|source| {
+    ensure_private_directory(&directory).map_err(|source| {
         anyhow!(
             "could not create diagnostic log directory {}: {source}",
             directory.display()
         )
     })?;
-    set_private_directory_permissions(&directory)?;
 
     let path = directory.join(format!("ri-{}-{}.log", utc_timestamp(), std::process::id()));
-    let file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&path)
-        .map_err(|source| {
-            anyhow!(
-                "could not create diagnostic log {}: {source}",
-                path.display()
-            )
-        })?;
-    set_private_file_permissions(&file, &path)?;
+    let file = create_private_file(&path).map_err(|source| {
+        anyhow!(
+            "could not create diagnostic log {}: {source}",
+            path.display()
+        )
+    })?;
 
     let subscriber = FileSubscriber::new(filter, file);
     let log_file = Arc::clone(&subscriber.file);
@@ -321,28 +316,10 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
-fn set_private_directory_permissions(_path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(_path, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
-}
-
-fn set_private_file_permissions(_file: &File, _path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        _file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use std::fs::{self, OpenOptions};
     use tracing::dispatcher::{self, Dispatch};
 
     #[test]

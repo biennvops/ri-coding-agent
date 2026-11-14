@@ -268,27 +268,11 @@ fn lock_path(path: &Path) -> PathBuf {
 }
 
 fn create_state_directory(parent: &Path, path: &Path) -> Result<(), StateError> {
-    fs::create_dir_all(parent).map_err(|source| StateError::Io {
+    crate::fs::ensure_private_directory(parent).map_err(|source| StateError::Io {
         path: path.to_path_buf(),
         operation: "creating state directory",
         source,
-    })?;
-    set_private_directory_permissions(parent, path)
-}
-
-fn set_private_directory_permissions(_path: &Path, _error_path: &Path) -> Result<(), StateError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(_path, fs::Permissions::from_mode(0o700)).map_err(|source| {
-            StateError::Io {
-                path: _error_path.to_path_buf(),
-                operation: "setting state directory permissions",
-                source,
-            }
-        })?;
-    }
-    Ok(())
+    })
 }
 
 #[cfg(test)]

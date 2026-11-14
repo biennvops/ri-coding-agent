@@ -3,7 +3,7 @@ pub mod app;
 pub mod config;
 pub mod context;
 pub mod conversation;
-mod fs;
+pub mod fs;
 pub mod model;
 pub mod plugin;
 pub mod session;
