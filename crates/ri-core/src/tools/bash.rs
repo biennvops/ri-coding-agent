@@ -1,4 +1,4 @@
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Write;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -12,20 +12,23 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::fs::create_private_file;
 use crate::model::ToolDefinition;
 
 use super::write::temporary_path;
 use super::{
-    bounded_preview, preview_lines, BoundedText, Tool, ToolCallPresentation, ToolContext,
-    ToolError, ToolEvent, ToolEventSender, ToolExecutionMetadata, ToolExecutionResult,
-    ToolOutputStream, ToolPreviewKind, MAX_TOOL_OUTPUT_BYTES,
+    bounded_preview, format_size, preview_lines, suffix_at_byte_boundary, Tool,
+    ToolCallPresentation, ToolContext, ToolError, ToolEvent, ToolEventSender,
+    ToolExecutionMetadata, ToolExecutionResult, ToolOutputStream, ToolPreviewKind,
+    MAX_TOOL_OUTPUT_BYTES, MAX_TOOL_OUTPUT_LINES,
 };
 
 pub const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const TERMINATION_GRACE: Duration = Duration::from_millis(75);
 const READER_DRAIN_GRACE: Duration = Duration::from_millis(100);
-const STREAM_OUTPUT_LIMIT: usize = MAX_TOOL_OUTPUT_BYTES / 2;
+// Only the end of the output is kept once it spills, so memory stays bounded.
+const TAIL_RETAINED_BYTES: usize = MAX_TOOL_OUTPUT_BYTES * 2;
 const BASH_CHUNK_BYTES: usize = 8 * 1024;
 
 pub(crate) struct BashTool;
@@ -190,7 +193,7 @@ impl Tool for BashTool {
                 stream_event = stream_rx.recv(), if active_readers > 0 => {
                     match stream_event {
                         Some(BashStreamEvent::Chunk { stream, text }) => {
-                            if let Err(error) = output.push(stream, &text) {
+                            if let Err(error) = output.push(&text) {
                                 process_error.get_or_insert(error);
                             }
                             if !event_stream_closed {
@@ -291,26 +294,14 @@ impl Tool for BashTool {
             )
         };
 
-        let stdout_text = output.stdout();
-        let stderr_text = output.stderr();
-        if !stdout_text.is_empty() {
-            model_content.push_str("\n\nstdout:\n");
-            model_content.push_str(&stdout_text);
-        }
-        if !stderr_text.is_empty() {
-            model_content.push_str("\n\nstderr:\n");
-            model_content.push_str(&stderr_text);
+        let tail = output.tail_truncation();
+        if !tail.content.is_empty() {
+            model_content.push_str("\n\n");
+            model_content.push_str(&tail.content);
         }
         if truncated {
-            if let Some(path) = &full_output_path {
-                model_content.push_str(&format!(
-                    "\n\n[Output truncated. Full output saved to {}]",
-                    path.display()
-                ));
-            } else {
-                model_content
-                    .push_str("\n\n[Output truncated; the full output could not be saved.]");
-            }
+            model_content.push_str("\n\n");
+            model_content.push_str(&output.truncation_notice(&tail, full_output_path.as_deref()));
         }
 
         Ok(ToolExecutionResult {
@@ -895,10 +886,58 @@ fn configure_process_group(command: &mut Command) {
 #[cfg(not(any(unix, windows)))]
 fn configure_process_group(_command: &mut Command) {}
 
+struct TailTruncation {
+    content: String,
+    output_lines: usize,
+    by_bytes: bool,
+    last_line_partial: bool,
+}
+
+/// Keeps the last lines of `text` that fit both limits, never splitting a
+/// line unless a single final line alone exceeds the byte limit.
+fn truncate_tail(text: &str, max_lines: usize, max_bytes: usize) -> TailTruncation {
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    if text.is_empty() || text.ends_with('\n') {
+        lines.pop();
+    }
+    let mut selected: Vec<&str> = Vec::new();
+    let mut bytes = 0usize;
+    let mut by_bytes = false;
+    let mut last_line_partial = false;
+    for line in lines.iter().rev() {
+        if selected.len() >= max_lines {
+            break;
+        }
+        let cost = line.len() + usize::from(!selected.is_empty());
+        if bytes + cost > max_bytes {
+            by_bytes = true;
+            if selected.is_empty() {
+                selected.push(suffix_at_byte_boundary(line, max_bytes));
+                last_line_partial = true;
+            }
+            break;
+        }
+        selected.push(line);
+        bytes += cost;
+    }
+    selected.reverse();
+    TailTruncation {
+        output_lines: selected.len(),
+        content: selected.join("\n"),
+        by_bytes,
+        last_line_partial,
+    }
+}
+
+/// Merged stdout/stderr in arrival order. Everything is buffered until a limit
+/// is crossed; from then on the full output goes to a spill file and only a
+/// rolling tail stays in memory.
 struct BashOutput {
-    stdout: BoundedText,
-    stderr: BoundedText,
-    combined: BoundedText,
+    tail: String,
+    total_bytes: usize,
+    newlines: usize,
+    open_line: bool,
+    current_line_bytes: usize,
     spill: Option<File>,
     spill_path: Option<std::path::PathBuf>,
 }
@@ -906,78 +945,87 @@ struct BashOutput {
 impl BashOutput {
     fn new() -> Self {
         Self {
-            stdout: BoundedText::new(STREAM_OUTPUT_LIMIT),
-            stderr: BoundedText::new(STREAM_OUTPUT_LIMIT),
-            combined: BoundedText::new(MAX_TOOL_OUTPUT_BYTES),
+            tail: String::new(),
+            total_bytes: 0,
+            newlines: 0,
+            open_line: false,
+            current_line_bytes: 0,
             spill: None,
             spill_path: None,
         }
     }
 
-    fn push(&mut self, stream: ToolOutputStream, text: &str) -> Result<(), ToolError> {
-        let stream_would_truncate = match stream {
-            ToolOutputStream::Stdout => {
-                self.stdout.total_bytes().saturating_add(text.len()) > STREAM_OUTPUT_LIMIT
-            }
-            ToolOutputStream::Stderr => {
-                self.stderr.total_bytes().saturating_add(text.len()) > STREAM_OUTPUT_LIMIT
-            }
-        };
-        let label = match stream {
-            ToolOutputStream::Stdout => "[stdout]\n",
-            ToolOutputStream::Stderr => "[stderr]\n",
-        };
-        let mut combined = String::with_capacity(label.len().saturating_add(text.len()));
-        combined.push_str(label);
-        combined.push_str(text);
+    fn total_lines(&self) -> usize {
+        self.newlines + usize::from(self.open_line)
+    }
 
-        let combined_would_truncate =
-            self.combined.total_bytes().saturating_add(combined.len()) > MAX_TOOL_OUTPUT_BYTES;
-        if self.spill.is_none() && (stream_would_truncate || combined_would_truncate) {
-            self.create_spill()?;
+    fn push(&mut self, text: &str) -> Result<(), ToolError> {
+        if text.is_empty() {
+            return Ok(());
         }
+        self.total_bytes = self.total_bytes.saturating_add(text.len());
+        self.newlines += text.matches('\n').count();
+        self.open_line = !text.ends_with('\n');
+        self.current_line_bytes = match text.rfind('\n') {
+            Some(index) => text.len() - index - 1,
+            None => self.current_line_bytes.saturating_add(text.len()),
+        };
+        self.tail.push_str(text);
+
         if let Some(spill) = &mut self.spill {
-            spill.write_all(combined.as_bytes()).map_err(|error| {
+            spill.write_all(text.as_bytes()).map_err(|error| {
                 ToolError::Failed(format!("could not append output spill file: {error}"))
             })?;
+            if self.tail.len() > TAIL_RETAINED_BYTES * 2 {
+                self.tail = suffix_at_byte_boundary(&self.tail, TAIL_RETAINED_BYTES).to_owned();
+            }
+        } else if self.truncated() {
+            self.create_spill()?;
         }
-        match stream {
-            ToolOutputStream::Stdout => self.stdout.push(text),
-            ToolOutputStream::Stderr => self.stderr.push(text),
-        }
-        self.combined.push(&combined);
         Ok(())
     }
 
     fn create_spill(&mut self) -> Result<(), ToolError> {
         let path = temporary_path(&std::env::temp_dir());
-        let mut spill = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|error| {
-                ToolError::Failed(format!("could not create output spill file: {error}"))
-            })?;
-        spill
-            .write_all(self.combined.retained().as_bytes())
-            .map_err(|error| {
-                ToolError::Failed(format!("could not initialize output spill file: {error}"))
-            })?;
+        let mut spill = create_private_file(&path).map_err(|error| {
+            ToolError::Failed(format!("could not create output spill file: {error}"))
+        })?;
+        spill.write_all(self.tail.as_bytes()).map_err(|error| {
+            ToolError::Failed(format!("could not initialize output spill file: {error}"))
+        })?;
         self.spill_path = Some(path);
         self.spill = Some(spill);
         Ok(())
     }
 
-    fn stdout(&self) -> String {
-        self.stdout.render()
-    }
-
-    fn stderr(&self) -> String {
-        self.stderr.render()
-    }
-
     fn truncated(&self) -> bool {
-        self.combined.is_truncated() || self.stdout.is_truncated() || self.stderr.is_truncated()
+        self.total_bytes > MAX_TOOL_OUTPUT_BYTES || self.total_lines() > MAX_TOOL_OUTPUT_LINES
+    }
+
+    fn tail_truncation(&self) -> TailTruncation {
+        truncate_tail(&self.tail, MAX_TOOL_OUTPUT_LINES, MAX_TOOL_OUTPUT_BYTES)
+    }
+
+    fn truncation_notice(&self, tail: &TailTruncation, path: Option<&std::path::Path>) -> String {
+        let total = self.total_lines();
+        let start = total.saturating_sub(tail.output_lines) + 1;
+        let full = path
+            .map(|path| format!("Full output: {}", path.display()))
+            .unwrap_or_default();
+        if tail.last_line_partial {
+            format!(
+                "[Showing last {} of line {total} (line is {}). {full}]",
+                format_size(tail.content.len()),
+                format_size(self.current_line_bytes)
+            )
+        } else if tail.by_bytes {
+            format!(
+                "[Showing lines {start}-{total} of {total} ({} limit). {full}]",
+                format_size(MAX_TOOL_OUTPUT_BYTES)
+            )
+        } else {
+            format!("[Showing lines {start}-{total} of {total}. {full}]")
+        }
     }
 
     fn finish(&mut self) -> Result<Option<std::path::PathBuf>, ToolError> {
@@ -1042,9 +1090,7 @@ mod tests {
 
         assert_eq!(result.metadata.exit_code, Some(7));
         assert!(!result.metadata.success);
-        assert!(result.model_content.contains("stdout:"));
         assert!(result.model_content.contains("out"));
-        assert!(result.model_content.contains("stderr:"));
         assert!(result.model_content.contains("err"));
         assert!(event_rx.recv().await.is_some());
         fs::remove_dir_all(root).unwrap();
@@ -1236,56 +1282,6 @@ mod tests {
         remove_test_dir(root);
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn stdout_truncation_spills_before_combined_limit() {
-        let root = unique_test_dir("bash-stdout-boundary");
-        fs::create_dir_all(&root).unwrap();
-        let context = ToolContext::new(&root).unwrap();
-        let result = BashTool
-            .execute(
-                json!({"command": format!("yes x | head -c {}", STREAM_OUTPUT_LIMIT + 1024)}),
-                &context,
-                mpsc::channel(128).0,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-
-        assert!(result.metadata.truncated);
-        let path = result
-            .metadata
-            .full_output_path
-            .expect("stdout truncation should spill");
-        assert!(fs::metadata(path).unwrap().len() > STREAM_OUTPUT_LIMIT as u64);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn stderr_truncation_spills_before_combined_limit() {
-        let root = unique_test_dir("bash-stderr-boundary");
-        fs::create_dir_all(&root).unwrap();
-        let context = ToolContext::new(&root).unwrap();
-        let result = BashTool
-            .execute(
-                json!({"command": format!("yes x | head -c {} 1>&2", STREAM_OUTPUT_LIMIT + 1024)}),
-                &context,
-                mpsc::channel(128).0,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-
-        assert!(result.metadata.truncated);
-        let path = result
-            .metadata
-            .full_output_path
-            .expect("stderr truncation should spill");
-        assert!(fs::metadata(path).unwrap().len() > STREAM_OUTPUT_LIMIT as u64);
-        fs::remove_dir_all(root).unwrap();
-    }
-
     #[cfg(windows)]
     #[tokio::test]
     async fn cancellation_kills_windows_descendants() {
@@ -1337,28 +1333,130 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn large_output_is_bounded_and_spilled() {
-        let root = unique_test_dir("bash-large");
+    async fn run_bash(name: &str, command: String) -> ToolExecutionResult {
+        let root = unique_test_dir(name);
         fs::create_dir_all(&root).unwrap();
         let context = ToolContext::new(&root).unwrap();
         let result = BashTool
             .execute(
-                json!({"command": format!("yes x | head -c {}", MAX_TOOL_OUTPUT_BYTES + 1024)}),
+                json!({ "command": command }),
                 &context,
                 mpsc::channel(128).0,
                 CancellationToken::new(),
             )
             .await
             .unwrap();
+        fs::remove_dir_all(root).unwrap();
+        result
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn small_output_is_returned_whole_without_a_spill_file() {
+        let result = run_bash("bash-small", "seq 1 100".to_owned()).await;
+
+        assert!(!result.metadata.truncated);
+        assert!(result.metadata.full_output_path.is_none());
+        assert!(result.model_content.contains("\n1\n2\n"));
+        assert!(result.model_content.ends_with("\n100"));
+        assert!(!result.model_content.contains("Full output"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn line_limit_keeps_tail_and_spills_full_output() {
+        let total = MAX_TOOL_OUTPUT_LINES + 500;
+        let result = run_bash("bash-lines", format!("seq 1 {total}")).await;
 
         assert!(result.metadata.truncated);
-        let path = result
-            .metadata
-            .full_output_path
-            .expect("output should spill");
-        assert!(fs::metadata(path).unwrap().len() > MAX_TOOL_OUTPUT_BYTES as u64);
-        fs::remove_dir_all(root).unwrap();
+        let path = result.metadata.full_output_path.clone().unwrap();
+        let spilled = fs::read_to_string(&path).unwrap();
+        assert_eq!(spilled.lines().count(), total);
+        assert!(result.model_content.contains(&format!("\n{total}\n")));
+        assert!(!result.model_content.contains("\n1\n"));
+        let start = total - MAX_TOOL_OUTPUT_LINES + 1;
+        assert!(result.model_content.contains(&format!(
+            "[Showing lines {start}-{total} of {total}. Full output: {}]",
+            path.display()
+        )));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn byte_limit_bounds_what_the_model_receives() {
+        let size = 10 * 1024 * 1024;
+        let line = "a".repeat(99);
+        let result = run_bash("bash-bytes", format!("yes {line} | head -c {size}")).await;
+
+        assert!(result.metadata.truncated);
+        assert!(result.model_content.len() < MAX_TOOL_OUTPUT_BYTES + 1024);
+        assert!(result.model_content.contains("50.0KB limit"));
+        let path = result.metadata.full_output_path.unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), size as u64);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spill_file_is_private_to_the_user() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let result = run_bash("bash-spill-mode", "seq 1 5000".to_owned()).await;
+
+        let path = result.metadata.full_output_path.unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stderr_is_merged_and_counts_toward_the_limit() {
+        let size = MAX_TOOL_OUTPUT_BYTES * 2;
+        let result = run_bash("bash-stderr", format!("yes x | head -c {size} 1>&2")).await;
+
+        assert!(result.metadata.truncated);
+        assert!(result.model_content.len() < MAX_TOOL_OUTPUT_BYTES + 1024);
+        let path = result.metadata.full_output_path.unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), size as u64);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oversized_final_line_is_clipped_to_its_end() {
+        let size = MAX_TOOL_OUTPUT_BYTES * 2;
+        let result = run_bash(
+            "bash-long-line",
+            format!("head -c {size} /dev/zero | tr '\\0' 'a'; printf END"),
+        )
+        .await;
+
+        assert!(result.metadata.truncated);
+        assert!(result
+            .model_content
+            .contains("END\n\n[Showing last 50.0KB of line 1"));
+        assert!(result.model_content.len() < MAX_TOOL_OUTPUT_BYTES + 1024);
+        fs::remove_file(result.metadata.full_output_path.unwrap()).unwrap();
+    }
+
+    #[test]
+    fn truncate_tail_respects_both_limits_and_line_boundaries() {
+        let text = "one\ntwo\nthree\nfour\n";
+        let by_lines = truncate_tail(text, 2, 1024);
+        assert_eq!(by_lines.content, "three\nfour");
+        assert!(!by_lines.by_bytes);
+
+        let by_bytes = truncate_tail(text, 10, 10);
+        assert_eq!(by_bytes.content, "three\nfour");
+        assert!(by_bytes.by_bytes && !by_bytes.last_line_partial);
+
+        let partial = truncate_tail("abcdefghij", 10, 4);
+        assert_eq!(partial.content, "ghij");
+        assert!(partial.last_line_partial);
     }
 
     #[cfg(unix)]

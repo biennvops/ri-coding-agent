@@ -19,10 +19,10 @@ pub use bash::DEFAULT_BASH_TIMEOUT_MS;
 pub use builtin::builtin_tool_registry;
 pub use registry::{ToolRegistry, ToolRegistryError};
 
-pub const MAX_TOOL_OUTPUT_BYTES: usize = 1024 * 1024;
+pub const MAX_TOOL_OUTPUT_BYTES: usize = 50 * 1024;
+pub const MAX_TOOL_OUTPUT_LINES: usize = 2000;
 pub const MAX_TOOL_PREVIEW_LINES: usize = 20;
 pub const MAX_TOOL_PREVIEW_BYTES: usize = 16 * 1024;
-pub const MAX_READ_LINES: usize = 1_000;
 pub const MAX_READ_FILE_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_EDIT_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -279,78 +279,13 @@ pub(crate) fn bounded_preview_with_limits<'a>(
     preview
 }
 
-#[derive(Debug)]
-pub(crate) struct BoundedText {
-    limit: usize,
-    total_bytes: usize,
-    truncated: bool,
-    head: String,
-    tail: String,
-}
-
-impl BoundedText {
-    pub(crate) fn new(limit: usize) -> Self {
-        Self {
-            limit: limit.max(2),
-            total_bytes: 0,
-            truncated: false,
-            head: String::new(),
-            tail: String::new(),
-        }
-    }
-
-    pub(crate) fn total_bytes(&self) -> usize {
-        self.total_bytes
-    }
-
-    pub(crate) fn is_truncated(&self) -> bool {
-        self.truncated
-    }
-
-    pub(crate) fn push(&mut self, text: &str) {
-        self.total_bytes = self.total_bytes.saturating_add(text.len());
-        if !self.truncated && self.head.len().saturating_add(text.len()) <= self.limit {
-            self.head.push_str(text);
-            return;
-        }
-
-        let head_limit = self.limit / 2;
-        let tail_limit = self.limit.saturating_sub(head_limit);
-        if !self.truncated {
-            let previous_head = std::mem::take(&mut self.head);
-            self.head = prefix_at_byte_boundary(&previous_head, head_limit).to_owned();
-            self.tail = if text.len() >= tail_limit {
-                suffix_at_byte_boundary(text, tail_limit).to_owned()
-            } else {
-                let mut tail =
-                    suffix_at_byte_boundary(&previous_head, tail_limit.saturating_sub(text.len()))
-                        .to_owned();
-                tail.push_str(text);
-                tail
-            };
-        } else {
-            self.tail = if text.len() >= tail_limit {
-                suffix_at_byte_boundary(text, tail_limit).to_owned()
-            } else {
-                let mut tail =
-                    suffix_at_byte_boundary(&self.tail, tail_limit.saturating_sub(text.len()))
-                        .to_owned();
-                tail.push_str(text);
-                tail
-            };
-        }
-        self.truncated = true;
-    }
-
-    pub(crate) fn retained(&self) -> &str {
-        &self.head
-    }
-
-    pub(crate) fn render(&self) -> String {
-        if !self.truncated {
-            return self.head.clone();
-        }
-        format!("{}\n[… output truncated …]\n{}", self.head, self.tail)
+pub(crate) fn format_size(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes}B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1}KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
     }
 }
 
@@ -410,27 +345,5 @@ pub(crate) mod tests {
                 arguments["text"].as_str().unwrap(),
             ))
         }
-    }
-
-    #[test]
-    fn bounded_text_retains_head_and_tail() {
-        let mut output = BoundedText::new(10);
-        output.push("0123456789");
-        output.push("abcdefghij");
-
-        assert!(output.is_truncated());
-        assert_eq!(output.total_bytes(), 20);
-        assert!(output.render().contains("01234"));
-        assert!(output.render().contains("fghij"));
-        assert!(output.render().is_char_boundary(output.render().len()));
-    }
-
-    #[test]
-    fn bounded_text_does_not_split_unicode() {
-        let mut output = BoundedText::new(8);
-        output.push("🦀🦀🦀🦀");
-        output.push("終わり");
-
-        assert!(std::str::from_utf8(output.render().as_bytes()).is_ok());
     }
 }

@@ -38,9 +38,7 @@ impl Tool for EditTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "edit".to_owned(),
-            description: Some(
-                "Replace exactly one matching text range in a workspace file.".to_owned(),
-            ),
+            description: Some("Replace exactly one matching text range in a file.".to_owned()),
             parameters: json!({
                 "type": "object",
                 "properties": {

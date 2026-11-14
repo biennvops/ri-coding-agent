@@ -1920,14 +1920,7 @@ fn canonical_directory(path: &Path) -> Result<PathBuf, SessionError> {
 }
 
 fn ensure_private_directory(path: &Path) -> Result<(), SessionError> {
-    fs::create_dir_all(path).map_err(|source| io_error(path, source))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .map_err(|source| io_error(path, source))?;
-    }
-    Ok(())
+    crate::fs::ensure_private_directory(path).map_err(|source| io_error(path, source))
 }
 
 struct SessionLockGuard {
