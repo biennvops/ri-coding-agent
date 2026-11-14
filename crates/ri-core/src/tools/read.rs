@@ -38,13 +38,13 @@ impl Tool for ReadTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read".to_owned(),
-            description: Some("Read text from a workspace file with numbered lines.".to_owned()),
+            description: Some("Read text from a file with numbered lines.".to_owned()),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "File path relative to the workspace"
+                        "description": "File path, relative to the workspace or absolute"
                     },
                     "offset": {
                         "type": "integer",
@@ -248,34 +248,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_binary_and_escape_paths() {
+    async fn rejects_binary_files() {
         let root = unique_test_dir("read-errors");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("binary"), [0xff, 0xfe]).unwrap();
         let context = ToolContext::new(&root).unwrap();
-        let sender = tokio::sync::mpsc::channel(1).0;
 
         assert!(ReadTool
             .execute(
                 json!({"path":"binary"}),
                 &context,
-                sender.clone(),
+                tokio::sync::mpsc::channel(1).0,
                 CancellationToken::new()
             )
             .await
             .unwrap_err()
             .to_string()
             .contains("UTF-8"));
-        assert!(ReadTool
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reads_absolute_paths_outside_the_workspace() {
+        let root = unique_test_dir("read-workspace");
+        let outside = unique_test_dir("read-outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("log.txt"), "spilled\n").unwrap();
+        let context = ToolContext::new(&root).unwrap();
+
+        let result = ReadTool
             .execute(
-                json!({"path":"../outside"}),
+                json!({"path": outside.join("log.txt").to_string_lossy()}),
                 &context,
-                sender,
-                CancellationToken::new()
+                tokio::sync::mpsc::channel(1).0,
+                CancellationToken::new(),
             )
             .await
-            .is_err());
+            .unwrap();
+
+        assert_eq!(result.model_content, "1 | spilled\n");
         fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 
     fn unique_test_dir(name: &str) -> std::path::PathBuf {
