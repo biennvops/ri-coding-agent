@@ -1,6 +1,6 @@
 use super::ContextBundle;
 
-pub const BUILT_IN_SYSTEM_PROMPT: &str = "You are ri, a coding agent.\n\n\
+pub const BUILT_IN_SYSTEM_PROMPT: &str = "You are a coding agent.\n\n\
 You can inspect and modify files and run commands using the provided tools.\n\
 Use tools when necessary to complete the user's task.\n\
 Keep changes focused and verify relevant work when practical.\n";
@@ -73,7 +73,7 @@ mod tests {
         let context = load_context_with_home(&nested, &root, Some(&home)).unwrap();
         let prompt = build_system_prompt(&context);
 
-        assert_eq!(prompt.matches("You are ri, a coding agent.").count(), 1);
+        assert_eq!(prompt.matches("You are a coding agent.").count(), 1);
         assert_eq!(prompt.matches("Tool workspace:").count(), 1);
         assert_eq!(prompt.matches("Project root:").count(), 1);
         assert_eq!(prompt.matches("<agents-context").count(), 3);
